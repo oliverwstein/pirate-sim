@@ -1,0 +1,3 @@
+[workspace]
+members = ["crates/sim-core", "crates/sim-viz"]
+resolver = "2"

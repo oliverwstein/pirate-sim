@@ -1,0 +1,17 @@
+# Build artifacts
+/target/
+
+# Raw source data (large, downloaded manually)
+/raw/
+/data/raw/
+
+# Generated binary grids (regenerate with tools/preprocess/)
+/data/grids/*.bin
+
+# OS files
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.swp
