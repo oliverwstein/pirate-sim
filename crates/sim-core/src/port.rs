@@ -73,7 +73,7 @@ const PORTS: &[(&str, f32, f32, Faction, f32)] = &[
     ("Charleston", -445.8, 916.8, Faction::England, 25.0),
     ("Boston", 86.4, 1491.6, Faction::England, 20.0),
     ("New York", -90.6, 1392.6, Faction::England, 60.0),     // NY harbor + lower Hudson + reach to Atlantic
-    ("Philadelphia", -177.8, 1312.6, Faction::England, 30.0), // 39.379°N, -75.460°W
+    ("Philadelphia", -177.8, 1312.6, Faction::England, 30.0), // City at 39.953°N -75.164°W; anchor here at the Delaware Bay mouth (~30 NM SE) since 1-NM grid can't open the river.
     ("Bermuda", 469.2, 892.8, Faction::England, D),
     ("Belize", -942.0, 0.0, Faction::England, 30.0),
     // === FRENCH ===
