@@ -2,7 +2,7 @@ use std::path::Path;
 
 use crate::map::MapSystem;
 use crate::port::{Port, all_ports};
-use crate::ship::{Ship, ShipStats};
+use crate::ship::{Ship, ShipState, ShipStats};
 use crate::types::SimDate;
 use crate::weather::WeatherSystem;
 
@@ -33,7 +33,7 @@ impl World {
         let stats = ShipStats::sloop();
 
         for ship in &mut self.ships {
-            if ship.destination.is_none() {
+            if ship.state != ShipState::Sailing {
                 continue;
             }
 

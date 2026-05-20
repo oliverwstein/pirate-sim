@@ -15,7 +15,7 @@ impl ShipStats {
             speed_typical: 9.0,
             speed_max: 12.0,
             windward_ability: 0.8,
-            no_go_half_angle: 40.0, // can't sail closer than 40° to wind
+            no_go_half_angle: 40.0,
         }
     }
 }
@@ -23,27 +23,62 @@ impl ShipStats {
 /// Which tack the ship is on when beating upwind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tack {
-    Port,      // wind coming from port (left) side
-    Starboard, // wind coming from starboard (right) side
+    Port,
+    Starboard,
+}
+
+/// The physical state of a ship.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShipState {
+    Sailing,   // underway, moving at current heading
+    Docked,    // stationary at a landing point (port, beach, etc.)
+    Anchored,  // stationary at sea (not landed)
 }
 
 pub struct Ship {
     pub position: Position,
     pub heading: f32,                  // degrees (0=N, 90=E, clockwise)
     pub speed: f32,                    // current speed in knots
-    pub destination: Option<Position>, // where we're trying to go
-    pub tack: Tack,                    // current tack when beating
+    pub state: ShipState,
+    pub destination: Option<Position>, // current orders (set by AI layer)
+    pub tack: Tack,
 }
 
 impl Ship {
     pub fn new(position: Position, destination: Option<Position>) -> Self {
+        let state = if destination.is_some() {
+            ShipState::Sailing
+        } else {
+            ShipState::Anchored
+        };
         Self {
             position,
             heading: 0.0,
             speed: 0.0,
+            state,
             destination,
             tack: Tack::Starboard,
         }
+    }
+
+    /// Give new orders: set destination and begin sailing.
+    pub fn set_destination(&mut self, dest: Position) {
+        self.destination = Some(dest);
+        self.state = ShipState::Sailing;
+    }
+
+    /// Drop anchor at current position (stop at sea).
+    pub fn anchor(&mut self) {
+        self.state = ShipState::Anchored;
+        self.speed = 0.0;
+        self.destination = None;
+    }
+
+    /// Dock at current position (arrived at land).
+    pub fn dock(&mut self) {
+        self.state = ShipState::Docked;
+        self.speed = 0.0;
+        self.destination = None;
     }
 
     /// Calculate effective speed based on wind angle and strength.
@@ -88,21 +123,17 @@ impl Ship {
         let bearing_to_dest = normalize_angle(delta.x.atan2(delta.y).to_degrees());
         let wind_from = wind.direction_from();
 
-        // Angle between desired bearing and wind source
         let angle_to_wind = angle_diff(bearing_to_dest, wind_from).abs();
 
         if angle_to_wind > stats.no_go_half_angle + 5.0 {
-            // Can sail direct — not in the no-go zone
             self.heading = bearing_to_dest;
         } else {
-            // In the no-go zone: must tack. Compute VMG for port and starboard tack.
             let port_heading = normalize_angle(wind_from - stats.no_go_half_angle);
             let starboard_heading = normalize_angle(wind_from + stats.no_go_half_angle);
 
             let port_vmg = vmg(port_heading, bearing_to_dest, self.speed_at_heading(port_heading, stats, wind));
             let starboard_vmg = vmg(starboard_heading, bearing_to_dest, self.speed_at_heading(starboard_heading, stats, wind));
 
-            // Hysteresis: only switch tack if the other side is >20% better VMG
             let hysteresis = 1.2;
             let new_tack = match self.tack {
                 Tack::Port => {
@@ -129,12 +160,11 @@ impl Ship {
         }
     }
 
-    /// Check if we've arrived at the destination.
+    /// Check if we've arrived at the destination. Transitions to Docked.
     pub fn check_arrival(&mut self) -> bool {
         if let Some(dest) = self.destination {
             if self.position.distance(dest) < 5.0 {
-                self.destination = None;
-                self.speed = 0.0;
+                self.dock();
                 return true;
             }
         }
@@ -153,16 +183,14 @@ fn vmg(heading: f32, bearing_to_dest: f32, speed: f32) -> f32 {
 fn sail_efficiency(relative_angle: f32, windward_ability: f32) -> f32 {
     let a = relative_angle.abs();
     if a < 30.0 {
-        1.3 // running: wind directly behind, bonus speed
+        1.3
     } else if a < 60.0 {
-        1.3 - (a - 30.0) / 30.0 * 0.3 // broad reach
+        1.3 - (a - 30.0) / 30.0 * 0.3
     } else if a < 90.0 {
-        1.0 // beam reach: wind perpendicular
+        1.0
     } else if a < 135.0 {
-        // Close reach → close-hauled: windward_ability matters
         1.0 - (a - 90.0) / 45.0 * (1.0 - 0.4 * windward_ability)
     } else {
-        // Beating into wind: heavily penalized
         0.1 + 0.3 * windward_ability
     }
 }
@@ -196,42 +224,37 @@ mod tests {
 
     #[test]
     fn test_running_fast() {
-        // Ship heading north (0°), wind from south (180°) = running = fast
-        let ship = Ship { position: Position::ZERO, heading: 0.0, speed: 0.0, destination: None, tack: Tack::Starboard };
+        let ship = Ship { position: Position::ZERO, heading: 0.0, speed: 0.0, state: ShipState::Sailing, destination: None, tack: Tack::Starboard };
         let stats = ShipStats::sloop();
-        let wind = WindVector { u: 0.0, v: 15.0 }; // blowing north, from south
+        let wind = WindVector { u: 0.0, v: 15.0 };
         let speed = ship.effective_speed(&stats, &wind);
         assert!(speed > 10.0, "Running should be fast, got {}", speed);
     }
 
     #[test]
     fn test_beating_slow() {
-        // Ship heading north (0°), wind from north (0°) = beating = slow
-        let ship = Ship { position: Position::ZERO, heading: 0.0, speed: 0.0, destination: None, tack: Tack::Starboard };
+        let ship = Ship { position: Position::ZERO, heading: 0.0, speed: 0.0, state: ShipState::Sailing, destination: None, tack: Tack::Starboard };
         let stats = ShipStats::sloop();
-        let wind = WindVector { u: 0.0, v: -15.0 }; // blowing south, from north (0°)
+        let wind = WindVector { u: 0.0, v: -15.0 };
         let speed = ship.effective_speed(&stats, &wind);
         assert!(speed < 5.0, "Beating should be slow, got {}", speed);
     }
 
     #[test]
     fn test_heading_toward_destination_direct() {
-        // Wind from south, destination due east — not in no-go zone, should sail direct
         let mut ship = Ship::new(Position::ZERO, Some(Position::new(100.0, 0.0)));
         let stats = ShipStats::sloop();
-        let wind = WindVector { u: 0.0, v: 15.0 }; // from south (180°)
+        let wind = WindVector { u: 0.0, v: 15.0 };
         ship.update_heading_toward_destination(&stats, &wind);
         assert!((ship.heading - 90.0).abs() < 1.0, "Expected ~90°, got {}", ship.heading);
     }
 
     #[test]
     fn test_tacking_when_beating() {
-        // Wind from north (blowing south), destination due north — must tack
         let mut ship = Ship::new(Position::ZERO, Some(Position::new(0.0, 100.0)));
         let stats = ShipStats::sloop();
-        let wind = WindVector { u: 0.0, v: -15.0 }; // from north (0°)
+        let wind = WindVector { u: 0.0, v: -15.0 };
         ship.update_heading_toward_destination(&stats, &wind);
-        // Should not be heading directly north (0°) — should be offset by no_go_half_angle
         let angle_from_wind = angle_diff(ship.heading, 0.0).abs();
         assert!(
             angle_from_wind >= stats.no_go_half_angle - 1.0,
@@ -242,15 +265,37 @@ mod tests {
 
     #[test]
     fn test_vmg_running() {
-        // Heading directly toward destination = max VMG
         let v = vmg(90.0, 90.0, 10.0);
-        assert!((v - 10.0).abs() < 0.01, "VMG should be 10 when heading matches bearing, got {}", v);
+        assert!((v - 10.0).abs() < 0.01);
     }
 
     #[test]
     fn test_vmg_perpendicular() {
-        // Heading perpendicular to destination = zero VMG
         let v = vmg(0.0, 90.0, 10.0);
-        assert!(v.abs() < 0.01, "VMG should be ~0 when perpendicular, got {}", v);
+        assert!(v.abs() < 0.01);
+    }
+
+    #[test]
+    fn test_ship_state_transitions() {
+        let mut ship = Ship::new(Position::ZERO, Some(Position::new(3.0, 0.0)));
+        assert_eq!(ship.state, ShipState::Sailing);
+
+        ship.anchor();
+        assert_eq!(ship.state, ShipState::Anchored);
+        assert!(ship.destination.is_none());
+
+        ship.set_destination(Position::new(10.0, 0.0));
+        assert_eq!(ship.state, ShipState::Sailing);
+
+        ship.dock();
+        assert_eq!(ship.state, ShipState::Docked);
+        assert_eq!(ship.speed, 0.0);
+    }
+
+    #[test]
+    fn test_arrival_docks() {
+        let mut ship = Ship::new(Position::ZERO, Some(Position::new(3.0, 0.0)));
+        assert!(ship.check_arrival());
+        assert_eq!(ship.state, ShipState::Docked);
     }
 }
