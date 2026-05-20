@@ -1,5 +1,6 @@
 use std::path::Path;
 
+use crate::ai::ShipAI;
 use crate::map::MapSystem;
 use crate::port::{Port, all_ports};
 use crate::ship::{Ship, ShipState, ShipStats};
@@ -11,6 +12,7 @@ pub struct World {
     pub weather: WeatherSystem,
     pub ports: Vec<Port>,
     pub ships: Vec<Ship>,
+    pub ship_ais: Vec<ShipAI>,
     pub date: SimDate,
 }
 
@@ -24,39 +26,41 @@ impl World {
             weather,
             ports: all_ports(),
             ships: Vec::new(),
-            date: SimDate::new(1680, 0, 1), // January 1, 1680
+            ship_ais: Vec::new(),
+            date: SimDate::new(1680, 0, 1),
         }
+    }
+
+    /// Add a ship with its AI controller.
+    pub fn add_ship(&mut self, ship: Ship, ai: ShipAI) {
+        self.ships.push(ship);
+        self.ship_ais.push(ai);
     }
 
     /// Advance the simulation by one hour.
     pub fn tick(&mut self) {
         let stats = ShipStats::sloop();
 
-        for ship in &mut self.ships {
-            if ship.state != ShipState::Sailing {
+        for i in 0..self.ships.len() {
+            let wind = self.weather.wind.wind_at(self.ships[i].position, self.date.month());
+
+            // AI decides heading (or docks/undocks)
+            self.ship_ais[i].tick(&mut self.ships[i], &stats, &wind);
+
+            if self.ships[i].state != ShipState::Sailing {
                 continue;
             }
 
-            // Get wind at ship's position
-            let wind = self.weather.wind.wind_at(ship.position, self.date.month());
-
-            // Choose heading (VMG-based tacking when beating into wind)
-            ship.update_heading_toward_destination(&stats, &wind);
-
-            // Compute proposed new position
-            let new_pos = ship.compute_next_position(&stats, &wind, 1.0);
+            // Physics: compute movement
+            let new_pos = self.ships[i].compute_next_position(&stats, &wind, 1.0);
 
             // Land collision check
             if !self.map.land.is_land(new_pos) {
-                ship.position = new_pos;
-                ship.speed = ship.effective_speed(&stats, &wind);
+                self.ships[i].position = new_pos;
+                self.ships[i].speed = self.ships[i].effective_speed(&stats, &wind);
             } else {
-                ship.speed = 0.0;
-                // TODO: pathfinding around obstacles
+                self.ships[i].speed = 0.0;
             }
-
-            // Arrival check
-            ship.check_arrival();
         }
 
         self.date.advance_hours(1);

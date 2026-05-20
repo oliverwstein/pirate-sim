@@ -1,5 +1,6 @@
 use macroquad::prelude::*;
-use sim_core::ship::Ship;
+use sim_core::ai::ShipAI;
+use sim_core::ship::{Ship, ShipState};
 use sim_core::types::Position;
 use sim_core::world::World;
 use std::path::Path;
@@ -205,13 +206,19 @@ fn draw_hud(world: &World, paused: bool, ticks_per_frame: u32) {
 
     // Ship info
     for (i, ship) in world.ships.iter().enumerate() {
-        let dist = ship
+        let dist = world.ship_ais[i]
+            .nav
             .destination
             .map(|d| ship.position.distance(d))
             .unwrap_or(0.0);
+        let state_str = match ship.state {
+            ShipState::Sailing => "sailing",
+            ShipState::Docked => "docked",
+            ShipState::Anchored => "anchored",
+        };
         let ship_info = format!(
-            "Ship {}: speed={:.1}kt heading={:.0}° dist={:.0}nm",
-            i, ship.speed, ship.heading, dist
+            "Ship {}: {} speed={:.1}kt heading={:.0}° dist={:.0}nm",
+            i, state_str, ship.speed, ship.heading, dist
         );
         draw_text(&ship_info, 10.0, 40.0 + i as f32 * 18.0, 16.0, LIGHTGRAY);
     }
@@ -224,9 +231,9 @@ async fn main() {
     // Spawn test ship: Barbados → Port Royal (Jamaica)
     let barbados_pos = world.ports.iter().find(|p| p.name == "Bridgetown").unwrap().position;
     let port_royal_pos = world.ports.iter().find(|p| p.name == "Port Royal").unwrap().position;
-    world
-        .ships
-        .push(Ship::new(barbados_pos, Some(port_royal_pos)));
+    let ship = Ship::new(barbados_pos, ShipState::Sailing);
+    let ai = ShipAI::with_destination(port_royal_pos);
+    world.add_ship(ship, ai);
 
     let mut camera = Camera::new();
     let mut paused = false;
