@@ -27,8 +27,8 @@ LAT_MAX = 60.0
 LON_MIN = -90.0
 LON_MAX = 15.0
 
-# Output resolution: 0.25° per cell (matches ERA5 wind grid)
-CELL_DEG = 0.25
+# Output resolution: 0.05° per cell (high detail for coastlines)
+CELL_DEG = 0.05
 
 
 def latlon_to_nm(lat: float, lon: float) -> tuple[float, float]:
