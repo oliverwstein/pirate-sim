@@ -16,6 +16,7 @@
 
 use crate::bt::{self, Behavior, BtContext, BtState, Status};
 use crate::nav::NavState;
+use crate::pathfind::{self, PathfindContext};
 use crate::port::Port;
 use crate::ship::{Ship, ShipState, ShipStats};
 use crate::types::{Position, WindVector};
@@ -120,7 +121,19 @@ impl ShipAI {
     }
 
     /// Called each tick: run the behavior tree.
-    pub fn tick(&mut self, ship: &mut Ship, stats: &ShipStats, wind: &WindVector, ports: &[Port]) {
+    ///
+    /// `pathfind` is optional — when `Some`, the AI will plan obstacle-aware
+    /// waypoint routes whenever it picks a new destination. When `None` it
+    /// falls back to straight-line navigation (useful for unit tests with
+    /// synthetic toy ports).
+    pub fn tick(
+        &mut self,
+        ship: &mut Ship,
+        stats: &ShipStats,
+        wind: &WindVector,
+        ports: &[Port],
+        pathfind: Option<&PathfindContext<'_>>,
+    ) {
         let mut ctx = ShipBtContext {
             ship,
             stats,
@@ -129,6 +142,7 @@ impl ShipAI {
             dock_action: &mut self.dock_action,
             ports,
             rng_state: &mut self.rng_state,
+            pathfind,
         };
 
         let status = bt::tick(&self.tree, &mut self.state, &mut ctx, 0);
@@ -142,6 +156,7 @@ impl ShipAI {
     /// Give the AI a new destination.
     pub fn set_destination(&mut self, dest: Position) {
         self.nav.destination = Some(dest);
+        self.nav.clear_path();
     }
 }
 
@@ -164,13 +179,30 @@ struct ShipBtContext<'a> {
     dock_action: &'a mut DockAction,
     ports: &'a [Port],
     rng_state: &'a mut u64,
+    pathfind: Option<&'a PathfindContext<'a>>,
+}
+
+impl<'a> ShipBtContext<'a> {
+    /// Helper: set a fresh destination and plan a path to it (when pathfind
+    /// data is available). The destination is always recorded, even if the
+    /// planner fails — in that case the ship falls back to straight-line nav.
+    fn assign_destination(&mut self, dest: Position) {
+        self.nav.destination = Some(dest);
+        self.nav.clear_path();
+        if let Some(ctx) = self.pathfind {
+            if let Some(path) = pathfind::find_path(ctx, self.ship.position, dest) {
+                self.nav.set_path(path);
+            }
+        }
+    }
 }
 
 impl<'a> BtContext for ShipBtContext<'a> {
     fn execute_action(&mut self, id: usize) -> Status {
         match id {
             ACT_SAIL => {
-                if let Some(heading) = self.nav.compute_heading(self.ship.position, self.stats, self.wind) {
+                let land = self.pathfind.map(|c| c.land);
+                if let Some(heading) = self.nav.compute_heading(self.ship.position, self.stats, self.wind, land) {
                     self.ship.set_heading(heading);
                     Status::Running
                 } else {
@@ -217,13 +249,13 @@ impl<'a> BtContext for ShipBtContext<'a> {
                 // Pick a random port that isn't too close to current position
                 let idx = (xorshift64(self.rng_state) as usize) % self.ports.len();
                 let port = &self.ports[idx];
-                // Skip if we're already very close to this port
-                if self.ship.position.distance(port.position) < 20.0 {
+                let chosen = if self.ship.position.distance(port.position) < 20.0 {
                     let alt_idx = (idx + 1) % self.ports.len();
-                    self.nav.destination = Some(self.ports[alt_idx].position);
+                    self.ports[alt_idx].position
                 } else {
-                    self.nav.destination = Some(port.position);
-                }
+                    port.position
+                };
+                self.assign_destination(chosen);
                 Status::Success
             }
             ACT_DIVERT_TO_PORT => {
@@ -235,7 +267,8 @@ impl<'a> BtContext for ShipBtContext<'a> {
                         da.partial_cmp(&db).unwrap()
                     })
                 {
-                    self.nav.destination = Some(nearest.position);
+                    let dest = nearest.position;
+                    self.assign_destination(dest);
                 }
                 // Now sail (will be picked up next tick by HasDestination → Sail)
                 Status::Success

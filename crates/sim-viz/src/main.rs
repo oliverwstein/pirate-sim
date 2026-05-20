@@ -9,6 +9,7 @@ const SEA_COLOR: Color = Color::new(0.08, 0.20, 0.35, 1.0);
 const LAND_COLOR: Color = Color::new(0.15, 0.40, 0.12, 1.0);
 const SHIP_COLOR: Color = Color::new(1.0, 0.9, 0.2, 1.0);
 const WIND_COLOR: Color = Color::new(0.5, 0.7, 1.0, 0.6);
+const PATH_COLOR: Color = Color::new(1.0, 0.9, 0.2, 0.5);
 
 struct Camera {
     offset: Vec2,   // world-space center of view
@@ -74,30 +75,52 @@ fn draw_land(world: &World, camera: &Camera) {
     let row_start = ((land.origin.y - max_y) / land.cell_size_nm).floor().max(0.0) as u32;
     let row_end = ((land.origin.y - min_y) / land.cell_size_nm).ceil().min(land.height as f32) as u32;
 
-    let cell_screen_size = land.cell_size_nm * camera.zoom;
+    // When the grid is finer than one screen pixel per cell, stride through
+    // it so the whole visible area can be drawn cheaply. Each drawn rectangle
+    // covers a `stride x stride` block of source cells; if any cell in that
+    // block is land we paint the block as land. This is the cheap LOD trick
+    // that makes a 1 NM/cell grid render at low zoom.
+    let cell_px = land.cell_size_nm * camera.zoom;
+    let stride = if cell_px >= 1.0 {
+        1u32
+    } else {
+        (1.0 / cell_px).ceil() as u32
+    };
+    let block_screen_size = (land.cell_size_nm * stride as f32) * camera.zoom;
+    let draw_size = block_screen_size.max(1.0);
 
-    // Skip if cells are too small to see
-    if cell_screen_size < 1.0 {
-        return;
-    }
-
-    for row in row_start..row_end {
-        for col in col_start..col_end {
-            let idx = (row * land.width + col) as usize;
-            if land.data[idx] == 255 {
-                // This cell is land
+    let mut row = row_start;
+    while row < row_end {
+        let mut col = col_start;
+        while col < col_end {
+            // Block-any: is any cell in this stride x stride block land?
+            let r_max = (row + stride).min(land.height);
+            let c_max = (col + stride).min(land.width);
+            let mut is_land = false;
+            'outer: for rr in row..r_max {
+                let base = (rr * land.width) as usize;
+                for cc in col..c_max {
+                    if land.data[base + cc as usize] == 255 {
+                        is_land = true;
+                        break 'outer;
+                    }
+                }
+            }
+            if is_land {
                 let world_x = land.origin.x + col as f32 * land.cell_size_nm;
                 let world_y = land.origin.y - row as f32 * land.cell_size_nm;
                 let screen_pos = camera.world_to_screen(Position::new(world_x, world_y));
                 draw_rectangle(
                     screen_pos.x,
-                    screen_pos.y - cell_screen_size,
-                    cell_screen_size,
-                    cell_screen_size,
+                    screen_pos.y - block_screen_size,
+                    draw_size,
+                    draw_size,
                     LAND_COLOR,
                 );
             }
+            col += stride;
         }
+        row += stride;
     }
 }
 
@@ -169,6 +192,21 @@ fn draw_ports(world: &World, camera: &Camera) {
 }
 
 fn draw_ships(world: &World, camera: &Camera) {
+    // Planned paths first, so ship triangles draw on top.
+    for (i, ship) in world.ships.iter().enumerate() {
+        let nav = &world.ship_ais[i].nav;
+        if nav.waypoints.is_empty() {
+            continue;
+        }
+        let mut prev = camera.world_to_screen(ship.position);
+        for wp in nav.waypoints.iter() {
+            let p = camera.world_to_screen(*wp);
+            draw_line(prev.x, prev.y, p.x, p.y, 1.5, PATH_COLOR);
+            draw_circle(p.x, p.y, 2.0, PATH_COLOR);
+            prev = p;
+        }
+    }
+
     for ship in &world.ships {
         let sp = camera.world_to_screen(ship.position);
         let size = 6.0;

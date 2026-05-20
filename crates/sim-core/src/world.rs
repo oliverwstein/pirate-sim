@@ -2,6 +2,7 @@ use std::path::Path;
 
 use crate::ai::ShipAI;
 use crate::map::MapSystem;
+use crate::pathfind::PathfindContext;
 use crate::port::{Port, all_ports};
 use crate::ship::{Ship, ShipState, ShipStats};
 use crate::types::SimDate;
@@ -40,27 +41,39 @@ impl World {
     /// Advance the simulation by one hour.
     pub fn tick(&mut self) {
         let stats = ShipStats::sloop();
+        let month = self.date.month();
+        let pathfind = PathfindContext::new(&self.map.land, &self.weather.wind, &stats, month);
 
         for i in 0..self.ships.len() {
-            let wind = self.weather.wind.wind_at(self.ships[i].position, self.date.month());
+            let wind = self.weather.wind.wind_at(self.ships[i].position, month);
 
             // AI decides heading (or docks/undocks)
-            self.ship_ais[i].tick(&mut self.ships[i], &stats, &wind, &self.ports);
+            self.ship_ais[i].tick(
+                &mut self.ships[i],
+                &stats,
+                &wind,
+                &self.ports,
+                Some(&pathfind),
+            );
 
-            // Resource consumption (always, even when docked — crew still eats)
+            // Resource consumption
             self.ships[i].tick_resources(&stats);
 
             if self.ships[i].state != ShipState::Sailing {
                 continue;
             }
 
-            // Physics: compute movement
+            // Physics: compute movement, swept against land so a single
+            // tick never tunnels through a coastline.
             let new_pos = self.ships[i].compute_next_position(&stats, &wind, 1.0);
+            let old_pos = self.ships[i].position;
+            let safe_pos = self.map.land.farthest_clear_point(old_pos, new_pos);
 
-            // Land collision check
-            if !self.map.land.is_land(new_pos) {
-                self.ships[i].position = new_pos;
-                self.ships[i].speed = self.ships[i].effective_speed(&stats, &wind);
+            if safe_pos.distance(old_pos) > 0.05 {
+                self.ships[i].position = safe_pos;
+                // Speed reflects how far we actually traveled.
+                let traveled = safe_pos.distance(old_pos);
+                self.ships[i].speed = traveled; // 1 hour tick → NM == kt
             } else {
                 self.ships[i].speed = 0.0;
             }

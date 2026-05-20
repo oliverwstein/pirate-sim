@@ -27,8 +27,10 @@ LAT_MAX = 60.0
 LON_MIN = -90.0
 LON_MAX = 15.0
 
-# Output resolution: 0.05° per cell (high detail for coastlines)
-CELL_DEG = 0.05
+# Output resolution: 1 NM per cell (~0.01667°). High enough to capture rivers
+# and narrow channels (Delaware to Philadelphia, Hudson to Albany, etc.) at
+# the cost of ~24M cells total over the Caribbean + US east coast bbox.
+CELL_DEG = 1.0 / 60.0
 
 
 def latlon_to_nm(lat: float, lon: float) -> tuple[float, float]:

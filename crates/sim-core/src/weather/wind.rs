@@ -120,4 +120,20 @@ impl WindGrid {
 
         WindVector { u, v }
     }
+
+    /// Construct a WindGrid from raw components (used by tests / synthetic maps).
+    pub fn from_raw(
+        u_data: Vec<f32>,
+        v_data: Vec<f32>,
+        width: u32,
+        height: u32,
+        origin: Position,
+        cell_size_nm: f32,
+        months: u8,
+    ) -> Self {
+        let n = (months as usize) * (height as usize) * (width as usize);
+        assert_eq!(u_data.len(), n, "u_data size mismatch");
+        assert_eq!(v_data.len(), n, "v_data size mismatch");
+        Self { u_data, v_data, width, height, origin, cell_size_nm, months }
+    }
 }
