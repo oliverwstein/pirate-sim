@@ -108,6 +108,7 @@ impl Ship {
     /// Consume provisions and accumulate fouling for one hour.
     /// Called by world tick. Returns true if provisions are exhausted.
     pub fn tick_resources(&mut self, stats: &ShipStats) -> bool {
+        // TODO: provisions should only be consumed while sailing. Likewise, a ship should not accumulate fouling while careened, and should accumulate more while docked or anchored than while sailing.
         // Provision consumption: per hour = daily / 24
         let hourly_consumption = stats.daily_provision_consumption() / 24.0;
         self.provisions = (self.provisions - hourly_consumption).max(0.0);
