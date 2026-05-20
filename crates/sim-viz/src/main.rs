@@ -11,17 +11,33 @@ const SHIP_COLOR: Color = Color::new(1.0, 0.9, 0.2, 1.0);
 const WIND_COLOR: Color = Color::new(0.5, 0.7, 1.0, 0.6);
 const PATH_COLOR: Color = Color::new(1.0, 0.9, 0.2, 0.5);
 
+/// Discrete level-of-detail zoom steps in pixels-per-NM. Mouse wheel
+/// snaps between adjacent levels; the camera additionally clamps zoom
+/// up so that the entire map always fills the viewport.
+const LOD_LEVELS: &[f32] = &[0.1, 0.2, 0.4, 0.8, 1.6, 3.2];
+
 struct Camera {
-    offset: Vec2,   // world-space center of view
-    zoom: f32,      // pixels per nautical mile
+    offset: Vec2,           // world-space center of view
+    lod_index: usize,       // index into LOD_LEVELS (requested zoom step)
+    fit_zoom: f32,          // computed each frame: zoom at which the whole map fits
+    scroll_accum: f32,      // accumulator for mouse wheel deltas
 }
 
 impl Camera {
     fn new() -> Self {
         Self {
             offset: Vec2::ZERO,
-            zoom: 0.4,
+            // 0.4 px/NM is a reasonable default-fit for typical screens.
+            lod_index: LOD_LEVELS.iter().position(|&z| z >= 0.4).unwrap_or(2),
+            fit_zoom: 0.0,
+            scroll_accum: 0.0,
         }
+    }
+
+    /// Effective zoom: the requested LoD level, but never below `fit_zoom`
+    /// (so we don't waste viewport area when the entire map already fits).
+    fn zoom(&self) -> f32 {
+        LOD_LEVELS[self.lod_index].max(self.fit_zoom)
     }
 
     fn world_to_screen(&self, pos: Position) -> Vec2 {
@@ -29,11 +45,23 @@ impl Camera {
         let sh = screen_height();
         let dx = pos.x - self.offset.x;
         let dy = pos.y - self.offset.y;
-        Vec2::new(sw / 2.0 + dx * self.zoom, sh / 2.0 - dy * self.zoom)
+        let z = self.zoom();
+        Vec2::new(sw / 2.0 + dx * z, sh / 2.0 - dy * z)
+    }
+
+    /// Update `fit_zoom` for the current viewport given the world extent.
+    fn update_fit(&mut self, world: &World) {
+        let land = &world.map.land;
+        let world_w = land.width as f32 * land.cell_size_nm;
+        let world_h = land.height as f32 * land.cell_size_nm;
+        let fit_x = screen_width() / world_w;
+        let fit_y = screen_height() / world_h;
+        self.fit_zoom = fit_x.min(fit_y);
     }
 
     fn handle_input(&mut self) {
-        let pan_speed = 10.0 / self.zoom;
+        let z = self.zoom();
+        let pan_speed = 10.0 / z;
         if is_key_down(KeyCode::W) || is_key_down(KeyCode::Up) {
             self.offset.y += pan_speed;
         }
@@ -47,10 +75,30 @@ impl Camera {
             self.offset.x += pan_speed;
         }
 
-        let (_scroll_x, scroll_y) = mouse_wheel();
-        if scroll_y != 0.0 {
-            self.zoom *= 1.0 + scroll_y * 0.1;
-            self.zoom = self.zoom.clamp(0.05, 5.0);
+        // Mouse wheel: accumulate and step LoD on threshold so a single
+        // scroll click moves exactly one level (avoids zoom-flicker on
+        // high-resolution trackpads which deliver many tiny deltas).
+        let (_sx, sy) = mouse_wheel();
+        self.scroll_accum += sy;
+        while self.scroll_accum >= 1.0 {
+            if self.lod_index + 1 < LOD_LEVELS.len() {
+                self.lod_index += 1;
+            }
+            self.scroll_accum -= 1.0;
+        }
+        while self.scroll_accum <= -1.0 {
+            if self.lod_index > 0 {
+                self.lod_index -= 1;
+            }
+            self.scroll_accum += 1.0;
+        }
+
+        // Keyboard zoom (Z = in, X = out).
+        if is_key_pressed(KeyCode::Z) && self.lod_index + 1 < LOD_LEVELS.len() {
+            self.lod_index += 1;
+        }
+        if is_key_pressed(KeyCode::X) && self.lod_index > 0 {
+            self.lod_index -= 1;
         }
     }
 }
@@ -106,7 +154,7 @@ fn draw_land(world: &World, camera: &Camera, tex: &Texture2D) {
     let world_x = land.origin.x;
     let world_y = land.origin.y;
     let top_left = camera.world_to_screen(Position::new(world_x, world_y));
-    let pixel_size = land.cell_size_nm * camera.zoom;
+    let pixel_size = land.cell_size_nm * camera.zoom();
     let dest_w = land.width as f32 * pixel_size;
     let dest_h = land.height as f32 * pixel_size;
     draw_texture_ex(
@@ -126,7 +174,7 @@ fn draw_wind_arrows(world: &World, camera: &Camera) {
     let month = world.date.month();
 
     // Draw wind arrows every N grid cells
-    let spacing = (20.0 / camera.zoom).max(3.0) as u32;
+    let spacing = (20.0 / camera.zoom()).max(3.0) as u32;
 
     for row in (0..wind.height).step_by(spacing as usize) {
         for col in (0..wind.width).step_by(spacing as usize) {
@@ -147,7 +195,7 @@ fn draw_wind_arrows(world: &World, camera: &Camera) {
             }
 
             // Arrow length proportional to wind speed
-            let arrow_len = w.speed() * camera.zoom * 0.8;
+            let arrow_len = w.speed() * camera.zoom() * 0.8;
             if arrow_len < 2.0 {
                 continue;
             }
@@ -182,7 +230,7 @@ fn draw_ports(world: &World, camera: &Camera) {
         draw_circle_lines(sp.x, sp.y, 4.0, 1.0, WHITE);
 
         // Draw name if zoomed in enough
-        if camera.zoom > 0.15 {
+        if camera.zoom() > 0.15 {
             draw_text(port.name, sp.x + 6.0, sp.y - 4.0, 14.0, color);
         }
     }
@@ -224,18 +272,21 @@ fn draw_ships(world: &World, camera: &Camera) {
     }
 }
 
-fn draw_hud(world: &World, paused: bool, ticks_per_frame: u32) {
+fn draw_hud(world: &World, camera: &Camera, paused: bool, ticks_per_frame: u32) {
     let date_str = format!(
         "Year {} Day {} {:02}:00",
         world.date.year, world.date.day_of_year, world.date.hour
     );
     let status = if paused { "PAUSED" } else { "RUNNING" };
     let info = format!(
-        "{} | Speed: {}h/frame | {} | Ships: {}",
+        "{} | Speed: {}h/frame | {} | Ships: {} | Zoom: {}/{} ({:.2}px/NM)",
         date_str,
         ticks_per_frame,
         status,
-        world.ships.len()
+        world.ships.len(),
+        camera.lod_index + 1,
+        LOD_LEVELS.len(),
+        camera.zoom(),
     );
     draw_text(&info, 10.0, 20.0, 20.0, WHITE);
 
@@ -279,6 +330,7 @@ async fn main() {
 
     loop {
         // Input
+        camera.update_fit(&world);
         camera.handle_input();
         if is_key_pressed(KeyCode::Space) {
             paused = !paused;
@@ -308,7 +360,7 @@ async fn main() {
         draw_wind_arrows(&world, &camera);
         draw_ports(&world, &camera);
         draw_ships(&world, &camera);
-        draw_hud(&world, paused, ticks_per_frame);
+        draw_hud(&world, &camera, paused, ticks_per_frame);
 
         next_frame().await;
     }
