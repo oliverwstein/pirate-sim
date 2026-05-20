@@ -21,6 +21,7 @@ use std::collections::{BinaryHeap, HashMap, HashSet};
 
 use crate::harbor::Harbor;
 use crate::map::land::{CoarseLand, LandMap};
+use crate::navmesh::Navmesh;
 use crate::ship::{speed_at_heading, ShipStats};
 use crate::types::{Position, WindVector};
 use crate::weather::wind::WindGrid;
@@ -31,11 +32,27 @@ pub struct PathfindContext<'a> {
     pub wind: &'a WindGrid,
     pub stats: &'a ShipStats,
     pub month: u8,
+    /// Optional navmesh. When present, [`find_path_to_harbor`] and
+    /// [`find_path`] use graph routing on the mesh — sub-millisecond and
+    /// guaranteed-connected — instead of coarse-grid A*. Tests and small
+    /// synthetic maps may omit it (`None`), in which case we fall back to
+    /// the original coarse A*.
+    pub navmesh: Option<&'a Navmesh>,
 }
 
 impl<'a> PathfindContext<'a> {
     pub fn new(land: &'a LandMap, wind: &'a WindGrid, stats: &'a ShipStats, month: u8) -> Self {
-        Self { land, wind, stats, month }
+        Self { land, wind, stats, month, navmesh: None }
+    }
+
+    pub fn with_navmesh(
+        land: &'a LandMap,
+        wind: &'a WindGrid,
+        stats: &'a ShipStats,
+        month: u8,
+        navmesh: &'a Navmesh,
+    ) -> Self {
+        Self { land, wind, stats, month, navmesh: Some(navmesh) }
     }
 }
 
@@ -65,6 +82,21 @@ const CLEARANCE_CELLS: u32 = 0;
 /// smoother to invalidate too many of the planner's waypoints.
 const SMOOTH_MARGIN_NM: f32 = 2.0;
 
+/// Search radius (NM) for finding visible navmesh entry/exit nodes from a
+/// non-mesh start/goal point (a harbor anchor, a ship's current position).
+const ENTRY_RADIUS_NM: f32 = 200.0;
+
+/// Cap on the number of mesh entry/exit nodes considered. The mesh has very
+/// high local connectivity (avg degree 30+), so a handful of nearby nodes
+/// already covers all reasonable graph entries.
+const ENTRY_CANDIDATES: usize = 16;
+
+/// Margin (NM) used when probing line-of-sight from a coastal start/anchor
+/// point to a mesh node. Zero (line-of-sight only) is correct here: harbor
+/// anchors are placed adjacent to coastlines so any non-zero margin would
+/// reject every candidate.
+const ENTRY_MARGIN_NM: f32 = 0.0;
+
 /// Heuristic weight for weighted A*. Values >1 make the search greedier:
 /// dramatically faster, paths a few percent longer than optimal. At 1 NM/cell
 /// a strict (weight=1.0) search blows the expansion budget on long open-water
@@ -84,6 +116,19 @@ pub fn find_path(
     start: Position,
     goal: Position,
 ) -> Option<Vec<Position>> {
+    // Trivial: line-of-sight to goal.
+    if ctx.land.corridor_is_clear(start, goal, SMOOTH_MARGIN_NM) {
+        return Some(vec![goal]);
+    }
+
+    // Navmesh fast path.
+    if let Some(nm) = ctx.navmesh {
+        if let Some(p) = navmesh_path(ctx.land, nm, start, &[goal], goal) {
+            return Some(p);
+        }
+        // If the mesh failed, fall through to the coarse-grid backup.
+    }
+
     let coarse = &ctx.land.coarse;
 
     let raw_start = coarse.pos_to_cell(start)?;
@@ -93,10 +138,6 @@ pub fn find_path(
     let goal_anchor = coarse.cell_to_pos(goal_cell.0, goal_cell.1);
 
     if start_cell == goal_cell {
-        return Some(vec![goal_anchor]);
-    }
-
-    if ctx.land.corridor_is_clear(start, goal_anchor, SMOOTH_MARGIN_NM) {
         return Some(vec![goal_anchor]);
     }
 
@@ -117,7 +158,6 @@ pub fn find_path_to_harbor(
     harbor: &Harbor,
 ) -> Option<Vec<Position>> {
     let land = ctx.land;
-    let coarse = &land.coarse;
 
     if harbor.cells.is_empty() {
         return None;
@@ -133,6 +173,15 @@ pub fn find_path_to_harbor(
         return Some(vec![harbor.anchor]);
     }
 
+    // Navmesh fast path.
+    if let Some(nm) = ctx.navmesh {
+        if let Some(p) = navmesh_path(land, nm, start, &[harbor.anchor], harbor.anchor) {
+            return Some(p);
+        }
+        // If the mesh failed, fall through to the coarse-grid backup.
+    }
+
+    let coarse = &land.coarse;
     let raw_start = coarse.pos_to_cell(start)?;
     let start_cell = coarse.nearest_sea_cell(raw_start.0, raw_start.1, SNAP_RADIUS)?;
 
@@ -159,6 +208,51 @@ pub fn find_path_to_harbor(
     // Use the harbor anchor as the terminal world position so the ship has
     // a definite point to aim at inside the zone.
     finalize_path(land, coarse, start, &cells, harbor.anchor)
+}
+
+/// Plan a path through the navmesh from `start` to any of the goal anchors,
+/// returning waypoint positions ending at `terminal`. The boundary legs
+/// (start → first mesh node, last mesh node → terminal) bypass the mesh and
+/// rely on line-of-sight checks. Returns `None` if no graph route exists.
+fn navmesh_path(
+    land: &LandMap,
+    nm: &Navmesh,
+    start: Position,
+    goal_anchors: &[Position],
+    terminal: Position,
+) -> Option<Vec<Position>> {
+    // Mesh entries from start.
+    let starts = nm.visible_from(land, start, ENTRY_RADIUS_NM, ENTRY_CANDIDATES, ENTRY_MARGIN_NM);
+    if starts.is_empty() {
+        return None;
+    }
+
+    // Mesh exits visible from any goal anchor (union of all visibility sets).
+    let mut goal_seen: HashSet<u32> = HashSet::new();
+    let mut goals: Vec<u32> = Vec::new();
+    for &ga in goal_anchors {
+        for n in nm.visible_from(land, ga, ENTRY_RADIUS_NM, ENTRY_CANDIDATES, ENTRY_MARGIN_NM) {
+            if goal_seen.insert(n) {
+                goals.push(n);
+            }
+        }
+    }
+    if goals.is_empty() {
+        return None;
+    }
+
+    let route = nm.route(&starts, &goals)?;
+
+    // Build raw waypoint list: [start, mesh nodes..., terminal] then smooth.
+    let mut points: Vec<Position> = Vec::with_capacity(route.len() + 2);
+    points.push(start);
+    for idx in &route {
+        points.push(nm.nodes[*idx as usize].pos);
+    }
+    points.push(terminal);
+
+    let smoothed = smooth_path(land, &points);
+    Some(smoothed.into_iter().skip(1).collect())
 }
 
 /// Common path-finalization: coarse cells → world positions → smoothed waypoints.

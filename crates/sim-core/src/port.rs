@@ -73,7 +73,7 @@ const PORTS: &[(&str, f32, f32, Faction, f32)] = &[
     ("Charleston", -445.8, 916.8, Faction::England, 25.0),
     ("Boston", 86.4, 1491.6, Faction::England, 20.0),
     ("New York", -90.6, 1392.6, Faction::England, 60.0),     // NY harbor + lower Hudson + reach to Atlantic
-    ("Philadelphia", -160.2, 1347.0, Faction::England, 150.0), // up the Delaware to the bay mouth + Atlantic
+    ("Philadelphia", -177.8, 1312.6, Faction::England, 30.0), // 39.379°N, -75.460°W
     ("Bermuda", 469.2, 892.8, Faction::England, D),
     ("Belize", -942.0, 0.0, Faction::England, 30.0),
     // === FRENCH ===
@@ -85,7 +85,7 @@ const PORTS: &[(&str, f32, f32, Faction, f32)] = &[
     // === DUTCH ===
     ("Willemstad", 214.2, -323.4, Faction::Holland, D),
     ("St. Eustatius", 571.8, -1.2, Faction::Holland, D),
-    ("Paramaribo", 1039.8, -700.2, Faction::Holland, 20.0), // up the Suriname river
+    ("Paramaribo", 1039.8, -685.0, Faction::Holland, 15.0), // moved to mouth of Suriname river
     // === PIRATE HAVENS ===
     ("Tortuga", -16.8, 152.4, Faction::Pirate, D),
     ("Nassau", -291.0, 453.0, Faction::Pirate, D),

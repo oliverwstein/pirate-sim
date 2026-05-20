@@ -13,7 +13,7 @@ use std::time::Instant;
 fn main() {
     let world = World::load(Path::new("data/"));
     let stats = ShipStats::sloop();
-    let pf = PathfindContext::new(&world.map.land, &world.weather.wind, &stats, 0);
+    let pf = PathfindContext::with_navmesh(&world.map.land, &world.weather.wind, &stats, 0, &world.navmesh);
 
     let n = world.ports.len();
     println!("Benchmarking {} ports = {} ordered pairs ({} directed routes)",
@@ -44,9 +44,12 @@ fn main() {
                 Some(h) => h,
                 None => continue,
             };
+            // Start from the source harbor's anchor (a known sea position),
+            // not the port's literal coordinate which can sit on land.
+            let from_pos = world.harbors.for_port(i).map(|h| h.anchor).unwrap_or(from.position);
 
             let t0 = Instant::now();
-            let result = find_path_to_harbor(&pf, from.position, harbor);
+            let result = find_path_to_harbor(&pf, from_pos, harbor);
             let dt = t0.elapsed();
             let us = dt.as_micros();
 

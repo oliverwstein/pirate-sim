@@ -4,6 +4,7 @@ pub mod weather;
 pub mod ship;
 pub mod harbor;
 pub mod pathfind;
+pub mod navmesh;
 pub mod nav;
 pub mod bt;
 pub mod ai;

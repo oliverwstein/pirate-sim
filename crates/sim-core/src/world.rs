@@ -3,6 +3,7 @@ use std::path::Path;
 use crate::ai::ShipAI;
 use crate::harbor::HarborMap;
 use crate::map::MapSystem;
+use crate::navmesh::Navmesh;
 use crate::pathfind::PathfindContext;
 use crate::port::{Port, all_ports};
 use crate::ship::{Ship, ShipState, ShipStats};
@@ -14,6 +15,7 @@ pub struct World {
     pub weather: WeatherSystem,
     pub ports: Vec<Port>,
     pub harbors: HarborMap,
+    pub navmesh: Navmesh,
     pub ships: Vec<Ship>,
     pub ship_ais: Vec<ShipAI>,
     pub date: SimDate,
@@ -25,12 +27,14 @@ impl World {
         let weather = WeatherSystem::load(data_dir);
         let ports = all_ports();
         let harbors = HarborMap::build(&map.land, &ports);
+        let navmesh = Navmesh::build(&map.land);
 
         Self {
             map,
             weather,
             ports,
             harbors,
+            navmesh,
             ships: Vec::new(),
             ship_ais: Vec::new(),
             date: SimDate::new(1680, 0, 1),
@@ -47,7 +51,13 @@ impl World {
     pub fn tick(&mut self) {
         let stats = ShipStats::sloop();
         let month = self.date.month();
-        let pathfind = PathfindContext::new(&self.map.land, &self.weather.wind, &stats, month);
+        let pathfind = PathfindContext::with_navmesh(
+            &self.map.land,
+            &self.weather.wind,
+            &stats,
+            month,
+            &self.navmesh,
+        );
 
         for i in 0..self.ships.len() {
             let wind = self.weather.wind.wind_at(self.ships[i].position, month);
