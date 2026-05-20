@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use crate::ai::ShipAI;
+use crate::harbor::HarborMap;
 use crate::map::MapSystem;
 use crate::pathfind::PathfindContext;
 use crate::port::{Port, all_ports};
@@ -12,6 +13,7 @@ pub struct World {
     pub map: MapSystem,
     pub weather: WeatherSystem,
     pub ports: Vec<Port>,
+    pub harbors: HarborMap,
     pub ships: Vec<Ship>,
     pub ship_ais: Vec<ShipAI>,
     pub date: SimDate,
@@ -21,11 +23,14 @@ impl World {
     pub fn load(data_dir: &Path) -> Self {
         let map = MapSystem::load(data_dir);
         let weather = WeatherSystem::load(data_dir);
+        let ports = all_ports();
+        let harbors = HarborMap::build(&map.land, &ports);
 
         Self {
             map,
             weather,
-            ports: all_ports(),
+            ports,
+            harbors,
             ships: Vec::new(),
             ship_ais: Vec::new(),
             date: SimDate::new(1680, 0, 1),
@@ -53,6 +58,7 @@ impl World {
                 &stats,
                 &wind,
                 &self.ports,
+                &self.harbors,
                 Some(&pathfind),
             );
 
@@ -65,6 +71,20 @@ impl World {
 
             // Physics: compute movement, swept against land so a single
             // tick never tunnels through a coastline.
+            //
+            // Rescue: a ship may legitimately be inside a land cell — e.g.,
+            // it just undocked from a port whose literal coordinates fall
+            // on land at our 1 NM/cell resolution. From inside land,
+            // `farthest_clear_point` would otherwise refuse all motion and
+            // strand the ship. Snap to the nearest sea cell first.
+            if self.map.land.is_land(self.ships[i].position) {
+                if let Some(cell) = self.map.land.pos_to_cell(self.ships[i].position) {
+                    if let Some(sea) = self.map.land.nearest_sea_cell(cell.0, cell.1, 32) {
+                        self.ships[i].position = self.map.land.cell_to_pos(sea.0, sea.1);
+                    }
+                }
+            }
+
             let new_pos = self.ships[i].compute_next_position(&stats, &wind, 1.0);
             let old_pos = self.ships[i].position;
             let safe_pos = self.map.land.farthest_clear_point(old_pos, new_pos);

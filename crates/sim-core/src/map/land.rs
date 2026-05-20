@@ -18,6 +18,134 @@ pub struct LandMap {
     pub height: u32,
     pub origin: Position, // NW corner in NM
     pub cell_size_nm: f32,
+    /// Chebyshev (king-move) distance from each cell to the nearest land
+    /// cell, saturating at 255. Land cells are 0. Computed once at load
+    /// time so `has_cell_clearance` is an O(1) array lookup instead of a
+    /// (2k+1)² nested scan — critical for A* performance at 1 NM/cell.
+    pub dist_to_land: Vec<u8>,
+    /// Coarse downsampled view (5 NM/cell) used for fast A* planning. The
+    /// fine grid is reserved for swept-collision and corridor smoothing.
+    pub coarse: CoarseLand,
+}
+
+/// Coarse-resolution land mask derived from a fine `LandMap`. Designed to
+/// be roughly 25× smaller (5 NM/cell vs 1 NM/cell) so that A* on long
+/// Caribbean / Atlantic routes is millisecond-cheap. A coarse cell is
+/// considered "land" if any of its source fine cells is land — i.e., we
+/// over-estimate land conservatively. The precomputed `dist_to_land`
+/// enables O(1) clearance queries on the coarse grid.
+pub struct CoarseLand {
+    pub data: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+    pub origin: Position,
+    pub cell_size_nm: f32,
+    pub dist_to_land: Vec<u8>,
+    /// Stride relative to the source fine grid (cells per coarse cell).
+    pub stride: u32,
+}
+
+impl CoarseLand {
+    pub fn is_sea_cell(&self, col: u32, row: u32) -> bool {
+        if col >= self.width || row >= self.height {
+            return false;
+        }
+        self.data[(row * self.width + col) as usize] != 255
+    }
+
+    pub fn has_cell_clearance(&self, col: u32, row: u32, radius: u32) -> bool {
+        if col >= self.width || row >= self.height {
+            return false;
+        }
+        (self.dist_to_land[(row * self.width + col) as usize] as u32) > radius
+    }
+
+    pub fn pos_to_cell(&self, pos: Position) -> Option<(u32, u32)> {
+        let dx = pos.x - self.origin.x;
+        let dy = self.origin.y - pos.y;
+        let col = (dx / self.cell_size_nm) as i32;
+        let row = (dy / self.cell_size_nm) as i32;
+        if col < 0 || row < 0 || col >= self.width as i32 || row >= self.height as i32 {
+            None
+        } else {
+            Some((col as u32, row as u32))
+        }
+    }
+
+    pub fn cell_to_pos(&self, col: u32, row: u32) -> Position {
+        Position::new(
+            self.origin.x + (col as f32 + 0.5) * self.cell_size_nm,
+            self.origin.y - (row as f32 + 0.5) * self.cell_size_nm,
+        )
+    }
+
+    /// BFS-find the nearest sea cell. Used for snapping start/goal points
+    /// that land in coarse cells the planner would otherwise reject.
+    pub fn nearest_sea_cell(&self, col: u32, row: u32, max_radius: u32) -> Option<(u32, u32)> {
+        if self.is_sea_cell(col, row) {
+            return Some((col, row));
+        }
+        use std::collections::{HashSet, VecDeque};
+        let mut visited: HashSet<(u32, u32)> = HashSet::new();
+        let mut queue: VecDeque<(u32, u32, u32)> = VecDeque::new();
+        visited.insert((col, row));
+        queue.push_back((col, row, 0));
+        while let Some((c, r, d)) = queue.pop_front() {
+            if d > max_radius {
+                continue;
+            }
+            for (dc, dr) in &[(-1i32, 0i32), (1, 0), (0, -1), (0, 1), (-1, -1), (1, -1), (-1, 1), (1, 1)] {
+                let nc = c as i32 + dc;
+                let nr = r as i32 + dr;
+                if nc < 0 || nr < 0 || nc >= self.width as i32 || nr >= self.height as i32 {
+                    continue;
+                }
+                let key = (nc as u32, nr as u32);
+                if visited.insert(key) {
+                    if self.is_sea_cell(key.0, key.1) {
+                        return Some(key);
+                    }
+                    queue.push_back((key.0, key.1, d + 1));
+                }
+            }
+        }
+        None
+    }
+}
+
+fn build_coarse(data: &[u8], width: u32, height: u32, origin: Position, cell_size_nm: f32, stride: u32) -> CoarseLand {
+    let cw = (width + stride - 1) / stride;
+    let ch = (height + stride - 1) / stride;
+    let mut coarse_data = vec![0u8; (cw * ch) as usize];
+    for cr in 0..ch {
+        for cc in 0..cw {
+            let r0 = cr * stride;
+            let c0 = cc * stride;
+            let r1 = (r0 + stride).min(height);
+            let c1 = (c0 + stride).min(width);
+            let mut land_seen = false;
+            'outer: for rr in r0..r1 {
+                let base = (rr * width) as usize;
+                for col in c0..c1 {
+                    if data[base + col as usize] == 255 {
+                        land_seen = true;
+                        break 'outer;
+                    }
+                }
+            }
+            coarse_data[(cr * cw + cc) as usize] = if land_seen { 255 } else { 0 };
+        }
+    }
+    let coarse_dist = compute_distance_to_land(&coarse_data, cw, ch);
+    CoarseLand {
+        data: coarse_data,
+        width: cw,
+        height: ch,
+        origin,
+        cell_size_nm: cell_size_nm * stride as f32,
+        dist_to_land: coarse_dist,
+        stride,
+    }
 }
 
 impl LandMap {
@@ -43,6 +171,8 @@ impl LandMap {
         );
 
         let data = bytes[20..].to_vec();
+        let dist_to_land = compute_distance_to_land(&data, width, height);
+        let coarse = build_coarse(&data, width, height, Position::new(origin_x, origin_y), cell_size, 5);
 
         Self {
             data,
@@ -50,6 +180,8 @@ impl LandMap {
             height,
             origin: Position::new(origin_x, origin_y),
             cell_size_nm: cell_size,
+            dist_to_land,
+            coarse,
         }
     }
 
@@ -229,21 +361,17 @@ impl LandMap {
 
     /// Returns true if the cell and its (`radius`-cell) Chebyshev neighborhood
     /// are all sea. `radius=1` is a 3×3 block, `radius=2` is 5×5, etc.
+    ///
+    /// Implemented as a single lookup against the precomputed
+    /// `dist_to_land` field: a cell with distance ≥ radius+1 has at least
+    /// `radius` clear cells in every direction (including out-of-bounds:
+    /// the border is treated as land, so this also rejects edge cells).
     pub fn has_cell_clearance(&self, col: u32, row: u32, radius: u32) -> bool {
-        let r = radius as i32;
-        for dr in -r..=r {
-            for dc in -r..=r {
-                let nc = col as i32 + dc;
-                let nr = row as i32 + dr;
-                if nc < 0 || nr < 0 || nc >= self.width as i32 || nr >= self.height as i32 {
-                    return false;
-                }
-                if !self.is_sea_cell(nc as u32, nr as u32) {
-                    return false;
-                }
-            }
+        if col >= self.width || row >= self.height {
+            return false;
         }
-        true
+        let d = self.dist_to_land[(row * self.width + col) as usize] as u32;
+        d > radius
     }
 
     /// Grid dimensions in world space.
@@ -301,6 +429,69 @@ impl LandMap {
     /// Construct a LandMap from raw components (used by tests / synthetic maps).
     pub fn from_raw(data: Vec<u8>, width: u32, height: u32, origin: Position, cell_size_nm: f32) -> Self {
         assert_eq!(data.len(), (width * height) as usize, "data size mismatch");
-        Self { data, width, height, origin, cell_size_nm }
+        let dist_to_land = compute_distance_to_land(&data, width, height);
+        let coarse = build_coarse(&data, width, height, origin, cell_size_nm, 5);
+        Self { data, width, height, origin, cell_size_nm, dist_to_land, coarse }
     }
+}
+
+/// Two-pass Chebyshev distance transform. Land cells (and out-of-bounds,
+/// implicitly via initial INF values not propagating through them) get 0;
+/// sea cells get the king-move distance to the nearest land cell, saturated
+/// at 255.
+fn compute_distance_to_land(data: &[u8], width: u32, height: u32) -> Vec<u8> {
+    let w = width as usize;
+    let h = height as usize;
+    // Use u16 internally to avoid wraparound during accumulation; clamp to
+    // u8 at the end. Initial sea cells get a large value, land = 0.
+    let mut dist: Vec<u16> = data.iter().map(|&v| if v == 255 { 0 } else { u16::MAX }).collect();
+    // Forward pass: top-to-bottom, left-to-right. Borders are treated as
+    // out-of-bounds (effectively land) so coastline cells at the edge get
+    // dist=1, ensuring `has_cell_clearance` rejects them safely.
+    for r in 0..h {
+        for c in 0..w {
+            let idx = r * w + c;
+            if dist[idx] == 0 {
+                continue;
+            }
+            let mut m: u16 = u16::MAX;
+            // Border check: treat out-of-bounds as land (dist=0), so the
+            // candidate neighbor distance is 0+1=1.
+            if r == 0 || c == 0 || c + 1 == w {
+                m = 1;
+            } else {
+                if dist[idx - w - 1] < m { m = dist[idx - w - 1]; }
+                if dist[idx - w] < m { m = dist[idx - w]; }
+                if dist[idx - w + 1] < m { m = dist[idx - w + 1]; }
+                if dist[idx - 1] < m { m = dist[idx - 1]; }
+            }
+            let cand = m.saturating_add(1);
+            if cand < dist[idx] {
+                dist[idx] = cand;
+            }
+        }
+    }
+    // Backward pass: bottom-to-top, right-to-left.
+    for r in (0..h).rev() {
+        for c in (0..w).rev() {
+            let idx = r * w + c;
+            if dist[idx] == 0 {
+                continue;
+            }
+            let mut m: u16 = u16::MAX;
+            if r + 1 == h || c == 0 || c + 1 == w {
+                m = 1;
+            } else {
+                if dist[idx + 1] < m { m = dist[idx + 1]; }
+                if dist[idx + w - 1] < m { m = dist[idx + w - 1]; }
+                if dist[idx + w] < m { m = dist[idx + w]; }
+                if dist[idx + w + 1] < m { m = dist[idx + w + 1]; }
+            }
+            let cand = m.saturating_add(1);
+            if cand < dist[idx] {
+                dist[idx] = cand;
+            }
+        }
+    }
+    dist.into_iter().map(|d| d.min(255) as u8).collect()
 }

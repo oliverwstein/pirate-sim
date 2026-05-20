@@ -15,6 +15,7 @@
 //! ]
 
 use crate::bt::{self, Behavior, BtContext, BtState, Status};
+use crate::harbor::HarborMap;
 use crate::nav::NavState;
 use crate::pathfind::{self, PathfindContext};
 use crate::port::Port;
@@ -40,6 +41,12 @@ const CAREEN_RATE_PORT: f32 = 3.0; // fouling points removed per hour
 
 /// Below this many days of provisions, divert to nearest port.
 const LOW_PROVISIONS_DAYS: f32 = 10.0;
+
+/// If a ship's waypoint queue is empty but it is still farther than this
+/// from its destination, request a fresh plan. Larger than `ARRIVAL_NM` so
+/// that ships about to dock don't waste a planner call, but small enough
+/// that a ship drifting past its smoothed route promptly recovers.
+const REPLAN_DISTANCE_NM: f32 = 25.0;
 
 /// What the ship is doing while docked (for display purposes).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -132,6 +139,7 @@ impl ShipAI {
         stats: &ShipStats,
         wind: &WindVector,
         ports: &[Port],
+        harbors: &HarborMap,
         pathfind: Option<&PathfindContext<'_>>,
     ) {
         let mut ctx = ShipBtContext {
@@ -141,6 +149,7 @@ impl ShipAI {
             nav: &mut self.nav,
             dock_action: &mut self.dock_action,
             ports,
+            harbors,
             rng_state: &mut self.rng_state,
             pathfind,
         };
@@ -156,6 +165,7 @@ impl ShipAI {
     /// Give the AI a new destination.
     pub fn set_destination(&mut self, dest: Position) {
         self.nav.destination = Some(dest);
+        self.nav.dest_port = None;
         self.nav.clear_path();
     }
 }
@@ -178,16 +188,46 @@ struct ShipBtContext<'a> {
     nav: &'a mut NavState,
     dock_action: &'a mut DockAction,
     ports: &'a [Port],
+    harbors: &'a HarborMap,
     rng_state: &'a mut u64,
     pathfind: Option<&'a PathfindContext<'a>>,
 }
 
 impl<'a> ShipBtContext<'a> {
-    /// Helper: set a fresh destination and plan a path to it (when pathfind
-    /// data is available). The destination is always recorded, even if the
-    /// planner fails — in that case the ship falls back to straight-line nav.
+    /// Set a destination *port* (by index) and plan a path to its harbor
+    /// zone. The destination is recorded even if planning fails — the ship
+    /// then falls back to straight-line nav with reactive deflection.
+    fn assign_destination_port(&mut self, port_index: usize) {
+        let port = &self.ports[port_index];
+        self.nav.destination = Some(port.position);
+        self.nav.dest_port = Some(port_index);
+        self.nav.clear_path();
+
+        if let (Some(pf), Some(harbor)) = (self.pathfind, self.harbors.for_port(port_index)) {
+            if let Some(path) = pathfind::find_path_to_harbor(pf, self.ship.position, harbor) {
+                self.nav.set_path(path);
+            }
+        }
+    }
+
+    /// Re-plan a path to the current destination port without resetting
+    /// other navigation state. Called when the existing waypoint queue has
+    /// emptied but the ship is still mid-voyage.
+    fn replan_to_port(&mut self, port_index: usize) {
+        if let (Some(pf), Some(harbor)) = (self.pathfind, self.harbors.for_port(port_index)) {
+            if let Some(path) = pathfind::find_path_to_harbor(pf, self.ship.position, harbor) {
+                self.nav.set_path(path);
+            }
+        }
+    }
+
+    /// Set a free-form destination *position* (e.g., open-water rendezvous).
+    /// No harbor zone is associated — arrival will use the literal
+    /// `ARRIVAL_NM` distance.
+    #[allow(dead_code)]
     fn assign_destination(&mut self, dest: Position) {
         self.nav.destination = Some(dest);
+        self.nav.dest_port = None;
         self.nav.clear_path();
         if let Some(ctx) = self.pathfind {
             if let Some(path) = pathfind::find_path(ctx, self.ship.position, dest) {
@@ -195,18 +235,63 @@ impl<'a> ShipBtContext<'a> {
             }
         }
     }
+
+    /// True if the ship is in its destination port's harbor zone.
+    fn in_destination_harbor(&self) -> bool {
+        let port_idx = match self.nav.dest_port {
+            Some(i) => i,
+            None => return false,
+        };
+        let pf = match self.pathfind {
+            Some(pf) => pf,
+            None => return false,
+        };
+        let harbor = match self.harbors.for_port(port_idx) {
+            Some(h) => h,
+            None => return false,
+        };
+        harbor.contains_pos(pf.land, self.ship.position)
+    }
 }
 
 impl<'a> BtContext for ShipBtContext<'a> {
     fn execute_action(&mut self, id: usize) -> Status {
         match id {
             ACT_SAIL => {
+                // Harbor-zone arrival: if we're inside the destination's
+                // harbor zone, transition to Docked immediately. The literal
+                // port coordinate may still be far away (e.g., Philadelphia
+                // up the Delaware) — that's fine.
+                if self.in_destination_harbor() {
+                    self.ship.dock();
+                    *self.dock_action = DockAction::Idle;
+                    self.nav.destination = None;
+                    self.nav.dest_port = None;
+                    self.nav.clear_path();
+                    return Status::Success;
+                }
+
+                // Replan when our planned route has been exhausted but we're
+                // still nowhere near the destination. Without this, a ship
+                // that drifts/tacks past its last waypoint will dead-reckon
+                // straight toward the destination — through land, if any —
+                // and pin against the coast.
+                if self.nav.waypoints.is_empty() && self.nav.dest_port.is_some() {
+                    if let Some(dest) = self.nav.destination {
+                        if self.ship.position.distance(dest) > REPLAN_DISTANCE_NM {
+                            if let Some(idx) = self.nav.dest_port {
+                                self.replan_to_port(idx);
+                            }
+                        }
+                    }
+                }
+
                 let land = self.pathfind.map(|c| c.land);
                 if let Some(heading) = self.nav.compute_heading(self.ship.position, self.stats, self.wind, land) {
                     self.ship.set_heading(heading);
                     Status::Running
                 } else {
-                    // Arrived — dock
+                    // Arrived at a free-form destination (no harbor zone).
                     self.ship.dock();
                     *self.dock_action = DockAction::Idle;
                     Status::Success
@@ -246,31 +331,23 @@ impl<'a> BtContext for ShipBtContext<'a> {
                 if self.ports.is_empty() {
                     return Status::Failure;
                 }
-                // Pick a random port that isn't too close to current position
-                let idx = (xorshift64(self.rng_state) as usize) % self.ports.len();
-                let port = &self.ports[idx];
-                let chosen = if self.ship.position.distance(port.position) < 20.0 {
-                    let alt_idx = (idx + 1) % self.ports.len();
-                    self.ports[alt_idx].position
-                } else {
-                    port.position
-                };
-                self.assign_destination(chosen);
+                let mut idx = (xorshift64(self.rng_state) as usize) % self.ports.len();
+                if self.ship.position.distance(self.ports[idx].position) < 20.0 {
+                    idx = (idx + 1) % self.ports.len();
+                }
+                self.assign_destination_port(idx);
                 Status::Success
             }
             ACT_DIVERT_TO_PORT => {
-                // Set destination to nearest port, then sail there
-                if let Some(nearest) = self.ports.iter()
-                    .min_by(|a, b| {
+                if let Some((nearest_idx, _)) = self.ports.iter().enumerate()
+                    .min_by(|(_, a), (_, b)| {
                         let da = self.ship.position.distance(a.position);
                         let db = self.ship.position.distance(b.position);
                         da.partial_cmp(&db).unwrap()
                     })
                 {
-                    let dest = nearest.position;
-                    self.assign_destination(dest);
+                    self.assign_destination_port(nearest_idx);
                 }
-                // Now sail (will be picked up next tick by HasDestination → Sail)
                 Status::Success
             }
             _ => Status::Failure,

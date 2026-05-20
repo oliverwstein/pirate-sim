@@ -55,51 +55,30 @@ impl Camera {
     }
 }
 
-fn draw_land(world: &World, camera: &Camera) {
+/// Build a single texture of the land mask. Cells are downsampled by
+/// `STRIDE` (block-any-land) to keep GPU memory + upload time reasonable
+/// for a 6300×3900 source: at STRIDE=2 the texture is ~3150×1950 ≈ 24 MB,
+/// which uploads near-instantly and renders as a single textured quad. The
+/// coastline visually still reads as ~2 NM resolution which is more than
+/// enough for the strategic-scale viz.
+fn build_land_texture(world: &World) -> Texture2D {
+    const STRIDE: u32 = 2;
     let land = &world.map.land;
-    // Only draw visible cells for performance
-    let sw = screen_width();
-    let sh = screen_height();
-
-    // Determine visible world bounds
-    let half_w = sw / (2.0 * camera.zoom);
-    let half_h = sh / (2.0 * camera.zoom);
-    let min_x = camera.offset.x - half_w;
-    let max_x = camera.offset.x + half_w;
-    let min_y = camera.offset.y - half_h;
-    let max_y = camera.offset.y + half_h;
-
-    // Convert to grid cells
-    let col_start = ((min_x - land.origin.x) / land.cell_size_nm).floor().max(0.0) as u32;
-    let col_end = ((max_x - land.origin.x) / land.cell_size_nm).ceil().min(land.width as f32) as u32;
-    let row_start = ((land.origin.y - max_y) / land.cell_size_nm).floor().max(0.0) as u32;
-    let row_end = ((land.origin.y - min_y) / land.cell_size_nm).ceil().min(land.height as f32) as u32;
-
-    // When the grid is finer than one screen pixel per cell, stride through
-    // it so the whole visible area can be drawn cheaply. Each drawn rectangle
-    // covers a `stride x stride` block of source cells; if any cell in that
-    // block is land we paint the block as land. This is the cheap LOD trick
-    // that makes a 1 NM/cell grid render at low zoom.
-    let cell_px = land.cell_size_nm * camera.zoom;
-    let stride = if cell_px >= 1.0 {
-        1u32
-    } else {
-        (1.0 / cell_px).ceil() as u32
-    };
-    let block_screen_size = (land.cell_size_nm * stride as f32) * camera.zoom;
-    let draw_size = block_screen_size.max(1.0);
-
-    let mut row = row_start;
-    while row < row_end {
-        let mut col = col_start;
-        while col < col_end {
-            // Block-any: is any cell in this stride x stride block land?
-            let r_max = (row + stride).min(land.height);
-            let c_max = (col + stride).min(land.width);
+    let (sw, sh) = (land.width, land.height);
+    let tw = (sw + STRIDE - 1) / STRIDE;
+    let th = (sh + STRIDE - 1) / STRIDE;
+    let mut bytes = vec![0u8; (tw * th * 4) as usize];
+    for r in 0..th {
+        for c in 0..tw {
+            // Block-any: any source cell in the STRIDE×STRIDE block is land.
+            let r0 = r * STRIDE;
+            let c0 = c * STRIDE;
+            let r1 = (r0 + STRIDE).min(sh);
+            let c1 = (c0 + STRIDE).min(sw);
             let mut is_land = false;
-            'outer: for rr in row..r_max {
-                let base = (rr * land.width) as usize;
-                for cc in col..c_max {
+            'outer: for rr in r0..r1 {
+                let base = (rr * sw) as usize;
+                for cc in c0..c1 {
                     if land.data[base + cc as usize] == 255 {
                         is_land = true;
                         break 'outer;
@@ -107,21 +86,39 @@ fn draw_land(world: &World, camera: &Camera) {
                 }
             }
             if is_land {
-                let world_x = land.origin.x + col as f32 * land.cell_size_nm;
-                let world_y = land.origin.y - row as f32 * land.cell_size_nm;
-                let screen_pos = camera.world_to_screen(Position::new(world_x, world_y));
-                draw_rectangle(
-                    screen_pos.x,
-                    screen_pos.y - block_screen_size,
-                    draw_size,
-                    draw_size,
-                    LAND_COLOR,
-                );
+                let idx = ((r * tw + c) * 4) as usize;
+                bytes[idx] = (LAND_COLOR.r * 255.0) as u8;
+                bytes[idx + 1] = (LAND_COLOR.g * 255.0) as u8;
+                bytes[idx + 2] = (LAND_COLOR.b * 255.0) as u8;
+                bytes[idx + 3] = 255;
             }
-            col += stride;
         }
-        row += stride;
     }
+    let img = Image { bytes, width: tw as u16, height: th as u16 };
+    let tex = Texture2D::from_image(&img);
+    tex.set_filter(FilterMode::Nearest);
+    tex
+}
+
+fn draw_land(world: &World, camera: &Camera, tex: &Texture2D) {
+    let land = &world.map.land;
+    // Top-left corner of the texture in world space.
+    let world_x = land.origin.x;
+    let world_y = land.origin.y;
+    let top_left = camera.world_to_screen(Position::new(world_x, world_y));
+    let pixel_size = land.cell_size_nm * camera.zoom;
+    let dest_w = land.width as f32 * pixel_size;
+    let dest_h = land.height as f32 * pixel_size;
+    draw_texture_ex(
+        tex,
+        top_left.x,
+        top_left.y,
+        WHITE,
+        DrawTextureParams {
+            dest_size: Some(Vec2::new(dest_w, dest_h)),
+            ..Default::default()
+        },
+    );
 }
 
 fn draw_wind_arrows(world: &World, camera: &Camera) {
@@ -275,6 +272,7 @@ async fn main() {
     let mut world = World::load(Path::new("data/"));
     spawn_demo_ship(&mut world);
 
+    let land_texture = build_land_texture(&world);
     let mut camera = Camera::new();
     let mut paused = false;
     let mut ticks_per_frame: u32 = 1;
@@ -306,7 +304,7 @@ async fn main() {
 
         // Render
         clear_background(SEA_COLOR);
-        draw_land(&world, &camera);
+        draw_land(&world, &camera, &land_texture);
         draw_wind_arrows(&world, &camera);
         draw_ports(&world, &camera);
         draw_ships(&world, &camera);

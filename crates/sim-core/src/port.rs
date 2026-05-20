@@ -27,56 +27,67 @@ pub struct Port {
     pub name: &'static str,
     pub position: Position,
     pub faction: Faction,
+    /// Radius (NM) around `position` defining the harbor zone — the set of
+    /// connected sea cells where a ship is considered "in port" for
+    /// arrival/docking purposes. Larger values are useful for ports that sit
+    /// up rivers or estuaries (Philadelphia, New York, New Orleans, etc.).
+    pub harbor_radius_nm: f32,
 }
+
+/// Default harbor radius (NM) used when a port doesn't specify one.
+pub const DEFAULT_HARBOR_RADIUS_NM: f32 = 8.0;
 
 /// All ports from historical research (coordinates in NM from origin 17.5°N, 72.5°W).
 pub fn all_ports() -> Vec<Port> {
     PORTS
         .iter()
-        .map(|(name, x, y, faction)| Port {
+        .map(|(name, x, y, faction, radius)| Port {
             name,
             position: Position::new(*x, *y),
             faction: *faction,
+            harbor_radius_nm: *radius,
         })
         .collect()
 }
 
-const PORTS: &[(&str, f32, f32, Faction)] = &[
+const D: f32 = DEFAULT_HARBOR_RADIUS_NM;
+
+const PORTS: &[(&str, f32, f32, Faction, f32)] = &[
     // === SPANISH ===
-    ("Havana", -592.8, 337.8, Faction::Spain),
-    ("Portobelo", -429.0, -477.0, Faction::Spain),
-    ("Cartagena", -181.8, -426.0, Faction::Spain),
-    ("Santo Domingo", 157.2, 58.2, Faction::Spain),
-    ("Santiago de Cuba", -199.2, 151.2, Faction::Spain),
-    ("San Juan", 382.8, 58.2, Faction::Spain),
-    ("Maracaibo", 52.2, -412.2, Faction::Spain),
-    ("La Guaira", 334.2, -414.0, Faction::Spain),
-    ("Trinidad", 658.8, -411.0, Faction::Spain),
-    ("Margarita", 517.8, -390.0, Faction::Spain),
+    ("Havana", -592.8, 337.8, Faction::Spain, D),
+    ("Portobelo", -429.0, -477.0, Faction::Spain, D),
+    ("Cartagena", -181.8, -426.0, Faction::Spain, D),
+    ("Santo Domingo", 157.2, 58.2, Faction::Spain, D),
+    ("Santiago de Cuba", -199.2, 151.2, Faction::Spain, D),
+    ("San Juan", 382.8, 58.2, Faction::Spain, D),
+    ("Maracaibo", 52.2, -412.2, Faction::Spain, 30.0), // up Lake Maracaibo
+    ("La Guaira", 334.2, -414.0, Faction::Spain, D),
+    ("Trinidad", 658.8, -411.0, Faction::Spain, D),
+    ("Margarita", 517.8, -390.0, Faction::Spain, D),
     // === ENGLISH ===
-    ("Port Royal", -260.4, 26.4, Faction::England),
-    ("Kingston", -257.4, 28.2, Faction::England),
-    ("Bridgetown", 772.8, -264.0, Faction::England),
-    ("Basseterre", 586.8, -12.0, Faction::England),
-    ("English Harbour", 644.4, -30.0, Faction::England),
-    ("Charleston", -445.8, 916.8, Faction::England),
-    ("Boston", 86.4, 1491.6, Faction::England),
-    ("New York", -90.6, 1392.6, Faction::England),
-    ("Philadelphia", -160.2, 1347.0, Faction::England),
-    ("Bermuda", 469.2, 892.8, Faction::England),
-    ("Belize", -942.0, 0.0, Faction::England),
+    ("Port Royal", -260.4, 26.4, Faction::England, D),
+    ("Kingston", -257.4, 28.2, Faction::England, D),
+    ("Bridgetown", 772.8, -264.0, Faction::England, D),
+    ("Basseterre", 586.8, -12.0, Faction::England, D),
+    ("English Harbour", 644.4, -30.0, Faction::England, D),
+    ("Charleston", -445.8, 916.8, Faction::England, 25.0),
+    ("Boston", 86.4, 1491.6, Faction::England, 20.0),
+    ("New York", -90.6, 1392.6, Faction::England, 60.0),     // NY harbor + lower Hudson + reach to Atlantic
+    ("Philadelphia", -160.2, 1347.0, Faction::England, 150.0), // up the Delaware to the bay mouth + Atlantic
+    ("Bermuda", 469.2, 892.8, Faction::England, D),
+    ("Belize", -942.0, 0.0, Faction::England, 30.0),
     // === FRENCH ===
-    ("Fort-Royal", 685.8, -174.0, Faction::France),
-    ("Basse-Terre", 646.2, -90.0, Faction::France),
-    ("Cap-Français", 18.0, 135.6, Faction::France),
-    ("Petit-Goâve", -22.2, 55.8, Faction::France),
-    ("Cayenne", 1210.2, -753.6, Faction::France),
+    ("Fort-Royal", 685.8, -174.0, Faction::France, D),
+    ("Basse-Terre", 646.2, -90.0, Faction::France, D),
+    ("Cap-Français", 18.0, 135.6, Faction::France, D),
+    ("Petit-Goâve", -22.2, 55.8, Faction::France, D),
+    ("Cayenne", 1210.2, -753.6, Faction::France, 15.0),
     // === DUTCH ===
-    ("Willemstad", 214.2, -323.4, Faction::Holland),
-    ("St. Eustatius", 571.8, -1.2, Faction::Holland),
-    ("Paramaribo", 1039.8, -700.2, Faction::Holland),
+    ("Willemstad", 214.2, -323.4, Faction::Holland, D),
+    ("St. Eustatius", 571.8, -1.2, Faction::Holland, D),
+    ("Paramaribo", 1039.8, -700.2, Faction::Holland, 20.0), // up the Suriname river
     // === PIRATE HAVENS ===
-    ("Tortuga", -16.8, 152.4, Faction::Pirate),
-    ("Nassau", -291.0, 453.0, Faction::Pirate),
-    ("Tobago", 709.8, -375.0, Faction::Pirate),
+    ("Tortuga", -16.8, 152.4, Faction::Pirate, D),
+    ("Nassau", -291.0, 453.0, Faction::Pirate, D),
+    ("Tobago", 709.8, -375.0, Faction::Pirate, D),
 ];

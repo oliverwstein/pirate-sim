@@ -17,9 +17,10 @@
 //! coastlines.
 
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 
-use crate::map::land::LandMap;
+use crate::harbor::Harbor;
+use crate::map::land::{CoarseLand, LandMap};
 use crate::ship::{speed_at_heading, ShipStats};
 use crate::types::{Position, WindVector};
 use crate::weather::wind::WindGrid;
@@ -38,27 +39,31 @@ impl<'a> PathfindContext<'a> {
     }
 }
 
-/// Maximum number of nodes the planner will expand before giving up. The grid
-/// is now 1 NM/cell (~24M cells over the full bbox), so long routes need
-/// substantial budget. Will be reduced once the harbor-zone goal predicate
-/// removes the worst long-tail searches near coasts.
-const MAX_EXPANSIONS: usize = 10_000_000;
+/// Maximum number of nodes the planner will expand before giving up. The
+/// search runs on the coarse (5 NM/cell) grid, where a typical Caribbean
+/// route is well under 10k expansions even with a weighted heuristic.
+const MAX_EXPANSIONS: usize = 500_000;
 
-/// Maximum BFS radius (in cells) when snapping a land cell to the nearest sea.
-/// At 1 NM/cell, 64 cells = 64 NM, ample margin for any port a ship plausibly
-/// starts inside of.
-const SNAP_RADIUS: u32 = 64;
+/// Maximum BFS radius (in coarse cells) when snapping a land cell to the
+/// nearest sea. 16 coarse cells = 80 NM, ample for any port we plausibly
+/// start inside of.
+const SNAP_RADIUS: u32 = 16;
 
-/// Required clearance (in cells) around a node for it to be considered safe.
-/// At 1 NM/cell, 1 cell ≈ 1 NM. We keep this small because any larger margin
-/// excludes the immediate neighborhoods of coastal ports. The smoother
-/// enforces a wider corridor margin (`SMOOTH_MARGIN_NM`) on the final
-/// straight-line segments to keep ships off the rocks.
-const CLEARANCE_CELLS: u32 = 1;
+/// Required clearance (in coarse cells) around a node for it to be
+/// considered safe. Zero is correct here: coarse cells are conservatively
+/// "land" if any of their 25 fine source cells is land, so a sea coarse
+/// cell already implies all 25 fine source cells are clear sea — i.e., the
+/// cell is at least one coarse-cell (5 NM) away from any actual coastline
+/// in fine grid terms. Adding extra coarse clearance over-constrains tight
+/// bays (e.g., Petit-Goâve in Bay of Gonâve) where every cell is within
+/// one coarse-cell of land.
+const CLEARANCE_CELLS: u32 = 0;
 
 /// Smoother corridor margin (NM): smoothed segments must keep this much
-/// distance from any land along their length.
-const SMOOTH_MARGIN_NM: f32 = 5.0;
+/// distance from any land along their length. Kept modest because at 1 NM/cell
+/// the planner already routes through narrow channels and we don't want the
+/// smoother to invalidate too many of the planner's waypoints.
+const SMOOTH_MARGIN_NM: f32 = 2.0;
 
 /// Heuristic weight for weighted A*. Values >1 make the search greedier:
 /// dramatically faster, paths a few percent longer than optimal. At 1 NM/cell
@@ -66,54 +71,117 @@ const SMOOTH_MARGIN_NM: f32 = 5.0;
 /// routes. Lower toward 1.0 if path quality starts to matter more than speed.
 const HEURISTIC_WEIGHT: f32 = 2.0;
 
-/// Find a navigable path of waypoints from `start` to `goal`. The returned
-/// list does NOT include `start` but ends with `goal` (or the nearest navigable
-/// approximation of it). Returns `None` if no path can be found.
+/// Find a navigable path of waypoints from `start` to a goal *point*. The
+/// returned list does NOT include `start` but ends with the snapped sea-cell
+/// anchor near `goal`. Returns `None` if no path can be found.
+///
+/// This single-point variant is mostly for tests, the diagnostic example,
+/// and emergency cases where there's no harbor zone (e.g., open-water
+/// rendezvous). Production code should use [`find_path_to_harbor`] so that
+/// the planner can terminate at any cell in the destination's harbor zone.
 pub fn find_path(
     ctx: &PathfindContext<'_>,
     start: Position,
     goal: Position,
 ) -> Option<Vec<Position>> {
-    let land = ctx.land;
+    let coarse = &ctx.land.coarse;
 
-    // Resolve start/goal to cell indices, snapping off land if necessary.
-    let raw_start = land.pos_to_cell(start)?;
-    let raw_goal = land.pos_to_cell(goal)?;
-    let start_cell = land.nearest_sea_cell(raw_start.0, raw_start.1, SNAP_RADIUS)?;
-    let goal_cell = land.nearest_sea_cell(raw_goal.0, raw_goal.1, SNAP_RADIUS)?;
-    let goal_anchor = land.cell_to_pos(goal_cell.0, goal_cell.1);
+    let raw_start = coarse.pos_to_cell(start)?;
+    let raw_goal = coarse.pos_to_cell(goal)?;
+    let start_cell = coarse.nearest_sea_cell(raw_start.0, raw_start.1, SNAP_RADIUS)?;
+    let goal_cell = coarse.nearest_sea_cell(raw_goal.0, raw_goal.1, SNAP_RADIUS)?;
+    let goal_anchor = coarse.cell_to_pos(goal_cell.0, goal_cell.1);
 
     if start_cell == goal_cell {
         return Some(vec![goal_anchor]);
     }
 
-    // Fast path: if there's already a clean corridor to the goal anchor,
-    // skip A* entirely.
-    if land.corridor_is_clear(start, goal_anchor, SMOOTH_MARGIN_NM) {
+    if ctx.land.corridor_is_clear(start, goal_anchor, SMOOTH_MARGIN_NM) {
         return Some(vec![goal_anchor]);
     }
 
-    let cells = a_star(ctx, start_cell, goal_cell)?;
+    let mut goal_set = HashSet::with_capacity(1);
+    goal_set.insert(goal_cell);
+    let cells = a_star(ctx, start_cell, &goal_set, goal_cell)?;
 
-    // Translate cells to world positions (centers), then smooth.
+    finalize_path(ctx.land, coarse, start, &cells, goal_anchor)
+}
+
+/// Plan a path from `start` to any cell of `harbor`'s zone. The returned
+/// waypoint list ends with whichever harbor cell A* terminated on (smoothed
+/// back to fewer points). Returns `None` if no path exists or if start and
+/// the harbor are in disconnected sea components.
+pub fn find_path_to_harbor(
+    ctx: &PathfindContext<'_>,
+    start: Position,
+    harbor: &Harbor,
+) -> Option<Vec<Position>> {
+    let land = ctx.land;
+    let coarse = &land.coarse;
+
+    if harbor.cells.is_empty() {
+        return None;
+    }
+
+    // If we're already inside the harbor zone, no movement needed.
+    if harbor.contains_pos(land, start) {
+        return Some(vec![start]);
+    }
+
+    // Fast path: clear corridor straight to the harbor anchor.
+    if land.corridor_is_clear(start, harbor.anchor, SMOOTH_MARGIN_NM) {
+        return Some(vec![harbor.anchor]);
+    }
+
+    let raw_start = coarse.pos_to_cell(start)?;
+    let start_cell = coarse.nearest_sea_cell(raw_start.0, raw_start.1, SNAP_RADIUS)?;
+
+    // Lift the harbor zone (fine cells) into the coarse grid so A* can
+    // terminate at any coarse cell that contains a harbor fine cell.
+    let stride = coarse.stride;
+    let mut goal_set: HashSet<(u32, u32)> = HashSet::with_capacity(harbor.cells.len() / 16 + 1);
+    for &(c, r) in &harbor.cells {
+        goal_set.insert((c / stride, r / stride));
+    }
+    if goal_set.is_empty() {
+        return None;
+    }
+
+    // Heuristic target: the coarse cell of the harbor anchor.
+    let anchor_coarse = coarse.pos_to_cell(harbor.anchor)?;
+
+    if start_cell == anchor_coarse || goal_set.contains(&start_cell) {
+        return Some(vec![harbor.anchor]);
+    }
+
+    let cells = a_star(ctx, start_cell, &goal_set, anchor_coarse)?;
+
+    // Use the harbor anchor as the terminal world position so the ship has
+    // a definite point to aim at inside the zone.
+    finalize_path(land, coarse, start, &cells, harbor.anchor)
+}
+
+/// Common path-finalization: coarse cells → world positions → smoothed waypoints.
+/// Smoothing uses the FINE land grid so corridor checks are accurate.
+fn finalize_path(
+    land: &LandMap,
+    coarse: &CoarseLand,
+    start: Position,
+    cells: &[(u32, u32)],
+    terminal: Position,
+) -> Option<Vec<Position>> {
     let mut points: Vec<Position> = Vec::with_capacity(cells.len() + 1);
     points.push(start);
-    for &(c, r) in &cells {
-        points.push(land.cell_to_pos(c, r));
+    for &(c, r) in cells {
+        points.push(coarse.cell_to_pos(c, r));
     }
-    // The final waypoint is the snapped sea-cell anchor, not the raw `goal`,
-    // because the latter may sit on a coastal land cell that swept-collision
-    // would refuse to enter — the ship would then stop just short and never
-    // register arrival.
     if let Some(last) = points.last_mut() {
-        *last = goal_anchor;
+        *last = terminal;
     } else {
-        points.push(goal_anchor);
+        points.push(terminal);
     }
 
     let smoothed = smooth_path(land, &points);
-
-    // Drop the starting position; nav state only consumes waypoints ahead.
     Some(smoothed.into_iter().skip(1).collect())
 }
 
@@ -147,26 +215,27 @@ impl PartialOrd for FNode {
 fn a_star(
     ctx: &PathfindContext<'_>,
     start: (u32, u32),
-    goal: (u32, u32),
+    goal_cells: &HashSet<(u32, u32)>,
+    heuristic_target: (u32, u32),
 ) -> Option<Vec<(u32, u32)>> {
-    let land = ctx.land;
-    let goal_pos = land.cell_to_pos(goal.0, goal.1);
+    let coarse = &ctx.land.coarse;
+    let goal_pos = coarse.cell_to_pos(heuristic_target.0, heuristic_target.1);
 
-    // Cells within this many cells of start or goal bypass the clearance
-    // requirement (sea-only suffices). This lets ships escape tight coastal
-    // cells without forcing them to also be the goal.
-    let endpoint_window: i32 = (CLEARANCE_CELLS as i32) + 2;
+    // Start-window: a small disk around the start cell bypasses the
+    // clearance requirement so the ship can leave a coastal port. Goal-side
+    // exemptions are handled by the harbor zone itself.
+    let start_window: i32 = (CLEARANCE_CELLS as i32) + 1;
 
     let mut open: BinaryHeap<FNode> = BinaryHeap::new();
     let mut g_score: HashMap<(u32, u32), f32> = HashMap::new();
     let mut came_from: HashMap<(u32, u32), (u32, u32)> = HashMap::new();
 
     g_score.insert(start, 0.0);
-    open.push(FNode { f: heuristic(ctx, land.cell_to_pos(start.0, start.1), goal_pos), cell: start });
+    open.push(FNode { f: heuristic(ctx, coarse.cell_to_pos(start.0, start.1), goal_pos), cell: start });
 
     let mut expansions = 0usize;
     while let Some(FNode { cell: current, .. }) = open.pop() {
-        if current == goal {
+        if goal_cells.contains(&current) {
             return Some(reconstruct(came_from, current));
         }
         expansions += 1;
@@ -174,25 +243,23 @@ fn a_star(
             return None;
         }
 
-        let current_pos = land.cell_to_pos(current.0, current.1);
+        let current_pos = coarse.cell_to_pos(current.0, current.1);
         let current_g = *g_score.get(&current).unwrap_or(&f32::INFINITY);
 
         for &(dc, dr) in &NEIGHBORS {
             let nc = current.0 as i32 + dc;
             let nr = current.1 as i32 + dr;
-            if nc < 0 || nr < 0 || nc >= land.width as i32 || nr >= land.height as i32 {
+            if nc < 0 || nr < 0 || nc >= coarse.width as i32 || nr >= coarse.height as i32 {
                 continue;
             }
             let neighbor = (nc as u32, nr as u32);
 
-            // Passability: full clearance away from endpoints; sea-only near
-            // start or goal so coastal ports are reachable.
-            let near_endpoint = cell_chebyshev(neighbor, start) <= endpoint_window
-                || cell_chebyshev(neighbor, goal) <= endpoint_window;
+            let near_endpoint = cell_chebyshev(neighbor, start) <= start_window
+                || goal_cells.contains(&neighbor);
             let passable = if near_endpoint {
-                land.is_sea_cell(neighbor.0, neighbor.1)
+                coarse.is_sea_cell(neighbor.0, neighbor.1)
             } else {
-                land.has_cell_clearance(neighbor.0, neighbor.1, CLEARANCE_CELLS)
+                coarse.has_cell_clearance(neighbor.0, neighbor.1, CLEARANCE_CELLS)
             };
             if !passable {
                 continue;
@@ -202,14 +269,14 @@ fn a_star(
             if dc != 0 && dr != 0 {
                 let side_a = (current.0 as i32 + dc, current.1 as i32);
                 let side_b = (current.0 as i32, current.1 as i32 + dr);
-                if !land.is_sea_cell(side_a.0 as u32, side_a.1 as u32)
-                    || !land.is_sea_cell(side_b.0 as u32, side_b.1 as u32)
+                if !coarse.is_sea_cell(side_a.0 as u32, side_a.1 as u32)
+                    || !coarse.is_sea_cell(side_b.0 as u32, side_b.1 as u32)
                 {
                     continue;
                 }
             }
 
-            let neighbor_pos = land.cell_to_pos(neighbor.0, neighbor.1);
+            let neighbor_pos = coarse.cell_to_pos(neighbor.0, neighbor.1);
             let edge = edge_cost(ctx, current_pos, neighbor_pos);
             let tentative = current_g + edge;
 
@@ -273,8 +340,7 @@ fn cell_chebyshev(a: (u32, u32), b: (u32, u32)) -> i32 {
 /// Corridor-aware line-of-sight smoothing: keep a waypoint only if removing
 /// it would force a path through (or too close to) land. Walks forward
 /// greedily, jumping as far as the corridor with `SMOOTH_MARGIN_NM` clearance
-/// allows. Falls back to plain line-of-sight near start/goal so coastal
-/// approaches aren't artificially blocked.
+/// allows.
 fn smooth_path(land: &LandMap, points: &[Position]) -> Vec<Position> {
     if points.len() <= 2 {
         return points.to_vec();
@@ -283,18 +349,10 @@ fn smooth_path(land: &LandMap, points: &[Position]) -> Vec<Position> {
     out.push(points[0]);
     let mut anchor = 0usize;
     let mut probe = 1usize;
-    let last_idx = points.len() - 1;
     while probe < points.len() {
         let next = probe + 1;
-        // Near the endpoints we can't expect SMOOTH_MARGIN clearance (the
-        // goal is often on the coast). Use plain line-of-sight there.
-        let permissive = anchor == 0 || next >= last_idx;
         let ok = if next < points.len() {
-            if permissive {
-                land.line_is_clear(points[anchor], points[next])
-            } else {
-                land.corridor_is_clear(points[anchor], points[next], SMOOTH_MARGIN_NM)
-            }
+            land.corridor_is_clear(points[anchor], points[next], SMOOTH_MARGIN_NM)
         } else {
             false
         };
@@ -341,7 +399,7 @@ mod tests {
         let path = find_path(&ctx, start, goal).expect("path");
         // Final waypoint is the snapped sea-cell anchor near the goal.
         let last = path.last().copied().unwrap();
-        assert!(last.distance(goal) < land.cell_size_nm * 1.5);
+        assert!(last.distance(goal) < land.coarse.cell_size_nm * 1.5);
         // Line of sight is clear: should be a single waypoint (the goal anchor).
         assert_eq!(path.len(), 1);
     }
@@ -375,7 +433,8 @@ mod tests {
             prev = *p;
         }
         // Final waypoint is the snapped sea-cell anchor near the goal.
+        // (Coarse-grid planning can snap up to ~stride cells away.)
         let last = *path.last().unwrap();
-        assert!(last.distance(goal) < land.cell_size_nm * 1.5);
+        assert!(last.distance(goal) < land.coarse.cell_size_nm * 1.5);
     }
 }

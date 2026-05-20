@@ -31,6 +31,10 @@ const DEFLECT_LOOKAHEAD_NM: f32 = 14.0;
 pub struct NavState {
     /// Final goal — once cleared, the ship has arrived.
     pub destination: Option<Position>,
+    /// Index of the destination port, when the destination is one. Enables
+    /// harbor-zone arrival in the AI layer; geometric arrival is still used
+    /// for free-form destinations (None).
+    pub dest_port: Option<usize>,
     /// Ordered intermediate waypoints (front = next target). The final
     /// element should equal `destination` when a path was planned.
     pub waypoints: VecDeque<Position>,
@@ -41,6 +45,7 @@ impl NavState {
     pub fn new() -> Self {
         Self {
             destination: None,
+            dest_port: None,
             waypoints: VecDeque::new(),
             tack: Tack::Starboard,
         }
@@ -49,6 +54,7 @@ impl NavState {
     pub fn with_destination(dest: Position) -> Self {
         Self {
             destination: Some(dest),
+            dest_port: None,
             waypoints: VecDeque::new(),
             tack: Tack::Starboard,
         }
@@ -150,30 +156,47 @@ impl NavState {
 
 /// If the heading from `pos` would hit land within `lookahead_nm`, sweep
 /// outward from `desired` in 10° steps (preferring the smaller deflection)
-/// until we find a heading whose forward ray is clear. Falls back to the
-/// desired heading if nothing better is found within ±90°.
+/// until we find a heading whose forward ray is clear.
+///
+/// Two-tier fallback for tight waters: if no heading clears the full
+/// lookahead at any deflection up to ±90°, retry with a quarter of the
+/// lookahead. That lets the ship pick a viable short-tack heading (it will
+/// only make a fraction of normal progress, but it won't pin to zero).
+/// As a last resort returns the desired heading.
 fn deflect_for_land(pos: Position, desired: f32, land: &LandMap, lookahead_nm: f32) -> f32 {
+    if let Some(h) = sweep_clear(pos, desired, land, lookahead_nm) {
+        return h;
+    }
+    // Tight-water fallback: shorter horizon, accept any direction that
+    // gives us at least a short clear ray.
+    if let Some(h) = sweep_clear(pos, desired, land, (lookahead_nm * 0.25).max(2.0)) {
+        return h;
+    }
+    desired
+}
+
+/// Sweep ±10°, ±20°, … ±90° around `desired`, returning the first heading
+/// whose forward `lookahead_nm` ray is clear of land. `desired` itself is
+/// tried first (offset 0).
+fn sweep_clear(pos: Position, desired: f32, land: &LandMap, lookahead_nm: f32) -> Option<f32> {
     let probe = |h: f32| -> bool {
         let rad = h.to_radians();
         let end = pos + Position::new(rad.sin() * lookahead_nm, rad.cos() * lookahead_nm);
         land.line_is_clear(pos, end)
     };
-
     if probe(desired) {
-        return desired;
+        return Some(desired);
     }
-
-    // Sweep ±10°, ±20°, … up to ±90°.
     for offset_i in 1..=9 {
         let offset = offset_i as f32 * 10.0;
         for &sign in &[1.0_f32, -1.0] {
             let candidate = normalize_angle(desired + offset * sign);
             if probe(candidate) {
-                return candidate;
+                return Some(candidate);
             }
         }
     }
-    desired
+    None
 }
 
 /// Velocity Made Good: component of speed toward the destination bearing.
