@@ -1,5 +1,109 @@
 # Phase 1: Time and Space
 
+> **Status: Complete (and exceeded).** Goals 1–5 are met; the implementation
+> has also picked up several Phase 2 items along the way. The original
+> planning sketch is preserved below as a historical record. The
+> "Status & Delta from plan" section is the source of truth.
+
+## Status & Delta from plan
+
+### Success criteria — all met
+1. ✅ Barbados → Jamaica ~6 days on trade winds; reverse takes ~2× longer.
+2. ✅ Wind/sail physics behave as specified (`Ship::effective_speed`,
+   `sail_efficiency` in `crates/sim-core/src/ship.rs`).
+3. ✅ Ships cannot enter land. Coastline collisions are handled by a
+   land-rescue deflection in `World::tick`, *plus* upstream avoidance via
+   waypoint navigation (see "Beyond the original scope").
+4. ✅ Wind varies by month (`WindGrid` is `[months × h × w]`); winter
+   trades are visibly stronger than summer.
+5. ✅ The macroquad viz renders the Caribbean smoothly with pan/zoom and
+   time controls.
+
+### Delivered as planned
+- Workspace + `sim-core` / `sim-viz` split, zero rendering deps in core.
+- `LandMap` from GEBCO bathymetry (preprocessing in `tools/preprocess/`).
+- `WindGrid` from ERA5 monthly climatology (12-month bilinear lookup).
+- Ship physics: `effective_speed`, `compute_next_position`,
+  piecewise-linear `sail_efficiency`.
+- `World::tick` driving date, weather sampling, and per-ship physics.
+- Visualization with land, wind arrows, ships, camera, and time controls.
+
+### Beyond the original scope (effectively early Phase 2 work)
+- **Ports & harbors** (`port.rs`, `harbor.rs`): 27 historical ports across
+  the Caribbean and the eastern seaboard out to Philadelphia, each with a
+  BFS-built harbor zone and a guaranteed-sea anchor cell. Ports are
+  loaded from a hand-maintained list in `port.rs`, not yet RON.
+- **Behavior-tree AI** (`ai.rs`, `bt.rs`): ships pick destinations,
+  divert when provisions are low, dock on arrival, and sequence
+  resupply → careen → undock. The BT primitives (`Sequence`, `Selector`,
+  conditions, actions) are real but not yet Rhai-scripted.
+- **Provisions, fouling, careening** (`ship.rs` `ShipStats`):
+  `tick_resupply` and `tick_careen` advance over time at fixed rates
+  while in port.
+- **Navmesh-based routing** (`navmesh.rs`, `pathfind.rs`): a
+  programmatic open-water grid + auto-detected channel waypoints. The
+  ad-hoc "TODO: route around obstacle" in the original sketch became a
+  real planner that handles all 992 ordered port pairs in ~0.33 ms avg.
+  The ship follows planned waypoints from `NavState`, not just a
+  straight bearing.
+- **Single-binary world load** (`world.rs`): grids, ports, harbors, and
+  navmesh are all built from data at startup; no save/load yet.
+
+### Intentionally still out (deferred to later phases)
+- RON / data-driven ship & port definitions (today: hardcoded sloop and
+  hardcoded port list).
+- Rhai scripting for AI behaviors.
+- Save/load.
+- Cargo, goods, factions, sea zones, combat.
+- Replanning when blown off course or wind shifts.
+- Hierarchical / corridor-based pathing and historical-route preferences
+  (see `planning/research/navigation-methods.md`).
+
+### Things the sketch got wrong / changed in flight
+- `Ship` ended up *not* owning `destination` directly; navigation state
+  (destination, dest port, planned waypoints) lives in `NavState`,
+  consumed by AI.
+- Land collisions don't just zero `speed` — they trigger a
+  `nearest_sea_cell` BFS rescue so a ship that brushes the coast is
+  pushed back into clear water.
+- `SimDate::advance_hours` exists, but `total_hours_elapsed` does not
+  (it was added speculatively and removed as unused).
+- The `MapSystem` / `WeatherSystem` wrappers are thinner than the sketch
+  suggests — they're effectively just `pub land: LandMap` /
+  `pub wind: WindGrid`.
+
+### Current source layout (core crate)
+
+```
+crates/sim-core/src/
+├── lib.rs
+├── types.rs          (Position, WindVector, SimDate)
+├── world.rs          (World, tick, land-rescue)
+├── map/
+│   ├── mod.rs        (MapSystem)
+│   └── land.rs       (LandMap, line/corridor checks, nearest_sea_cell)
+├── weather/
+│   ├── mod.rs        (WeatherSystem)
+│   └── wind.rs       (WindGrid)
+├── ship.rs           (Ship, ShipStats, NavState, tick_resupply/careen)
+├── port.rs           (Port catalogue)
+├── harbor.rs         (Harbor zones, HarborMap)
+├── navmesh.rs        (Open-water + channel graph)
+├── pathfind.rs       (find_path, find_path_to_harbor)
+├── ai.rs             (ShipAI, BT context, action handlers)
+└── bt.rs             (Behavior tree primitives)
+```
+
+### Reference benchmarks (for regression-spotting)
+
+- `cargo test -p sim-core`: 17 passing.
+- `cargo run --release -p sim-core --example bench_pathfind`:
+  992/992 ordered port pairs route, avg ~0.33 ms, max ~3 ms.
+
+---
+
+## Original planning sketch (historical)
+
 ## Goal
 Prove the physical foundation: ships moving through real Caribbean geography affected by real wind patterns.
 
