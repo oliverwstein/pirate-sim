@@ -45,7 +45,10 @@ impl World {
             let wind = self.weather.wind.wind_at(self.ships[i].position, self.date.month());
 
             // AI decides heading (or docks/undocks)
-            self.ship_ais[i].tick(&mut self.ships[i], &stats, &wind);
+            self.ship_ais[i].tick(&mut self.ships[i], &stats, &wind, &self.ports);
+
+            // Resource consumption (always, even when docked — crew still eats)
+            self.ships[i].tick_resources(&stats);
 
             if self.ships[i].state != ShipState::Sailing {
                 continue;

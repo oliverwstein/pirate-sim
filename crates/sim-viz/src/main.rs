@@ -212,13 +212,21 @@ fn draw_hud(world: &World, paused: bool, ticks_per_frame: u32) {
             .map(|d| ship.position.distance(d))
             .unwrap_or(0.0);
         let state_str = match ship.state {
-            ShipState::Sailing => "sailing",
-            ShipState::Docked => "docked",
-            ShipState::Anchored => "anchored",
+            ShipState::Sailing => "SAILING".to_string(),
+            ShipState::Docked => {
+                match world.ship_ais[i].dock_action {
+                    sim_core::ai::DockAction::Idle => "DOCKED (idle)".to_string(),
+                    sim_core::ai::DockAction::Resupplying => "DOCKED (resupply)".to_string(),
+                    sim_core::ai::DockAction::Careening => "DOCKED (careen)".to_string(),
+                }
+            }
+            ShipState::Anchored => "ANCHORED".to_string(),
         };
+        let stats = sim_core::ship::ShipStats::sloop();
+        let prov_pct = (ship.provisions / stats.provision_capacity * 100.0) as i32;
         let ship_info = format!(
-            "Ship {}: {} speed={:.1}kt heading={:.0}° dist={:.0}nm",
-            i, state_str, ship.speed, ship.heading, dist
+            "Ship {}: {} | spd={:.1}kt dist={:.0}nm | food={}% foul={:.0}",
+            i, state_str, ship.speed, dist, prov_pct, ship.hull_fouling
         );
         draw_text(&ship_info, 10.0, 40.0 + i as f32 * 18.0, 16.0, LIGHTGRAY);
     }
@@ -227,13 +235,7 @@ fn draw_hud(world: &World, paused: bool, ticks_per_frame: u32) {
 #[macroquad::main("Pirate Sim - Phase 1")]
 async fn main() {
     let mut world = World::load(Path::new("data/"));
-
-    // Spawn test ship: Barbados → Port Royal (Jamaica)
-    let barbados_pos = world.ports.iter().find(|p| p.name == "Bridgetown").unwrap().position;
-    let port_royal_pos = world.ports.iter().find(|p| p.name == "Port Royal").unwrap().position;
-    let ship = Ship::new(barbados_pos, ShipState::Sailing);
-    let ai = ShipAI::with_destination(port_royal_pos);
-    world.add_ship(ship, ai);
+    spawn_demo_ship(&mut world);
 
     let mut camera = Camera::new();
     let mut paused = false;
@@ -250,6 +252,11 @@ async fn main() {
         }
         if is_key_pressed(KeyCode::Minus) {
             ticks_per_frame = (ticks_per_frame / 2).max(1);
+        }
+        if is_key_pressed(KeyCode::R) {
+            world = World::load(Path::new("data/"));
+            spawn_demo_ship(&mut world);
+            ticks_per_frame = 1;
         }
 
         // Tick
@@ -269,4 +276,11 @@ async fn main() {
 
         next_frame().await;
     }
+}
+
+fn spawn_demo_ship(world: &mut World) {
+    let barbados_pos = world.ports.iter().find(|p| p.name == "Bridgetown").unwrap().position;
+    let ship = Ship::new(barbados_pos, ShipState::Docked);
+    let ai = ShipAI::with_seed(7); // will choose a random destination on first tick
+    world.add_ship(ship, ai);
 }

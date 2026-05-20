@@ -42,8 +42,8 @@ impl NavState {
     ) -> Option<f32> {
         let dest = self.destination?;
 
-        // Check arrival
-        if pos.distance(dest) < 5.0 {
+        // Check arrival (10 NM threshold — accounts for tacking overshoot)
+        if pos.distance(dest) < 10.0 {
             self.destination = None;
             return None;
         }

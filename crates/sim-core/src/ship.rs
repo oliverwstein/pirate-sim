@@ -6,6 +6,8 @@ pub struct ShipStats {
     pub speed_max: f32,        // absolute maximum
     pub windward_ability: f32, // 0.0-1.0 (how well it sails upwind)
     pub no_go_half_angle: f32, // degrees from wind that ship cannot sail into
+    pub crew: u32,             // crew complement (determines provision consumption)
+    pub provision_capacity: f32, // max tons of provisions
 }
 
 impl ShipStats {
@@ -15,7 +17,15 @@ impl ShipStats {
             speed_max: 12.0,
             windward_ability: 0.8,
             no_go_half_angle: 40.0,
+            crew: 25,
+            provision_capacity: 3.0, // ~40 days of food for 25 crew
         }
+    }
+
+    /// Daily provision consumption in tons (based on crew size).
+    /// Historical: ~4 lbs/man/day total food = 0.0018 tons/man/day.
+    pub fn daily_provision_consumption(&self) -> f32 {
+        self.crew as f32 * 0.0018
     }
 }
 
@@ -30,18 +40,23 @@ pub enum ShipState {
 /// A ship: purely physical entity. Heading is set externally by AI/player.
 pub struct Ship {
     pub position: Position,
-    pub heading: f32,     // degrees (0=N, 90=E, clockwise)
-    pub speed: f32,       // current speed in knots
+    pub heading: f32,          // degrees (0=N, 90=E, clockwise)
+    pub speed: f32,            // current speed in knots
     pub state: ShipState,
+    pub provisions: f32,       // tons of food remaining
+    pub hull_fouling: f32,     // 0 = clean, 100 = fully encrusted
 }
 
 impl Ship {
     pub fn new(position: Position, state: ShipState) -> Self {
+        let stats = ShipStats::sloop();
         Self {
             position,
             heading: 0.0,
             speed: 0.0,
             state,
+            provisions: stats.provision_capacity,
+            hull_fouling: 0.0,
         }
     }
 
@@ -68,8 +83,11 @@ impl Ship {
     }
 
     /// Calculate effective speed based on current heading, wind, and stats.
+    /// Hull fouling reduces speed (up to 30% penalty at full fouling).
     pub fn effective_speed(&self, stats: &ShipStats, wind: &WindVector) -> f32 {
-        speed_at_heading(self.heading, stats, wind)
+        let base_speed = speed_at_heading(self.heading, stats, wind);
+        let fouling_penalty = 1.0 - self.hull_fouling * 0.003;
+        base_speed * fouling_penalty
     }
 
     /// Advance position by one time step. Returns new position (doesn't apply it).
@@ -86,9 +104,37 @@ impl Ship {
         let dy = distance_nm * rad.cos();
         self.position + Position::new(dx, dy)
     }
-}
 
-/// Calculate speed for a given heading (public utility for AI/nav).
+    /// Consume provisions and accumulate fouling for one hour.
+    /// Called by world tick. Returns true if provisions are exhausted.
+    pub fn tick_resources(&mut self, stats: &ShipStats) -> bool {
+        // Provision consumption: per hour = daily / 24
+        let hourly_consumption = stats.daily_provision_consumption() / 24.0;
+        self.provisions = (self.provisions - hourly_consumption).max(0.0);
+
+        // Hull fouling: accumulates ~1 point per 5 days in tropics
+        // = 1/(5*24) per hour ≈ 0.0083/hour
+        self.hull_fouling = (self.hull_fouling + 0.0083).min(100.0);
+
+        self.provisions <= 0.0
+    }
+
+    /// Resupply provisions to capacity.
+    pub fn resupply(&mut self, stats: &ShipStats) {
+        self.provisions = stats.provision_capacity;
+    }
+
+    /// Careen the hull (reset fouling). Only possible when docked.
+    pub fn careen(&mut self) {
+        self.hull_fouling = 0.0;
+    }
+
+    /// Days of provisions remaining at current consumption rate.
+    pub fn provisions_days_remaining(&self, stats: &ShipStats) -> f32 {
+        let daily = stats.daily_provision_consumption();
+        if daily > 0.0 { self.provisions / daily } else { f32::INFINITY }
+    }
+}
 pub fn speed_at_heading(heading: f32, stats: &ShipStats, wind: &WindVector) -> f32 {
     let wind_to = wind.direction_to();
     let relative_angle = angle_diff(heading, wind_to).abs();
@@ -134,7 +180,7 @@ mod tests {
 
     #[test]
     fn test_running_fast() {
-        let ship = Ship { position: Position::ZERO, heading: 0.0, speed: 0.0, state: ShipState::Sailing };
+        let ship = Ship::new(Position::ZERO, ShipState::Sailing);
         let stats = ShipStats::sloop();
         let wind = WindVector { u: 0.0, v: 15.0 };
         assert!(ship.effective_speed(&stats, &wind) > 10.0);
@@ -142,9 +188,10 @@ mod tests {
 
     #[test]
     fn test_beating_slow() {
-        let ship = Ship { position: Position::ZERO, heading: 0.0, speed: 0.0, state: ShipState::Sailing };
+        let mut ship = Ship::new(Position::ZERO, ShipState::Sailing);
+        ship.heading = 0.0; // heading north
         let stats = ShipStats::sloop();
-        let wind = WindVector { u: 0.0, v: -15.0 };
+        let wind = WindVector { u: 0.0, v: -15.0 }; // from north
         assert!(ship.effective_speed(&stats, &wind) < 5.0);
     }
 
@@ -163,5 +210,47 @@ mod tests {
         ship.undock();
         ship.dock();
         assert_eq!(ship.state, ShipState::Docked);
+    }
+
+    #[test]
+    fn test_provisions_consumption() {
+        let mut ship = Ship::new(Position::ZERO, ShipState::Sailing);
+        let stats = ShipStats::sloop();
+        let initial = ship.provisions;
+
+        // Tick 24 hours
+        for _ in 0..24 {
+            ship.tick_resources(&stats);
+        }
+
+        let consumed = initial - ship.provisions;
+        let expected_daily = stats.daily_provision_consumption();
+        assert!((consumed - expected_daily).abs() < 0.001,
+            "Expected ~{:.4} tons consumed in a day, got {:.4}", expected_daily, consumed);
+    }
+
+    #[test]
+    fn test_hull_fouling_speed_penalty() {
+        let mut ship = Ship::new(Position::ZERO, ShipState::Sailing);
+        let stats = ShipStats::sloop();
+        let wind = WindVector { u: 0.0, v: 15.0 }; // from south, running
+        let clean_speed = ship.effective_speed(&stats, &wind);
+
+        ship.hull_fouling = 50.0;
+        let fouled_speed = ship.effective_speed(&stats, &wind);
+        assert!(fouled_speed < clean_speed, "Fouled ship should be slower");
+        // 50 fouling = 15% penalty
+        let expected_ratio = 1.0 - 50.0 * 0.003;
+        let actual_ratio = fouled_speed / clean_speed;
+        assert!((actual_ratio - expected_ratio).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_provisions_days_remaining() {
+        let ship = Ship::new(Position::ZERO, ShipState::Sailing);
+        let stats = ShipStats::sloop();
+        let days = ship.provisions_days_remaining(&stats);
+        // 3.0 tons / (25 * 0.0018 tons/day) = ~66.7 days
+        assert!(days > 60.0 && days < 70.0, "Expected ~67 days, got {}", days);
     }
 }
