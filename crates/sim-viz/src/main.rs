@@ -7,6 +7,7 @@ use std::path::Path;
 
 const SEA_COLOR: Color = Color::new(0.08, 0.20, 0.35, 1.0);
 const LAND_COLOR: Color = Color::new(0.15, 0.40, 0.12, 1.0);
+const COAST_COLOR: Color = Color::new(0.05, 0.15, 0.05, 0.9);
 const SHIP_COLOR: Color = Color::new(1.0, 0.9, 0.2, 1.0);
 const WIND_COLOR: Color = Color::new(0.5, 0.7, 1.0, 0.6);
 const PATH_COLOR: Color = Color::new(1.0, 0.9, 0.2, 0.5);
@@ -103,70 +104,78 @@ impl Camera {
     }
 }
 
-/// Build a single texture of the land mask. Cells are downsampled by
-/// `STRIDE` (block-any-land) to keep GPU memory + upload time reasonable
-/// for a 6300×3900 source: at STRIDE=2 the texture is ~3150×1950 ≈ 24 MB,
-/// which uploads near-instantly and renders as a single textured quad. The
-/// coastline visually still reads as ~2 NM resolution which is more than
-/// enough for the strategic-scale viz.
-fn build_land_texture(world: &World) -> Texture2D {
-    const STRIDE: u32 = 2;
-    let land = &world.map.land;
-    let (sw, sh) = (land.width, land.height);
-    let tw = (sw + STRIDE - 1) / STRIDE;
-    let th = (sh + STRIDE - 1) / STRIDE;
-    let mut bytes = vec![0u8; (tw * th * 4) as usize];
-    for r in 0..th {
-        for c in 0..tw {
-            // Block-any: any source cell in the STRIDE×STRIDE block is land.
-            let r0 = r * STRIDE;
-            let c0 = c * STRIDE;
-            let r1 = (r0 + STRIDE).min(sh);
-            let c1 = (c0 + STRIDE).min(sw);
-            let mut is_land = false;
-            'outer: for rr in r0..r1 {
-                let base = (rr * sw) as usize;
-                for cc in c0..c1 {
-                    if land.data[base + cc as usize] == 255 {
-                        is_land = true;
-                        break 'outer;
-                    }
-                }
-            }
-            if is_land {
-                let idx = ((r * tw + c) * 4) as usize;
-                bytes[idx] = (LAND_COLOR.r * 255.0) as u8;
-                bytes[idx + 1] = (LAND_COLOR.g * 255.0) as u8;
-                bytes[idx + 2] = (LAND_COLOR.b * 255.0) as u8;
-                bytes[idx + 3] = 255;
-            }
-        }
+/// Render the land mesh as filled triangles. Falls back to drawing
+/// nothing if the mesh wasn't loaded (`data/grids/land_polys.bin`
+/// missing).
+///
+/// Triangles whose AABB is fully off-screen are skipped to avoid
+/// shipping every triangle in the dataset to the GPU each frame; for
+/// the eastern-seaboard + Caribbean view this typically prunes 80–95%
+/// of the ~80k triangles depending on zoom.
+fn draw_land(world: &World, camera: &Camera) {
+    let mesh = &world.land_mesh;
+    if mesh.indices.is_empty() {
+        return;
     }
-    let img = Image { bytes, width: tw as u16, height: th as u16 };
-    let tex = Texture2D::from_image(&img);
-    tex.set_filter(FilterMode::Nearest);
-    tex
+    let sw = screen_width();
+    let sh = screen_height();
+
+    // Project all vertices once per frame.
+    let projected: Vec<Vec2> = mesh
+        .vertices
+        .iter()
+        .map(|v| camera.world_to_screen(*v))
+        .collect();
+
+    let tri_count = mesh.indices.len() / 3;
+    for t in 0..tri_count {
+        let i0 = mesh.indices[t * 3] as usize;
+        let i1 = mesh.indices[t * 3 + 1] as usize;
+        let i2 = mesh.indices[t * 3 + 2] as usize;
+        let a = projected[i0];
+        let b = projected[i1];
+        let c = projected[i2];
+
+        // Off-screen reject: all three vertices on the same outside.
+        let off = (a.x < 0.0 && b.x < 0.0 && c.x < 0.0)
+            || (a.x > sw && b.x > sw && c.x > sw)
+            || (a.y < 0.0 && b.y < 0.0 && c.y < 0.0)
+            || (a.y > sh && b.y > sh && c.y > sh);
+        if off {
+            continue;
+        }
+        draw_triangle(a, b, c, LAND_COLOR);
+    }
 }
 
-fn draw_land(world: &World, camera: &Camera, tex: &Texture2D) {
-    let land = &world.map.land;
-    // Top-left corner of the texture in world space.
-    let world_x = land.origin.x;
-    let world_y = land.origin.y;
-    let top_left = camera.world_to_screen(Position::new(world_x, world_y));
-    let pixel_size = land.cell_size_nm * camera.zoom();
-    let dest_w = land.width as f32 * pixel_size;
-    let dest_h = land.height as f32 * pixel_size;
-    draw_texture_ex(
-        tex,
-        top_left.x,
-        top_left.y,
-        WHITE,
-        DrawTextureParams {
-            dest_size: Some(Vec2::new(dest_w, dest_h)),
-            ..Default::default()
-        },
-    );
+fn draw_coastline(world: &World, camera: &Camera) {
+    if world.coastline.lines.is_empty() {
+        return;
+    }
+    // Line thickness in pixels — keep constant at high zoom, slimmer when
+    // far out so the coast doesn't smear into a halo.
+    let thickness = (camera.zoom() * 0.7).clamp(0.6, 1.6);
+
+    let sw = screen_width();
+    let sh = screen_height();
+    for line in &world.coastline.lines {
+        if line.len() < 2 {
+            continue;
+        }
+        let mut prev = camera.world_to_screen(line[0]);
+        for p in &line[1..] {
+            let cur = camera.world_to_screen(*p);
+            // Cheap viewport reject: skip segments fully off-screen.
+            let off = (prev.x < 0.0 && cur.x < 0.0)
+                || (prev.x > sw && cur.x > sw)
+                || (prev.y < 0.0 && cur.y < 0.0)
+                || (prev.y > sh && cur.y > sh);
+            if !off {
+                draw_line(prev.x, prev.y, cur.x, cur.y, thickness, COAST_COLOR);
+            }
+            prev = cur;
+        }
+    }
 }
 
 fn draw_wind_arrows(world: &World, camera: &Camera) {
@@ -323,7 +332,6 @@ async fn main() {
     let mut world = World::load(Path::new("data/"));
     spawn_demo_ship(&mut world);
 
-    let land_texture = build_land_texture(&world);
     let mut camera = Camera::new();
     let mut paused = false;
     let mut ticks_per_frame: u32 = 1;
@@ -356,7 +364,8 @@ async fn main() {
 
         // Render
         clear_background(SEA_COLOR);
-        draw_land(&world, &camera, &land_texture);
+        draw_land(&world, &camera);
+        draw_coastline(&world, &camera);
         draw_wind_arrows(&world, &camera);
         draw_ports(&world, &camera);
         draw_ships(&world, &camera);

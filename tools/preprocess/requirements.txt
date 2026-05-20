@@ -1,2 +1,5 @@
 netCDF4>=1.6
 numpy>=1.24
+pyshp>=2.3
+shapely>=2.0
+mapbox_earcut>=1.0

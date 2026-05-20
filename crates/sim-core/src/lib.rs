@@ -9,4 +9,5 @@ pub mod nav;
 pub mod bt;
 pub mod ai;
 pub mod port;
+pub mod coastline;
 pub mod world;

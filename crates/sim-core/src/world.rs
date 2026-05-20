@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use crate::ai::ShipAI;
+use crate::coastline::{CoastlineMap, LandMesh};
 use crate::harbor::HarborMap;
 use crate::map::MapSystem;
 use crate::navmesh::Navmesh;
@@ -16,6 +17,8 @@ pub struct World {
     pub ports: Vec<Port>,
     pub harbors: HarborMap,
     pub navmesh: Navmesh,
+    pub coastline: CoastlineMap,
+    pub land_mesh: LandMesh,
     pub ships: Vec<Ship>,
     pub ship_ais: Vec<ShipAI>,
     pub date: SimDate,
@@ -28,6 +31,10 @@ impl World {
         let ports = all_ports();
         let harbors = HarborMap::build(&map.land, &ports);
         let navmesh = Navmesh::build(&map.land);
+        let coastline = CoastlineMap::load(&data_dir.join("grids/coastline.bin"))
+            .unwrap_or_default();
+        let land_mesh = LandMesh::load(&data_dir.join("grids/land_polys.bin"))
+            .unwrap_or_default();
 
         Self {
             map,
@@ -35,6 +42,8 @@ impl World {
             ports,
             harbors,
             navmesh,
+            coastline,
+            land_mesh,
             ships: Vec::new(),
             ship_ais: Vec::new(),
             date: SimDate::new(1680, 0, 1),
