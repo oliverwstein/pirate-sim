@@ -37,11 +37,11 @@ impl World {
                 continue;
             }
 
-            // Point at destination
-            ship.update_heading_toward_destination();
-
             // Get wind at ship's position
             let wind = self.weather.wind.wind_at(ship.position, self.date.month());
+
+            // Choose heading (VMG-based tacking when beating into wind)
+            ship.update_heading_toward_destination(&stats, &wind);
 
             // Compute proposed new position
             let new_pos = ship.compute_next_position(&stats, &wind, 1.0);
