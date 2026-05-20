@@ -32,9 +32,9 @@ CELL_DEG = 0.25
 
 
 def latlon_to_nm(lat: float, lon: float) -> tuple[float, float]:
-    """Convert lat/lon to nautical miles from origin."""
+    """Convert lat/lon to nautical miles from origin (equirectangular projection)."""
     dy = (lat - ORIGIN_LAT) * 60.0
-    dx = (lon - ORIGIN_LON) * 60.0 * math.cos(math.radians(lat))
+    dx = (lon - ORIGIN_LON) * 60.0  # No cos(lat) — matches grid's uniform cell size
     return (dx, dy)
 
 

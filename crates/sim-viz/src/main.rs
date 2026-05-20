@@ -143,6 +143,30 @@ fn draw_wind_arrows(world: &World, camera: &Camera) {
     }
 }
 
+fn draw_ports(world: &World, camera: &Camera) {
+    for port in &world.ports {
+        let sp = camera.world_to_screen(port.position);
+
+        // Only draw if on screen
+        if sp.x < -50.0 || sp.x > screen_width() + 50.0
+            || sp.y < -50.0 || sp.y > screen_height() + 50.0
+        {
+            continue;
+        }
+
+        let (r, g, b) = port.faction.color_rgb();
+        let color = Color::from_rgba(r, g, b, 255);
+
+        draw_circle(sp.x, sp.y, 4.0, color);
+        draw_circle_lines(sp.x, sp.y, 4.0, 1.0, WHITE);
+
+        // Draw name if zoomed in enough
+        if camera.zoom > 0.15 {
+            draw_text(port.name, sp.x + 6.0, sp.y - 4.0, 14.0, color);
+        }
+    }
+}
+
 fn draw_ships(world: &World, camera: &Camera) {
     for ship in &world.ships {
         let sp = camera.world_to_screen(ship.position);
@@ -198,13 +222,11 @@ async fn main() {
     let mut world = World::load(Path::new("data/"));
 
     // Spawn test ship: Barbados → Port Royal (Jamaica)
-    // Barbados: 13.1°N, 59.6°W → (754, -264) NM from origin
-    // Port Royal: 17.9°N, 76.8°W → (-246, 24) NM from origin
-    let barbados = Position::new(754.0, -264.0);
-    let port_royal = Position::new(-246.0, 24.0);
+    let barbados_pos = world.ports.iter().find(|p| p.name == "Bridgetown").unwrap().position;
+    let port_royal_pos = world.ports.iter().find(|p| p.name == "Port Royal").unwrap().position;
     world
         .ships
-        .push(Ship::new(barbados, Some(port_royal)));
+        .push(Ship::new(barbados_pos, Some(port_royal_pos)));
 
     let mut camera = Camera::new();
     let mut paused = false;
@@ -234,6 +256,7 @@ async fn main() {
         clear_background(SEA_COLOR);
         draw_land(&world, &camera);
         draw_wind_arrows(&world, &camera);
+        draw_ports(&world, &camera);
         draw_ships(&world, &camera);
         draw_hud(&world, paused, ticks_per_frame);
 

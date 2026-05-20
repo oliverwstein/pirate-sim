@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use crate::map::MapSystem;
+use crate::port::{Port, all_ports};
 use crate::ship::{Ship, ShipStats};
 use crate::types::SimDate;
 use crate::weather::WeatherSystem;
@@ -8,6 +9,7 @@ use crate::weather::WeatherSystem;
 pub struct World {
     pub map: MapSystem,
     pub weather: WeatherSystem,
+    pub ports: Vec<Port>,
     pub ships: Vec<Ship>,
     pub date: SimDate,
 }
@@ -20,6 +22,7 @@ impl World {
         Self {
             map,
             weather,
+            ports: all_ports(),
             ships: Vec::new(),
             date: SimDate::new(1680, 0, 1), // January 1, 1680
         }
