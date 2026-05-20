@@ -69,11 +69,6 @@ impl Ship {
         self.speed = speed;
     }
 
-    /// Set heading (the primary control input from AI/player).
-    pub fn set_heading(&mut self, heading: f32) {
-        self.heading = heading;
-    }
-
     /// Transition to sailing state.
     pub fn undock(&mut self) {
         self.state = ShipState::Sailing;
@@ -132,14 +127,18 @@ impl Ship {
         self.provisions <= 0.0
     }
 
-    /// Resupply provisions to capacity.
-    pub fn resupply(&mut self, stats: &ShipStats) {
-        self.provisions = stats.provision_capacity;
+    /// Resupply provisions for one hour at a port. Returns `true` once
+    /// provisions have reached capacity (the AI uses this as a "done" flag).
+    pub fn tick_resupply(&mut self, stats: &ShipStats) -> bool {
+        self.provisions = (self.provisions + RESUPPLY_RATE_PER_HOUR).min(stats.provision_capacity);
+        self.provisions >= stats.provision_capacity
     }
 
-    /// Careen the hull (reset fouling). Only possible when docked.
-    pub fn careen(&mut self) {
-        self.hull_fouling = 0.0;
+    /// Careen the hull for one hour at a port. Returns `true` once the
+    /// hull is fully clean.
+    pub fn tick_careen(&mut self) -> bool {
+        self.hull_fouling = (self.hull_fouling - CAREEN_RATE_PER_HOUR).max(0.0);
+        self.hull_fouling <= 0.0
     }
 
     /// Days of provisions remaining at current consumption rate.
@@ -148,6 +147,12 @@ impl Ship {
         if daily > 0.0 { self.provisions / daily } else { f32::INFINITY }
     }
 }
+
+/// Tons of provisions taken on per hour while resupplying at a port.
+const RESUPPLY_RATE_PER_HOUR: f32 = 0.5;
+
+/// Fouling points removed per hour while careening at a port.
+const CAREEN_RATE_PER_HOUR: f32 = 3.0;
 pub fn speed_at_heading(heading: f32, stats: &ShipStats, wind: &WindVector) -> f32 {
     let wind_to = wind.direction_to();
     let relative_angle = angle_diff(heading, wind_to).abs();

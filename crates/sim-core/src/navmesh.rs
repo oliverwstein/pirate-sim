@@ -15,13 +15,12 @@
 //!    become nodes. This gives a uniform "highway" of waypoints in deep
 //!    water — the bulk of Atlantic / Caribbean transit.
 //!
-//! 2. **Channel detection** (the fine-vs-coarse comparison): every cell of
-//!    the coarse-pessimistic land mask (where any of its 25 fine source
-//!    cells is land) is examined; if it nonetheless contains fine sea
-//!    cells with non-trivial clearance, we drop a waypoint at the deepest
-//!    one. This auto-discovers the Bocas of Trinidad, the Maracaibo
-//!    Strait, the Florida Strait, the Yucatán Channel, and similar narrow
-//!    passages — exactly the places the open-water grid is too sparse for.
+//! 2. **Channel detection**: every `CHANNEL_STRIDE × CHANNEL_STRIDE` block
+//!    of fine cells is examined; if it contains both land and sea, we drop
+//!    a waypoint at the deepest fine sea cell within. This auto-discovers
+//!    the Bocas of Trinidad, the Maracaibo Strait, the Florida Strait, the
+//!    Yucatán Channel, and similar narrow passages — exactly the places
+//!    the open-water grid is too sparse for.
 //!
 //! ## Edges
 //!
@@ -54,6 +53,12 @@ const MIN_OFFSHORE_NM: u32 = 1;
 /// Minimum distance-from-land for a channel-detection waypoint. Channels
 /// are by definition narrower than open water, so this is more permissive.
 const MIN_CHANNEL_NM: u32 = 0;
+
+/// Coarse-cell stride (in fine cells) used by the channel-detection pass.
+/// Each `CHANNEL_STRIDE × CHANNEL_STRIDE` block of fine cells is examined
+/// for a mixed land/sea state; if mixed, the deepest fine sea cell in the
+/// block becomes a channel waypoint.
+const CHANNEL_STRIDE: u32 = 5;
 
 /// Maximum length of any single navmesh edge. Long edges are slower to
 /// validate (more corridor samples) and rarely useful — open-water sampling
@@ -114,17 +119,21 @@ impl Navmesh {
         let open_count = node_positions.len();
 
         // --- Pass 2: channel detection (fine-vs-coarse comparison) ---
-        // For each coarse cell whose pessimistic view (any-fine-land) is
-        // "land" but which contains fine sea cells, drop a waypoint at the
-        // deepest fine cell inside it. To avoid duplicates we de-dup by
-        // coarse cell — at most one channel waypoint per coarse cell.
-        let coarse = &land.coarse;
-        for cr in 0..coarse.height {
-            for cc in 0..coarse.width {
-                let r0 = cr * coarse.stride;
-                let c0 = cc * coarse.stride;
-                let r1 = (r0 + coarse.stride).min(h);
-                let c1 = (c0 + coarse.stride).min(w);
+        // For each `CHANNEL_STRIDE × CHANNEL_STRIDE` block of fine cells
+        // that contains BOTH land and sea (i.e., a coastal block), drop a
+        // waypoint at the deepest fine sea cell inside it. To avoid
+        // duplicates we de-dup by block — at most one channel waypoint per
+        // block. This auto-discovers narrow straits, river mouths and
+        // similar passages that the open-water grid is too sparse for.
+        let stride = CHANNEL_STRIDE;
+        let cw = (w + stride - 1) / stride;
+        let ch = (h + stride - 1) / stride;
+        for cr in 0..ch {
+            for cc in 0..cw {
+                let r0 = cr * stride;
+                let c0 = cc * stride;
+                let r1 = (r0 + stride).min(h);
+                let c1 = (c0 + stride).min(w);
                 let mut has_land = false;
                 let mut has_sea = false;
                 'cells: for rr in r0..r1 {
@@ -139,8 +148,8 @@ impl Navmesh {
                         }
                     }
                 }
-                // We want coastal coarse cells: contain BOTH land and sea
-                // at fine resolution. Pure-sea is already covered by pass 1.
+                // Coastal blocks only: pure-sea blocks are already covered
+                // by pass 1.
                 if !(has_land && has_sea) {
                     continue;
                 }

@@ -24,7 +24,6 @@ use crate::types::Position;
 pub struct Harbor {
     pub port_index: usize,
     pub anchor: Position,
-    pub anchor_cell: (u32, u32),
     pub cells: HashSet<(u32, u32)>,
     /// Bounding box of the zone in world space (min, max). Useful for cheap
     /// "is this position even close?" pre-checks.
@@ -107,7 +106,6 @@ impl HarborMap {
             harbors.push(Harbor {
                 port_index: idx,
                 anchor,
-                anchor_cell,
                 cells,
                 bbox,
             });
@@ -119,12 +117,6 @@ impl HarborMap {
     /// Look up a harbor by its port index. O(n) over harbors; n is small.
     pub fn for_port(&self, port_index: usize) -> Option<&Harbor> {
         self.harbors.iter().find(|h| h.port_index == port_index)
-    }
-
-    /// Which port (if any) currently owns the harbor cell containing `pos`?
-    pub fn port_at(&self, land: &LandMap, pos: Position) -> Option<usize> {
-        let cell = land.pos_to_cell(pos)?;
-        self.cell_to_port.get(&cell).copied()
     }
 }
 

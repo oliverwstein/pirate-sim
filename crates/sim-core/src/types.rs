@@ -64,12 +64,6 @@ impl SimDate {
             self.day_of_year = total_days as u16;
         }
     }
-
-    pub fn total_hours_elapsed(&self, start_year: u16) -> u64 {
-        let years = (self.year - start_year) as u64;
-        let days = years * 365 + (self.day_of_year as u64 - 1);
-        days * 24 + self.hour as u64
-    }
 }
 
 fn month_day_to_doy(month: u8, day: u8) -> u16 {

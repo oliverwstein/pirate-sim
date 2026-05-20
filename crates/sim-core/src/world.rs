@@ -51,7 +51,7 @@ impl World {
     pub fn tick(&mut self) {
         let stats = ShipStats::sloop();
         let month = self.date.month();
-        let pathfind = PathfindContext::with_navmesh(
+        let pathfind = PathfindContext::new(
             &self.map.land,
             &self.weather.wind,
             &stats,

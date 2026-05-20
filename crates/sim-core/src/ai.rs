@@ -35,10 +35,6 @@ const COND_IS_DOCKED: usize = 0;
 const COND_HAS_DESTINATION: usize = 1;
 const COND_IS_LOW_PROVISIONS: usize = 2;
 
-/// Rates for port actions.
-const RESUPPLY_RATE: f32 = 0.5;    // tons per hour at a port
-const CAREEN_RATE_PORT: f32 = 3.0; // fouling points removed per hour
-
 /// Below this many days of provisions, divert to nearest port.
 const LOW_PROVISIONS_DAYS: f32 = 10.0;
 
@@ -221,21 +217,6 @@ impl<'a> ShipBtContext<'a> {
         }
     }
 
-    /// Set a free-form destination *position* (e.g., open-water rendezvous).
-    /// No harbor zone is associated — arrival will use the literal
-    /// `ARRIVAL_NM` distance.
-    #[allow(dead_code)]
-    fn assign_destination(&mut self, dest: Position) {
-        self.nav.destination = Some(dest);
-        self.nav.dest_port = None;
-        self.nav.clear_path();
-        if let Some(ctx) = self.pathfind {
-            if let Some(path) = pathfind::find_path(ctx, self.ship.position, dest) {
-                self.nav.set_path(path);
-            }
-        }
-    }
-
     /// True if the ship is in its destination port's harbor zone.
     fn in_destination_harbor(&self) -> bool {
         let port_idx = match self.nav.dest_port {
@@ -299,8 +280,7 @@ impl<'a> BtContext for ShipBtContext<'a> {
             }
             ACT_RESUPPLY => {
                 *self.dock_action = DockAction::Resupplying;
-                self.ship.provisions = (self.ship.provisions + RESUPPLY_RATE).min(self.stats.provision_capacity);
-                if self.ship.provisions >= self.stats.provision_capacity {
+                if self.ship.tick_resupply(self.stats) {
                     *self.dock_action = DockAction::Idle;
                     Status::Success
                 } else {
@@ -309,8 +289,7 @@ impl<'a> BtContext for ShipBtContext<'a> {
             }
             ACT_CAREEN => {
                 *self.dock_action = DockAction::Careening;
-                self.ship.hull_fouling = (self.ship.hull_fouling - CAREEN_RATE_PORT).max(0.0);
-                if self.ship.hull_fouling <= 0.0 {
+                if self.ship.tick_careen() {
                     *self.dock_action = DockAction::Idle;
                     Status::Success
                 } else {

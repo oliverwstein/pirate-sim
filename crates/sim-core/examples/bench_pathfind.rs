@@ -13,7 +13,7 @@ use std::time::Instant;
 fn main() {
     let world = World::load(Path::new("data/"));
     let stats = ShipStats::sloop();
-    let pf = PathfindContext::with_navmesh(&world.map.land, &world.weather.wind, &stats, 0, &world.navmesh);
+    let pf = PathfindContext::new(&world.map.land, &world.weather.wind, &stats, 0, &world.navmesh);
 
     let n = world.ports.len();
     println!("Benchmarking {} ports = {} ordered pairs ({} directed routes)",

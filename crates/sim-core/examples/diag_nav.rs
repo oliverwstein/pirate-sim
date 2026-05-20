@@ -7,7 +7,7 @@ use std::path::Path;
 fn main() {
     let world = World::load(Path::new("data/"));
     let stats = ShipStats::sloop();
-    let pf = PathfindContext::with_navmesh(&world.map.land, &world.weather.wind, &stats, 0, &world.navmesh);
+    let pf = PathfindContext::new(&world.map.land, &world.weather.wind, &stats, 0, &world.navmesh);
 
     // Try a few representative routes.
     let routes: &[(&str, &str)] = &[
