@@ -60,6 +60,15 @@ impl Ship {
         }
     }
 
+    /// Set heading and commanded speed (the primary control inputs from
+    /// AI/player). The commanded speed is what the ship will actually make
+    /// good this tick (before fouling); the navigator is responsible for
+    /// reducing it to reflect upwind tacking, sail damage, etc.
+    pub fn set_steering(&mut self, heading: f32, speed: f32) {
+        self.heading = heading;
+        self.speed = speed;
+    }
+
     /// Set heading (the primary control input from AI/player).
     pub fn set_heading(&mut self, heading: f32) {
         self.heading = heading;
@@ -82,12 +91,15 @@ impl Ship {
         self.speed = 0.0;
     }
 
-    /// Calculate effective speed based on current heading, wind, and stats.
-    /// Hull fouling reduces speed (up to 30% penalty at full fouling).
-    pub fn effective_speed(&self, stats: &ShipStats, wind: &WindVector) -> f32 {
-        let base_speed = speed_at_heading(self.heading, stats, wind);
+    /// Calculate effective speed: the commanded speed (set by the navigator)
+    /// reduced by hull fouling (up to 30% penalty at full fouling).
+    ///
+    /// `_stats` and `_wind` are kept in the signature for API compatibility
+    /// and future use (e.g., gust gusts overriding command), but the speed
+    /// model is now driven by the navigator via `set_steering`.
+    pub fn effective_speed(&self, _stats: &ShipStats, _wind: &WindVector) -> f32 {
         let fouling_penalty = 1.0 - self.hull_fouling * 0.003;
-        base_speed * fouling_penalty
+        self.speed * fouling_penalty
     }
 
     /// Advance position by one time step. Returns new position (doesn't apply it).
@@ -181,9 +193,11 @@ mod tests {
 
     #[test]
     fn test_running_fast() {
-        let ship = Ship::new(Position::ZERO, ShipState::Sailing);
+        let mut ship = Ship::new(Position::ZERO, ShipState::Sailing);
         let stats = ShipStats::sloop();
         let wind = WindVector { u: 0.0, v: 15.0 };
+        // Simulate navigator commanding running speed.
+        ship.speed = speed_at_heading(ship.heading, &stats, &wind);
         assert!(ship.effective_speed(&stats, &wind) > 10.0);
     }
 
@@ -193,6 +207,8 @@ mod tests {
         ship.heading = 0.0; // heading north
         let stats = ShipStats::sloop();
         let wind = WindVector { u: 0.0, v: -15.0 }; // from north
+        // Simulate navigator commanding the raw upwind hull speed (slow).
+        ship.speed = speed_at_heading(ship.heading, &stats, &wind);
         assert!(ship.effective_speed(&stats, &wind) < 5.0);
     }
 
@@ -235,6 +251,7 @@ mod tests {
         let mut ship = Ship::new(Position::ZERO, ShipState::Sailing);
         let stats = ShipStats::sloop();
         let wind = WindVector { u: 0.0, v: 15.0 }; // from south, running
+        ship.speed = speed_at_heading(ship.heading, &stats, &wind);
         let clean_speed = ship.effective_speed(&stats, &wind);
 
         ship.hull_fouling = 50.0;

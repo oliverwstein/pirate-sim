@@ -287,8 +287,8 @@ impl<'a> BtContext for ShipBtContext<'a> {
                 }
 
                 let land = self.pathfind.map(|c| c.land);
-                if let Some(heading) = self.nav.compute_heading(self.ship.position, self.stats, self.wind, land) {
-                    self.ship.set_heading(heading);
+                if let Some(s) = self.nav.compute_steering(self.ship.position, self.stats, self.wind, land) {
+                    self.ship.set_steering(s.heading, s.speed);
                     Status::Running
                 } else {
                     // Arrived at a free-form destination (no harbor zone).

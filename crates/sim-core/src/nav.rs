@@ -1,6 +1,13 @@
-//! Navigation utilities: VMG calculation, tacking, waypoint following, and
+//! Navigation utilities: VMG-based steering, waypoint following, and
 //! reactive land deflection. Used by the AI layer to translate goals into
-//! heading commands.
+//! heading + speed commands.
+//!
+//! We do not physically simulate tacking. When the bearing to the next
+//! waypoint lies inside the no-go zone, the ship still sails *directly*
+//! toward the waypoint, but at the velocity-made-good (VMG) it would have
+//! achieved by tacking optimally to either side. This is geometrically
+//! equivalent over distances larger than a few NM and avoids the whole
+//! class of bugs where physical zig-zagging pushes a ship into a coastline.
 
 use std::collections::VecDeque;
 
@@ -8,11 +15,12 @@ use crate::map::land::LandMap;
 use crate::ship::{angle_diff, normalize_angle, speed_at_heading, ShipStats};
 use crate::types::{Position, WindVector};
 
-/// Which tack the navigator is currently on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Tack {
-    Port,
-    Starboard,
+/// A steering command: the heading to set on the ship and the speed it
+/// should make good toward its target this tick (pre-fouling).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Steering {
+    pub heading: f32,
+    pub speed: f32,
 }
 
 /// Distance (NM) at which a waypoint is considered "reached".
@@ -27,6 +35,10 @@ const ARRIVAL_NM: f32 = 12.0;
 /// an entire one-hour tick of travel fits comfortably (max sloop speed ≈ 12 kt).
 const DEFLECT_LOOKAHEAD_NM: f32 = 14.0;
 
+/// Minimum speed (kt) the VMG model will report for an upwind leg. Keeps
+/// long voyages from grinding to literal zero in light winds.
+const MIN_UPWIND_VMG: f32 = 0.5;
+
 /// Navigation state for a ship (owned by AI, not by Ship itself).
 pub struct NavState {
     /// Final goal — once cleared, the ship has arrived.
@@ -38,7 +50,6 @@ pub struct NavState {
     /// Ordered intermediate waypoints (front = next target). The final
     /// element should equal `destination` when a path was planned.
     pub waypoints: VecDeque<Position>,
-    pub tack: Tack,
 }
 
 impl NavState {
@@ -47,7 +58,6 @@ impl NavState {
             destination: None,
             dest_port: None,
             waypoints: VecDeque::new(),
-            tack: Tack::Starboard,
         }
     }
 
@@ -56,7 +66,6 @@ impl NavState {
             destination: Some(dest),
             dest_port: None,
             waypoints: VecDeque::new(),
-            tack: Tack::Starboard,
         }
     }
 
@@ -79,19 +88,25 @@ impl NavState {
         self.waypoints.front().copied().or(self.destination)
     }
 
-    /// Compute the optimal heading given current position, wind, and destination.
-    /// Returns None if no destination is set or already arrived.
+    /// Compute steering (heading + commanded speed) given current position,
+    /// wind, and destination. Returns None if no destination is set or the
+    /// ship has arrived.
     ///
-    /// `land` is optional; when provided, the chosen heading is reactively
-    /// deflected to clear nearby coastline (a safety net for when wind /
-    /// tacking pushes the ship close to land between waypoints).
-    pub fn compute_heading(
+    /// The returned heading is always direct toward the next waypoint /
+    /// destination. When that bearing lies inside the no-go zone, the
+    /// returned `speed` reflects the velocity-made-good of an optimal
+    /// (instantaneous) tack, so coastal voyages don't drift sideways.
+    ///
+    /// `land` is optional; when provided, the heading is reactively deflected
+    /// to clear nearby coastline (a safety net for when wind / drift pushes
+    /// the ship close to land between planner waypoints).
+    pub fn compute_steering(
         &mut self,
         pos: Position,
         stats: &ShipStats,
         wind: &WindVector,
         land: Option<&LandMap>,
-    ) -> Option<f32> {
+    ) -> Option<Steering> {
         // Advance through waypoints we've already reached.
         while let Some(&wp) = self.waypoints.front() {
             if pos.distance(wp) < WAYPOINT_REACHED_NM {
@@ -117,40 +132,27 @@ impl NavState {
 
         let angle_to_wind = angle_diff(bearing_to_target, wind_from).abs();
 
-        let chosen = if angle_to_wind > stats.no_go_half_angle + 5.0 {
-            // Can sail direct
-            bearing_to_target
+        let speed = if angle_to_wind > stats.no_go_half_angle + 5.0 {
+            // Direct sailing: speed at the actual heading.
+            speed_at_heading(bearing_to_target, stats, wind)
         } else {
-            // Must tack: compute VMG for each side
-            let port_heading = normalize_angle(wind_from - stats.no_go_half_angle);
-            let starboard_heading = normalize_angle(wind_from + stats.no_go_half_angle);
-
-            let port_vmg = vmg(port_heading, bearing_to_target, speed_at_heading(port_heading, stats, wind));
-            let starboard_vmg = vmg(starboard_heading, bearing_to_target, speed_at_heading(starboard_heading, stats, wind));
-
-            // Hysteresis: only switch tack if other side is >20% better
-            let hysteresis = 1.2;
-            self.tack = match self.tack {
-                Tack::Port => {
-                    if starboard_vmg > port_vmg * hysteresis { Tack::Starboard } else { Tack::Port }
-                }
-                Tack::Starboard => {
-                    if port_vmg > starboard_vmg * hysteresis { Tack::Port } else { Tack::Starboard }
-                }
-            };
-
-            match self.tack {
-                Tack::Port => port_heading,
-                Tack::Starboard => starboard_heading,
-            }
+            // Upwind: model the ship as sailing directly at the VMG of an
+            // optimal tack. We pick whichever side gives better progress.
+            let port_h = normalize_angle(wind_from - stats.no_go_half_angle);
+            let stbd_h = normalize_angle(wind_from + stats.no_go_half_angle);
+            let port_vmg = vmg(port_h, bearing_to_target, speed_at_heading(port_h, stats, wind));
+            let stbd_vmg = vmg(stbd_h, bearing_to_target, speed_at_heading(stbd_h, stats, wind));
+            port_vmg.max(stbd_vmg).max(MIN_UPWIND_VMG)
         };
 
         // Reactive land deflection (optional). Keeps the ship from sailing
         // into a coast between planner waypoints (e.g., when blown sideways).
-        Some(match land {
-            Some(land) => deflect_for_land(pos, chosen, land, DEFLECT_LOOKAHEAD_NM),
-            None => chosen,
-        })
+        let heading = match land {
+            Some(land) => deflect_for_land(pos, bearing_to_target, land, DEFLECT_LOOKAHEAD_NM),
+            None => bearing_to_target,
+        };
+
+        Some(Steering { heading, speed })
     }
 }
 
@@ -214,18 +216,24 @@ mod tests {
         let mut nav = NavState::with_destination(Position::new(100.0, 0.0));
         let stats = ShipStats::sloop();
         let wind = WindVector { u: 0.0, v: 15.0 }; // from south
-        let heading = nav.compute_heading(Position::ZERO, &stats, &wind, None).unwrap();
-        assert!((heading - 90.0).abs() < 1.0);
+        let s = nav.compute_steering(Position::ZERO, &stats, &wind, None).unwrap();
+        assert!((s.heading - 90.0).abs() < 1.0);
+        assert!(s.speed > 5.0, "beam reach should be fast");
     }
 
     #[test]
-    fn test_tacking_heading() {
+    fn test_upwind_uses_vmg_speed() {
+        // Heading is direct toward target even when in the no-go zone, but
+        // commanded speed is the VMG of an optimal tack.
         let mut nav = NavState::with_destination(Position::new(0.0, 100.0));
         let stats = ShipStats::sloop();
         let wind = WindVector { u: 0.0, v: -15.0 }; // from north
-        let heading = nav.compute_heading(Position::ZERO, &stats, &wind, None).unwrap();
-        let angle_from_wind = angle_diff(heading, 0.0).abs();
-        assert!(angle_from_wind >= stats.no_go_half_angle - 1.0);
+        let s = nav.compute_steering(Position::ZERO, &stats, &wind, None).unwrap();
+        // Heading is direct (north).
+        assert!(angle_diff(s.heading, 0.0).abs() < 1.0);
+        // Speed is reduced (VMG, not full hull speed).
+        assert!(s.speed < stats.speed_typical, "upwind VMG should be slower than typical");
+        assert!(s.speed > MIN_UPWIND_VMG, "should still make some progress");
     }
 
     #[test]
@@ -233,8 +241,8 @@ mod tests {
         let mut nav = NavState::with_destination(Position::new(3.0, 0.0));
         let stats = ShipStats::sloop();
         let wind = WindVector { u: 0.0, v: 15.0 };
-        let result = nav.compute_heading(Position::ZERO, &stats, &wind, None);
-        assert!(result.is_none()); // within 5 NM = arrived
+        let result = nav.compute_steering(Position::ZERO, &stats, &wind, None);
+        assert!(result.is_none()); // within ARRIVAL_NM
         assert!(nav.destination.is_none());
     }
 
