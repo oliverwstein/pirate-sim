@@ -117,6 +117,7 @@ mod tests {
             position: Position::new(x, y),
             faction: crate::port::Faction::England,
             harbor_radius_nm: 5.0,
+            is_shipyard: false,
         }
     }
 

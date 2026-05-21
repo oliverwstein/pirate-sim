@@ -15,9 +15,9 @@ fn calm_wind() -> WindVector {
 /// Helper: some test ports for the AI to use.
 fn test_ports() -> Vec<Port> {
     vec![
-        Port { name: "PortA", position: Position { x: 100.0, y: 0.0 }, faction: sim_core::port::Faction::England, harbor_radius_nm: DEFAULT_HARBOR_RADIUS_NM },
-        Port { name: "PortB", position: Position { x: -100.0, y: 0.0 }, faction: sim_core::port::Faction::Spain, harbor_radius_nm: DEFAULT_HARBOR_RADIUS_NM },
-        Port { name: "PortC", position: Position { x: 0.0, y: 100.0 }, faction: sim_core::port::Faction::France, harbor_radius_nm: DEFAULT_HARBOR_RADIUS_NM },
+        Port { name: "PortA", position: Position { x: 100.0, y: 0.0 }, faction: sim_core::port::Faction::England, harbor_radius_nm: DEFAULT_HARBOR_RADIUS_NM, is_shipyard: false },
+        Port { name: "PortB", position: Position { x: -100.0, y: 0.0 }, faction: sim_core::port::Faction::Spain, harbor_radius_nm: DEFAULT_HARBOR_RADIUS_NM, is_shipyard: false },
+        Port { name: "PortC", position: Position { x: 0.0, y: 100.0 }, faction: sim_core::port::Faction::France, harbor_radius_nm: DEFAULT_HARBOR_RADIUS_NM, is_shipyard: false },
     ]
 }
 
@@ -308,8 +308,8 @@ fn trace_sailing_to_port_royal() {
     
     // Include Port Royal in the port list so diversion works sensibly
     let ports = vec![
-        Port { name: "Port Royal", position: port_royal, faction: sim_core::port::Faction::England, harbor_radius_nm: DEFAULT_HARBOR_RADIUS_NM },
-        Port { name: "Bridgetown", position: barbados, faction: sim_core::port::Faction::England, harbor_radius_nm: DEFAULT_HARBOR_RADIUS_NM },
+        Port { name: "Port Royal", position: port_royal, faction: sim_core::port::Faction::England, harbor_radius_nm: DEFAULT_HARBOR_RADIUS_NM, is_shipyard: false },
+        Port { name: "Bridgetown", position: barbados, faction: sim_core::port::Faction::England, harbor_radius_nm: DEFAULT_HARBOR_RADIUS_NM, is_shipyard: false },
     ];
     
     let mut ship = Ship::new(barbados, ShipState::Sailing);
@@ -352,8 +352,8 @@ fn low_provisions_diverts_to_nearest_port() {
     let stats = ShipStats::sloop();
     let wind = calm_wind();
     let ports = vec![
-        Port { name: "NearPort", position: Position { x: 50.0, y: 0.0 }, faction: sim_core::port::Faction::England, harbor_radius_nm: DEFAULT_HARBOR_RADIUS_NM },
-        Port { name: "FarPort", position: Position { x: 500.0, y: 0.0 }, faction: sim_core::port::Faction::Spain, harbor_radius_nm: DEFAULT_HARBOR_RADIUS_NM },
+        Port { name: "NearPort", position: Position { x: 50.0, y: 0.0 }, faction: sim_core::port::Faction::England, harbor_radius_nm: DEFAULT_HARBOR_RADIUS_NM, is_shipyard: false },
+        Port { name: "FarPort", position: Position { x: 500.0, y: 0.0 }, faction: sim_core::port::Faction::Spain, harbor_radius_nm: DEFAULT_HARBOR_RADIUS_NM, is_shipyard: false },
     ];
 
     // Ship at origin, heading to far port, but very low on provisions (< 4 days)
@@ -395,8 +395,8 @@ fn continuous_sailing_with_port_visits() {
     let stats = ShipStats::sloop();
     let wind = calm_wind();
     let ports = vec![
-        Port { name: "Home", position: Position { x: 0.0, y: 0.0 }, faction: sim_core::port::Faction::England, harbor_radius_nm: DEFAULT_HARBOR_RADIUS_NM },
-        Port { name: "Dest", position: Position { x: 30.0, y: 0.0 }, faction: sim_core::port::Faction::Spain, harbor_radius_nm: DEFAULT_HARBOR_RADIUS_NM },
+        Port { name: "Home", position: Position { x: 0.0, y: 0.0 }, faction: sim_core::port::Faction::England, harbor_radius_nm: DEFAULT_HARBOR_RADIUS_NM, is_shipyard: false },
+        Port { name: "Dest", position: Position { x: 30.0, y: 0.0 }, faction: sim_core::port::Faction::Spain, harbor_radius_nm: DEFAULT_HARBOR_RADIUS_NM, is_shipyard: false },
     ];
 
     let mut ship = Ship::new(Position { x: 0.0, y: 0.0 }, ShipState::Sailing);
@@ -442,8 +442,8 @@ fn dock_cycle_sells_arriving_cargo_and_buys_outgoing() {
     // Two ports far enough apart that arbitrage clears the distance
     // cost: a sugar surplus at Home, a sugar deficit at Dest.
     let ports = vec![
-        Port { name: "Home", position: Position { x: 0.0, y: 0.0 }, faction: sim_core::port::Faction::England, harbor_radius_nm: DEFAULT_HARBOR_RADIUS_NM },
-        Port { name: "Dest", position: Position { x: 30.0, y: 0.0 }, faction: sim_core::port::Faction::Spain, harbor_radius_nm: DEFAULT_HARBOR_RADIUS_NM },
+        Port { name: "Home", position: Position { x: 0.0, y: 0.0 }, faction: sim_core::port::Faction::England, harbor_radius_nm: DEFAULT_HARBOR_RADIUS_NM, is_shipyard: false },
+        Port { name: "Dest", position: Position { x: 30.0, y: 0.0 }, faction: sim_core::port::Faction::Spain, harbor_radius_nm: DEFAULT_HARBOR_RADIUS_NM, is_shipyard: false },
     ];
     let mut markets = vec![
         PortMarket::with_recipe(&goods, PortArchetype::SugarIsland.recipe()),
@@ -495,8 +495,8 @@ fn ship_with_no_profitable_trade_still_undocks() {
 
     // Two identical Minor ports — find_best_trade returns None.
     let ports = vec![
-        Port { name: "A", position: Position { x: 0.0, y: 0.0 }, faction: sim_core::port::Faction::England, harbor_radius_nm: DEFAULT_HARBOR_RADIUS_NM },
-        Port { name: "B", position: Position { x: 30.0, y: 0.0 }, faction: sim_core::port::Faction::England, harbor_radius_nm: DEFAULT_HARBOR_RADIUS_NM },
+        Port { name: "A", position: Position { x: 0.0, y: 0.0 }, faction: sim_core::port::Faction::England, harbor_radius_nm: DEFAULT_HARBOR_RADIUS_NM, is_shipyard: false },
+        Port { name: "B", position: Position { x: 30.0, y: 0.0 }, faction: sim_core::port::Faction::England, harbor_radius_nm: DEFAULT_HARBOR_RADIUS_NM, is_shipyard: false },
     ];
     let mut markets = vec![
         PortMarket::with_recipe(&goods, PortArchetype::Minor.recipe()),

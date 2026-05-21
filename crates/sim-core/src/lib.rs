@@ -16,3 +16,4 @@ pub mod market;
 pub mod trade;
 pub mod world;
 pub mod equilibrium;
+pub mod shipyard;

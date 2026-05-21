@@ -82,6 +82,17 @@ fn main() {
     // Simulate.
     for h in 1..=SIM_HOURS {
         world.tick();
+        // Snapshot any newly-built ships' starting silver so we can
+        // report a meaningful P/L for them at the end.
+        while world.ships.len() > starting_silver.len() {
+            let i = starting_silver.len();
+            starting_silver.push(world.ships[i].silver);
+            let owner_name = world.ships[i]
+                .owner_port
+                .and_then(|idx| world.ports.get(idx).map(|p| p.name))
+                .unwrap_or("?");
+            origin_names.push(owner_name);
+        }
         if h % (24 * 7) == 0 {
             let day = h / 24;
             for idx in &sample_idxs {
@@ -120,14 +131,17 @@ fn main() {
             .filter(|(_, t)| *t > 0.01)
             .map(|(id, t)| format!("{}:{:.1}", world.goods.get(id).name, t))
             .collect();
+        let built_tag = if i >= n_ships { " (built)" } else { "" };
         println!(
-            "{:<3}  {:<14}  {:>10.0}  {:>10.0}  {:>+10.0}  {:<10}  {:<30}",
-            i, origin_names[i], starting_silver[i], ship.silver, pl, state, cargo.join(",")
+            "{:<3}  {:<14}  {:>10.0}  {:>10.0}  {:>+10.0}  {:<10}  {:<30}{}",
+            i, origin_names[i], starting_silver[i], ship.silver, pl, state, cargo.join(","), built_tag
         );
     }
     println!();
     println!("Fleet total P/L: {:+.0} pesos", total_pl);
-    println!("Bankrupt ships:  {}/{}", bankrupt, n_ships);
+    println!("Bankrupt ships:  {}/{}", bankrupt, world.ships.len());
+    println!("Ships built by shipyards: {}  (last_month_avg_profit = {:+.0})",
+        world.ships_built, world.last_month_avg_profit);
 
     // ── Equilibrium divergence diagnostic. Solve the Kantorovich LP
     //    against the same world (linear and voyage-cost models). For
@@ -216,7 +230,7 @@ fn main() {
     println!();
     println!("Calibration verdict:");
     let losers = world.ships.iter().enumerate()
-        .filter(|(i, s)| s.silver < starting_silver[*i])
+        .filter(|(i, s)| *i < starting_silver.len() && s.silver < starting_silver[*i])
         .count();
     if bankrupt > 0 {
         println!(

@@ -67,6 +67,12 @@ pub struct Ship {
     /// Pesos in the ship's strongbox. Spent at port markets to buy
     /// provisions and trade goods; earned by selling cargo.
     pub silver: f32,
+    /// The port that originally launched this ship (its "home port"
+    /// for owner-of-record purposes). `None` for ships spawned by
+    /// tests or seeded into the world outside the shipyard system.
+    /// Stage 2 of the shipbuilding system will use this for
+    /// profit-remittance and refinancing at the home port.
+    pub owner_port: Option<usize>,
 }
 
 impl Ship {
@@ -81,6 +87,26 @@ impl Ship {
             cargo: Cargo::new(),
             hull_fouling: 0.0,
             silver: STARTING_SILVER_PESOS,
+            owner_port: None,
+        }
+    }
+
+    /// Construct a ship freshly built at a specific shipyard port, with
+    /// a custom amount of starting silver (sized at build time to be
+    /// roughly enough to buy one hold of cargo at the home port). The
+    /// ship's `owner_port` is set so future remittance logic can find it.
+    pub fn freshly_built(position: Position, owner_port: usize, starting_silver: f32) -> Self {
+        let stats = ShipStats::sloop();
+        Self {
+            position,
+            heading: 0.0,
+            speed: 0.0,
+            state: ShipState::Docked,
+            provisions: stats.provision_capacity,
+            cargo: Cargo::new(),
+            hull_fouling: 0.0,
+            silver: starting_silver,
+            owner_port: Some(owner_port),
         }
     }
 
