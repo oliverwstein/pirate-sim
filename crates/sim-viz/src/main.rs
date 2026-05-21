@@ -50,6 +50,18 @@ impl Camera {
         Vec2::new(sw / 2.0 + dx * z, sh / 2.0 - dy * z)
     }
 
+    /// Inverse of `world_to_screen`: convert a screen-space pixel
+    /// (e.g., a mouse click) back to world coordinates.
+    fn screen_to_world(&self, screen: Vec2) -> Position {
+        let sw = screen_width();
+        let sh = screen_height();
+        let z = self.zoom();
+        Position::new(
+            (screen.x - sw / 2.0) / z + self.offset.x,
+            -(screen.y - sh / 2.0) / z + self.offset.y,
+        )
+    }
+
     /// Update `fit_zoom` for the current viewport given the world extent.
     fn update_fit(&mut self, world: &World) {
         let land = &world.map.land;
@@ -319,22 +331,114 @@ fn draw_hud(world: &World, camera: &Camera, paused: bool, ticks_per_frame: u32) 
         };
         let stats = sim_core::ship::ShipStats::sloop();
         let prov_pct = (ship.provisions / stats.provision_capacity * 100.0) as i32;
+
+        // Cargo summary: show heaviest entry by tons (or "empty").
+        let cargo_str = ship
+            .cargo
+            .iter()
+            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+            .map(|(gid, tons)| {
+                let name = world.goods.get(gid).name;
+                format!("{} {:.0}t", name, tons)
+            })
+            .unwrap_or_else(|| "empty".to_string());
+
         let ship_info = format!(
-            "Ship {}: {} | spd={:.1}kt dist={:.0}nm | food={}% foul={:.0}",
-            i, state_str, ship.speed, dist, prov_pct, ship.hull_fouling
+            "Ship {}: {} | spd={:.1}kt dist={:.0}nm | food={}% foul={:.0} | ${:.0} | hold {:.0}/{:.0}t [{}]",
+            i,
+            state_str,
+            ship.speed,
+            dist,
+            prov_pct,
+            ship.hull_fouling,
+            ship.silver,
+            ship.cargo.total_tons(),
+            stats.cargo_capacity_tons,
+            cargo_str,
         );
         draw_text(&ship_info, 10.0, 40.0 + i as f32 * 18.0, 16.0, LIGHTGRAY);
     }
 }
 
-#[macroquad::main("Pirate Sim - Phase 1")]
+/// Right-side panel showing a selected port's market state: prices,
+/// stockpile, treasury, gateway flag.
+fn draw_market_panel(world: &World, port_idx: usize) {
+    if port_idx >= world.ports.len() || port_idx >= world.markets.len() {
+        return;
+    }
+    let port = &world.ports[port_idx];
+    let market = &world.markets[port_idx];
+
+    let panel_w: f32 = 320.0;
+    let panel_h: f32 = 28.0 + 18.0 * (world.goods.len() as f32 + 3.0);
+    let x = screen_width() - panel_w - 10.0;
+    let y = 10.0;
+
+    draw_rectangle(x, y, panel_w, panel_h, Color::new(0.0, 0.0, 0.0, 0.7));
+    draw_rectangle_lines(x, y, panel_w, panel_h, 2.0, WHITE);
+
+    let header = if market.is_europe_gateway {
+        format!("{} (Europe gateway)", port.name)
+    } else {
+        port.name.to_string()
+    };
+    draw_text(&header, x + 10.0, y + 22.0, 20.0, YELLOW);
+    draw_text(
+        &format!("Treasury: ${:.0}", market.silver),
+        x + 10.0,
+        y + 42.0,
+        16.0,
+        LIGHTGRAY,
+    );
+    draw_text(
+        "Good          stk(t)   buy   sell",
+        x + 10.0,
+        y + 62.0,
+        14.0,
+        Color::new(0.7, 0.7, 0.7, 1.0),
+    );
+
+    for (i, good) in world.goods.iter().enumerate() {
+        let stk = market.stockpile.get(good.id);
+        let buy = market.buy_price(good.id, &world.goods);
+        let sell = market.sell_price(good.id, &world.goods);
+        let line = format!("{:<14}{:>7.0} {:>5.1} {:>5.1}", good.name, stk, buy, sell);
+        draw_text(
+            &line,
+            x + 10.0,
+            y + 80.0 + i as f32 * 18.0,
+            14.0,
+            WHITE,
+        );
+    }
+}
+
+/// Find the port whose harbor radius contains the given world point,
+/// preferring the closer one if multiple match.
+fn pick_port_at(world: &World, world_pos: Position) -> Option<usize> {
+    let mut best: Option<(usize, f32)> = None;
+    for (i, port) in world.ports.iter().enumerate() {
+        let d = world_pos.distance(port.position);
+        // Use a generous click radius so small ports are still hittable.
+        let click_r = port.harbor_radius_nm.max(15.0);
+        if d <= click_r {
+            if best.map_or(true, |(_, db)| d < db) {
+                best = Some((i, d));
+            }
+        }
+    }
+    best.map(|(i, _)| i)
+}
+
+#[macroquad::main("Pirate Sim - Phase 2")]
 async fn main() {
     let mut world = World::load(Path::new("data/"));
-    spawn_demo_ship(&mut world);
+    spawn_demo_ships(&mut world);
 
     let mut camera = Camera::new();
     let mut paused = false;
     let mut ticks_per_frame: u32 = 1;
+    let mut selected_port: Option<usize> = None;
 
     loop {
         // Input
@@ -351,8 +455,25 @@ async fn main() {
         }
         if is_key_pressed(KeyCode::R) {
             world = World::load(Path::new("data/"));
-            spawn_demo_ship(&mut world);
+            spawn_demo_ships(&mut world);
             ticks_per_frame = 1;
+            selected_port = None;
+        }
+
+        // Click selects (or deselects) a port to inspect.
+        if is_mouse_button_pressed(MouseButton::Left) {
+            let (mx, my) = mouse_position();
+            let world_pos = camera.screen_to_world(Vec2::new(mx, my));
+            selected_port = match pick_port_at(&world, world_pos) {
+                Some(i) => {
+                    // Click an already-selected port to close the panel.
+                    if selected_port == Some(i) { None } else { Some(i) }
+                }
+                None => selected_port, // click empty water — keep panel
+            };
+        }
+        if is_key_pressed(KeyCode::Escape) {
+            selected_port = None;
         }
 
         // Tick
@@ -370,14 +491,29 @@ async fn main() {
         draw_ports(&world, &camera);
         draw_ships(&world, &camera);
         draw_hud(&world, &camera, paused, ticks_per_frame);
+        if let Some(idx) = selected_port {
+            draw_market_panel(&world, idx);
+        }
 
         next_frame().await;
     }
 }
 
-fn spawn_demo_ship(world: &mut World) {
-    let barbados_pos = world.ports.iter().find(|p| p.name == "Bridgetown").unwrap().position;
-    let ship = Ship::new(barbados_pos, ShipState::Docked);
-    let ai = ShipAI::with_seed(7); // will choose a random destination on first tick
-    world.add_ship(ship, ai);
+fn spawn_demo_ships(world: &mut World) {
+    // A small starter fleet so the trader AI has visible activity.
+    // Three ships spread across export-rich Caribbean ports — they
+    // discover the Atlantic→sugar→manufactures loop on their own.
+    for (port_name, seed) in [("Bridgetown", 7), ("Port Royal", 13), ("Boston", 21)] {
+        if let Some(port) = world.ports.iter().find(|p| p.name == port_name) {
+            let ship = Ship::new(port.position, ShipState::Docked);
+            let mut ai = ShipAI::with_seed(seed);
+            // Mark the ship as docked at this port so the trader AI's
+            // first dock-cycle tick sells nothing (empty hold) and
+            // immediately picks a profitable outbound cargo.
+            if let Some(idx) = world.ports.iter().position(|p| p.name == port_name) {
+                ai.nav.docked_at_port = Some(idx);
+            }
+            world.add_ship(ship, ai);
+        }
+    }
 }
