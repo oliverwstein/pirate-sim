@@ -31,8 +31,14 @@ const PRICE_SPREAD: f32 = 0.05;
 /// base × (1 + PRICE_K × (target - current)/target), clamped to
 /// [PRICE_FLOOR_FRAC × base, PRICE_CEIL_FRAC × base].
 pub const PRICE_K: f32 = 1.0;
+/// Below this fraction of base, the price floor kicks in (deep glut).
 pub const PRICE_FLOOR_FRAC: f32 = 0.25;
-pub const PRICE_CEIL_FRAC: f32 = 4.0;
+/// Above this fraction of base, the price ceiling kicks in (deep
+/// scarcity). Set high enough that goods produced locally can keep
+/// rising to genuinely choke off marginal demand when ships have
+/// drained the wharf and started borrowing against next month's
+/// production.
+pub const PRICE_CEIL_FRAC: f32 = 8.0;
 
 /// What a port produces and consumes each simulated month. Outputs are
 /// added to stockpiles; inputs are deducted (clamped at zero — a port
@@ -59,6 +65,15 @@ impl ProductionRecipe {
 /// Economic state of a port.
 pub struct PortMarket {
     pub stockpile: Cargo,
+    /// Tons borrowed against future production for goods the port
+    /// produces locally. When the wharf is empty but a ship still
+    /// wants to buy a locally-produced good, the deficit is recorded
+    /// here as a debt against next month's harvest. `tick_month` (and
+    /// any sell that adds the good back to the wharf) pays this debt
+    /// down before adding to the visible stockpile. Effective stock
+    /// for pricing = `stockpile − debt`, so each successive draw on
+    /// the hinterland raises the price for the next buyer.
+    pub debt: Cargo,
     /// Pesos in the port's treasury. Unused until step 5.
     pub silver: f32,
     pub recipe: ProductionRecipe,
@@ -76,6 +91,7 @@ impl PortMarket {
         }
         Self {
             stockpile,
+            debt: Cargo::new(),
             silver: INITIAL_PORT_SILVER_PESOS,
             recipe: ProductionRecipe::empty(),
         }
@@ -119,6 +135,7 @@ impl PortMarket {
         }
         Self {
             stockpile,
+            debt: Cargo::new(),
             silver: INITIAL_PORT_SILVER_PESOS,
             recipe,
         }
@@ -130,6 +147,9 @@ impl PortMarket {
     /// simply loses the value and produces nothing extra). Step 4 v1
     /// applies output and input independently; coupling production to
     /// input availability is a refinement deferred to Phase 3.
+    ///
+    /// After applying flow, settle any outstanding hinterland debt by
+    /// having new production pay down what was borrowed last month.
     pub fn tick_month(&mut self) {
         let prosperity = self.recipe.prosperity.max(0.0);
         for (id, tons) in self.recipe.monthly_outputs.clone() {
@@ -138,9 +158,34 @@ impl PortMarket {
         for (id, tons) in self.recipe.monthly_inputs.clone() {
             self.stockpile.remove(id, tons * prosperity);
         }
+        self.settle_debt();
     }
 
-    /// Pesos-per-ton local price for `id`, factoring stockpile.
+    /// Whenever stockpile goes positive, use it to pay down any
+    /// outstanding hinterland debt for that good. Called after monthly
+    /// production and after any sell that adds inventory back to the
+    /// wharf.
+    fn settle_debt(&mut self) {
+        let owed: Vec<(GoodId, f32)> = self.debt.iter().collect();
+        for (id, debt_tons) in owed {
+            let in_stock = self.stockpile.get(id);
+            let pay = debt_tons.min(in_stock);
+            if pay > 0.0 {
+                self.stockpile.remove(id, pay);
+                self.debt.remove(id, pay);
+            }
+        }
+    }
+
+    /// True iff the port produces this good (it appears in
+    /// `monthly_outputs`). Used to decide whether `buy` may borrow
+    /// against next month's production when the wharf is empty.
+    fn produces(&self, id: GoodId) -> bool {
+        self.recipe.monthly_outputs.iter().any(|(g, _)| *g == id)
+    }
+
+    /// Pesos-per-ton local price for `id`, factoring effective stock
+    /// (visible stockpile minus any outstanding hinterland debt).
     /// Stockpile-driven modulation kicks in only once a `target` is
     /// declared via the recipe; until then the base price is returned.
     pub fn price(&self, id: GoodId, registry: &GoodsRegistry) -> f32 {
@@ -149,7 +194,12 @@ impl PortMarket {
         if target <= 0.0 {
             return good.base_price_pesos;
         }
-        let current = self.stockpile.get(id);
+        // Effective stock can go negative when ships have borrowed
+        // against next month's production via `buy`; that pushes the
+        // factor above 2× and toward the ceiling, exactly what we
+        // want — the Nth ship of a dry month pays much more than the
+        // first.
+        let current = self.stockpile.get(id) - self.debt.get(id);
         let factor = 1.0 + PRICE_K * (target - current) / target;
         let clamped = factor.clamp(PRICE_FLOOR_FRAC, PRICE_CEIL_FRAC);
         good.base_price_pesos * clamped
@@ -168,23 +218,37 @@ impl PortMarket {
         self.price(id, registry) * (1.0 - PRICE_SPREAD)
     }
 
-    /// Implicit "target" stockpile: 6 months of the recipe's output
-    /// (or input). When neither is set, returns 0.0 → flat pricing.
+    /// Implicit "target" stockpile: 6 months of the recipe's gross
+    /// throughput (max of output and input rates). For dual-flow goods
+    /// like provisions on a sugar island (5 t/mo locally produced,
+    /// 12 t/mo consumed) the consumption rate dominates the inventory
+    /// target, since the wharf needs to cover the *demand*, not just
+    /// the local supply. Returns 0.0 when neither flow is set, which
+    /// gives flat base pricing.
     fn target_stock(&self, id: GoodId) -> f32 {
         let from_outputs = self.recipe.monthly_outputs
             .iter()
             .find(|(g, _)| *g == id)
-            .map(|(_, t)| *t * 6.0);
+            .map(|(_, t)| *t)
+            .unwrap_or(0.0);
         let from_inputs = self.recipe.monthly_inputs
             .iter()
             .find(|(g, _)| *g == id)
-            .map(|(_, t)| *t * 6.0);
-        from_outputs.or(from_inputs).unwrap_or(0.0)
+            .map(|(_, t)| *t)
+            .unwrap_or(0.0);
+        from_outputs.max(from_inputs) * 6.0
     }
 
     /// Buy `requested_tons` of `id` from this market on behalf of `ship`.
     /// Atomic: either the full requested amount transacts or nothing
     /// changes. Returns the cost in pesos on success.
+    ///
+    /// Locally-produced goods (anything in `monthly_outputs`) can be
+    /// bought even when the wharf stockpile is depleted: the deficit
+    /// is recorded as `debt` (borrowed against next month's harvest)
+    /// and prices rise accordingly via the effective-stock formula.
+    /// Goods the port doesn't produce — only imports — hard-fail when
+    /// stockpile runs out.
     pub fn buy(
         &mut self,
         ship: &mut crate::ship::Ship,
@@ -205,12 +269,25 @@ impl PortMarket {
         if requested_tons > cargo_room + 1e-4 {
             return Err(TradeError::InsufficientCargoSpace);
         }
-        if requested_tons > self.stockpile.get(id) + 1e-4 {
-            return Err(TradeError::InsufficientStockpile);
+        let in_stock = self.stockpile.get(id);
+        if requested_tons > in_stock + 1e-4 {
+            // Wharf empty: only sustainable if the port produces this
+            // good locally (then we borrow against next month). For a
+            // pure import-good the wharf running dry is a hard stop.
+            if !self.produces(id) {
+                return Err(TradeError::InsufficientStockpile);
+            }
         }
         ship.silver -= cost;
         self.silver += cost;
-        self.stockpile.remove(id, requested_tons);
+        let from_wharf = requested_tons.min(in_stock);
+        if from_wharf > 0.0 {
+            self.stockpile.remove(id, from_wharf);
+        }
+        let from_hinterland = (requested_tons - from_wharf).max(0.0);
+        if from_hinterland > 0.0 {
+            self.debt.add(id, from_hinterland);
+        }
         ship.cargo.add(id, requested_tons);
         Ok(cost)
     }
@@ -239,6 +316,9 @@ impl PortMarket {
         self.stockpile.add(id, requested_tons);
         self.silver -= proceeds;
         ship.silver += proceeds;
+        // Resold inventory pays down any outstanding hinterland debt
+        // for this good before remaining as visible stockpile.
+        self.settle_debt();
         Ok(proceeds)
     }
 }
@@ -308,11 +388,17 @@ impl PortArchetype {
         use crate::goods::ids::*;
         let (outputs, inputs): (&[(GoodId, f32)], &[(GoodId, f32)]) = match self {
             PortArchetype::SugarIsland => (
-                &[(SUGAR, 80.0), (MOLASSES, 30.0), (RUM, 15.0)],
+                // Small local provisions output (yams, cassava, fish)
+                // on top of the staple sugar/molasses/rum complex.
+                // Net food importer because consumption (12 t/mo)
+                // exceeds local supply (5 t/mo) — but a visiting ship
+                // can borrow against the next harvest at rising
+                // prices when the wharf is dry.
+                &[(SUGAR, 80.0), (MOLASSES, 30.0), (RUM, 15.0), (PROVISIONS, 5.0)],
                 &[(PROVISIONS, 12.0), (MANUFACTURES, 6.0), (ENSLAVED_PERSONS, 3.0), (NAVAL_STORES, 2.0)],
             ),
             PortArchetype::TobaccoColony => (
-                &[(TOBACCO, 60.0)],
+                &[(TOBACCO, 60.0), (PROVISIONS, 4.0)],
                 &[(PROVISIONS, 6.0), (MANUFACTURES, 4.0), (ENSLAVED_PERSONS, 2.0)],
             ),
             PortArchetype::NorthAmericanFarming => (
@@ -334,11 +420,11 @@ impl PortArchetype {
                 &[(MANUFACTURES, 5.0)],
             ),
             PortArchetype::PirateHaven => (
-                &[],
+                &[(PROVISIONS, 3.0)],
                 &[(PROVISIONS, 4.0), (RUM, 3.0), (MANUFACTURES, 2.0)],
             ),
             PortArchetype::Minor => (
-                &[],
+                &[(PROVISIONS, 2.0)],
                 &[(PROVISIONS, 2.0), (MANUFACTURES, 1.0)],
             ),
             // === EUROPE ===
@@ -399,7 +485,7 @@ impl PortArchetype {
             // coin. Differentiated regionally: Ouidah took relatively
             // more rum, Elmina relatively more iron/manufactures.
             PortArchetype::AfricanElmina => (
-                &[(ENSLAVED_PERSONS, 8.0)],
+                &[(ENSLAVED_PERSONS, 8.0), (PROVISIONS, 8.0)],
                 &[
                     (MANUFACTURES, 12.0),
                     (RUM, 4.0),
@@ -407,7 +493,7 @@ impl PortArchetype {
                 ],
             ),
             PortArchetype::AfricanOuidah => (
-                &[(ENSLAVED_PERSONS, 10.0)],
+                &[(ENSLAVED_PERSONS, 10.0), (PROVISIONS, 10.0)],
                 &[
                     (MANUFACTURES, 8.0),
                     (RUM, 8.0),
@@ -566,8 +652,13 @@ mod tests {
         for (id, tons) in &recipe.monthly_outputs {
             assert_eq!(market.stockpile.get(*id), *tons * 12.0);
         }
-        // Inputs sit at 3× monthly throughput (3 months' buffer).
+        // Inputs sit at 3× monthly throughput (3 months' buffer) —
+        // unless the good is *also* an output (e.g. PROVISIONS on a
+        // sugar island), in which case the output seeding wins.
         for (id, tons) in &recipe.monthly_inputs {
+            if recipe.monthly_outputs.iter().any(|(g, _)| g == id) {
+                continue;
+            }
             assert_eq!(market.stockpile.get(*id), *tons * 3.0);
         }
         // Output prices should be cheap (surplus); input prices expensive.
@@ -593,10 +684,14 @@ mod tests {
         let sugar_out = recipe.monthly_outputs.iter()
             .find(|(g, _)| *g == ids::SUGAR).unwrap().1;
         assert!((market.stockpile.get(ids::SUGAR) - (sugar_before + sugar_out)).abs() < 1e-3);
-        // Provisions (input) decreased by its monthly figure.
+        // Provisions appear on both sides (sugar islands grow some
+        // food locally and import the rest); net change = output − input.
+        let prov_out = recipe.monthly_outputs.iter()
+            .find(|(g, _)| *g == ids::PROVISIONS).map(|(_, t)| *t).unwrap_or(0.0);
         let prov_in = recipe.monthly_inputs.iter()
-            .find(|(g, _)| *g == ids::PROVISIONS).unwrap().1;
-        assert!((market.stockpile.get(ids::PROVISIONS) - (provisions_before - prov_in)).abs() < 1e-3);
+            .find(|(g, _)| *g == ids::PROVISIONS).map(|(_, t)| *t).unwrap_or(0.0);
+        let expected = provisions_before + prov_out - prov_in;
+        assert!((market.stockpile.get(ids::PROVISIONS) - expected).abs() < 1e-3);
     }
 
     #[test]
@@ -744,5 +839,62 @@ mod tests {
         // Elmina's monthly_outputs include ENSLAVED_PERSONS, so the
         // stockpile is seeded at 6× monthly output.
         assert!(elmina.stockpile.get(ids::ENSLAVED_PERSONS) > 0.0);
+    }
+
+    #[test]
+    fn producer_port_can_be_bought_into_negative_effective_stock() {
+        // A producer port: makes SUGAR, no inputs. Drain its wharf,
+        // then a further buy should still succeed by borrowing against
+        // next month's harvest — but at a higher unit price than the
+        // first.
+        use crate::ship::{Ship, ShipState, ShipStats};
+        use crate::types::Position;
+        let registry = GoodsRegistry::starter();
+        let mut recipe = ProductionRecipe::empty();
+        recipe.monthly_outputs.push((ids::SUGAR, 4.0)); // 4 t/mo → 48 t starting wharf, fits in sloop
+        let mut market = PortMarket::with_recipe(&registry, recipe);
+        let stats = ShipStats::sloop();
+        let mut ship = Ship::new(Position::ZERO, ShipState::Docked);
+        ship.silver = 1_000_000.0;
+
+        // Drain the visible wharf.
+        let wharf = market.stockpile.get(ids::SUGAR);
+        market.buy(&mut ship, &stats, ids::SUGAR, wharf, &registry).unwrap();
+        let price_at_zero = market.buy_price(ids::SUGAR, &registry);
+
+        // Now buy more — must succeed via the hinterland-debt path.
+        let further = 5.0;
+        let cost = market.buy(&mut ship, &stats, ids::SUGAR, further, &registry).unwrap();
+        let unit_paid = cost / further;
+        assert!(market.debt.get(ids::SUGAR) >= further - 1e-3,
+            "deficit should be recorded as hinterland debt");
+        assert!(unit_paid > price_at_zero - 1e-3,
+            "borrowing against next month should price above the empty-wharf price");
+
+        // And the next monthly tick should pay debt down before
+        // adding to visible stockpile.
+        let debt_before = market.debt.get(ids::SUGAR);
+        market.tick_month();
+        assert!(market.debt.get(ids::SUGAR) < debt_before,
+            "tick_month should settle outstanding hinterland debt");
+    }
+
+    #[test]
+    fn import_only_good_still_hard_fails_when_stockpile_empty() {
+        // Sugar island does not produce manufactures. Once its
+        // import stock is exhausted, further buys must fail.
+        use crate::ship::{Ship, ShipState, ShipStats};
+        use crate::types::Position;
+        let registry = GoodsRegistry::starter();
+        let recipe = PortArchetype::SugarIsland.recipe();
+        let mut market = PortMarket::with_recipe(&registry, recipe);
+        let stats = ShipStats::sloop();
+        let mut ship = Ship::new(Position::ZERO, ShipState::Docked);
+        ship.silver = 10_000_000.0;
+
+        let wharf = market.stockpile.get(ids::MANUFACTURES);
+        market.buy(&mut ship, &stats, ids::MANUFACTURES, wharf, &registry).unwrap();
+        let err = market.buy(&mut ship, &stats, ids::MANUFACTURES, 1.0, &registry);
+        assert!(matches!(err, Err(TradeError::InsufficientStockpile)));
     }
 }
