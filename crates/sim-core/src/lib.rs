@@ -17,3 +17,4 @@ pub mod trade;
 pub mod world;
 pub mod equilibrium;
 pub mod shipyard;
+pub mod shiptype;

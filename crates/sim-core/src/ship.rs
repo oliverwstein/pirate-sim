@@ -73,6 +73,10 @@ pub struct Ship {
     /// Stage 2 of the shipbuilding system will use this for
     /// profit-remittance and refinancing at the home port.
     pub owner_port: Option<usize>,
+    /// What kind of ship this is. Indexes into the world's
+    /// `ShipTypeRegistry` to look up stats, build cost, etc. Defaults
+    /// to `shiptype::ids::SLOOP` for back-compat with `Ship::new`.
+    pub ship_type: crate::shiptype::ShipTypeId,
 }
 
 impl Ship {
@@ -88,6 +92,7 @@ impl Ship {
             hull_fouling: 0.0,
             silver: STARTING_SILVER_PESOS,
             owner_port: None,
+            ship_type: crate::shiptype::ids::SLOOP,
         }
     }
 
@@ -95,8 +100,13 @@ impl Ship {
     /// a custom amount of starting silver (sized at build time to be
     /// roughly enough to buy one hold of cargo at the home port). The
     /// ship's `owner_port` is set so future remittance logic can find it.
-    pub fn freshly_built(position: Position, owner_port: usize, starting_silver: f32) -> Self {
-        let stats = ShipStats::sloop();
+    pub fn freshly_built(
+        position: Position,
+        owner_port: usize,
+        starting_silver: f32,
+        ship_type: crate::shiptype::ShipTypeId,
+        stats: &ShipStats,
+    ) -> Self {
         Self {
             position,
             heading: 0.0,
@@ -107,6 +117,7 @@ impl Ship {
             hull_fouling: 0.0,
             silver: starting_silver,
             owner_port: Some(owner_port),
+            ship_type,
         }
     }
 

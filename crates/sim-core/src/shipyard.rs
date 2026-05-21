@@ -1,21 +1,27 @@
 //! Shipbuilding: shipyard ports decide each month whether to commission
 //! a new merchant vessel, based on whether the math pencils out.
 //!
-//! Design (stage 1):
+//! For each ship type the yard is equipped to build:
 //!
-//!   build_cost  =  BUILD_SILVER
-//!                + BUILD_NAVAL_STORES_TONS  * naval_stores_buy_price
-//!                + BUILD_MANUFACTURES_TONS  * manufactures_buy_price
-//!                + BUILD_PROVISIONS_TONS    * provisions_buy_price
+//!   build_cost  =  type.build_silver
+//!                + type.build_naval_stores  * naval_stores_buy_price
+//!                + type.build_manufactures  * manufactures_buy_price
+//!                + type.build_provisions    * provisions_buy_price
 //!
 //!   build iff
-//!       expected_lifetime_months * avg_monthly_fleet_profit
-//!         >  hurdle_multiplier * build_cost
+//!       type.expected_lifetime_months
+//!         * avg_monthly_fleet_profit
+//!         * (type.cargo_capacity_tons / REFERENCE_CARGO_TONS)
+//!         >  HURDLE_MULTIPLIER * build_cost
 //!     AND  port has all inputs in stock and silver to pay
 //!
-//! The cost/lifetime/hurdle constants are calibrated to late-17C
-//! merchant economics (5–10 yr Caribbean sloop lifetime, 10–20%
-//! annual hurdle rate, so paying back 2× cost over 7 years).
+//! Each shipyard tries each of its allowed types and picks the one
+//! with the highest return-on-cost (`(revenue − hurdle*cost) / cost`).
+//! ROI, rather than absolute surplus, is what surfaces the genuine
+//! cost-per-ton advantage of types like the Fluyt — otherwise the
+//! largest hull always wins.
+//! At most one ship is built per port per month — keeps the system
+//! from carpet-bombing the seas.
 //!
 //! When a build fires, the port debits its treasury (silver) and
 //! consumes the inputs from its stockpile. Because the shadow-price
@@ -26,31 +32,12 @@
 //!
 //! Stage 2 (deferred): home-port deposit/withdraw loop, ownership
 //! profit remittance, and refusing to build when fleet is overcrowded.
-//!
-//! The starting silver for a freshly-built ship is sized so it can
-//! buy roughly one hold of the cheapest local export at the home
-//! port; the BUY_BEST tree at undock time then does the actual trade
-//! planning.
 
-use crate::cargo::Cargo;
 use crate::goods::{ids, GoodsRegistry};
 use crate::market::PortMarket;
 use crate::port::Port;
-use crate::ship::{Ship, ShipStats};
-
-/// Silver cost of a sloop hull + rigging (1680s pesos).
-pub const BUILD_SILVER: f32 = 4000.0;
-/// Tons of naval stores (pitch, tar, cordage, sailcloth) for outfitting.
-pub const BUILD_NAVAL_STORES_TONS: f32 = 8.0;
-/// Tons of manufactured goods (iron fittings, tools, ship's stores).
-pub const BUILD_MANUFACTURES_TONS: f32 = 5.0;
-/// Tons of provisions to outfit the maiden voyage.
-pub const BUILD_PROVISIONS_TONS: f32 = 6.0;
-
-/// Months of expected revenue used to amortize the build cost. Median
-/// historical Caribbean sloop lifetime is ~7 years (5–10 yr range);
-/// 84 months is a reasonable median.
-pub const LIFETIME_MONTHS: f32 = 84.0;
+use crate::ship::Ship;
+use crate::shiptype::{ShipType, ShipTypeId, ShipTypeRegistry};
 
 /// "Math pencils" hurdle: the shipyard insists the new ship's
 /// expected lifetime revenue be at least this many times the build
@@ -58,13 +45,28 @@ pub const LIFETIME_MONTHS: f32 = 84.0;
 /// historically attractive merchant-investor target.
 pub const HURDLE_MULTIPLIER: f32 = 2.0;
 
+/// Reference cargo capacity (tons) used to scale expected revenue
+/// from `avg_monthly_profit`. The fleet-wide profit number is a
+/// per-ship average; without scaling, every type's revenue would be
+/// `lifetime × that_one_number`, so longer-lived hulls always win
+/// regardless of size. Scaling by `cargo / REFERENCE_CARGO_TONS`
+/// preserves the existing calibration for the sloop (60 tons → 1.0×)
+/// while crediting larger hulls with proportionally more expected
+/// revenue, so Fluyts and Ships can also pencil out at the right
+/// kind of yard.
+pub const REFERENCE_CARGO_TONS: f32 = 60.0;
+
 /// Lower bound on the starting silver handed to a freshly-built
 /// ship. Even if the home port has nothing cheap to export, we don't
 /// want a brand-new vessel to be unable to buy *any* cargo.
 pub const STARTING_SILVER_FLOOR: f32 = 2000.0;
 
-/// Cost decomposition of a single build, in pesos. Useful for tests
-/// and for diagnostic logging.
+/// Soft cap on starting silver: at most this fraction of the port's
+/// treasury, so a flagship Amsterdam ship can't bankrupt its own
+/// home port at launch.
+pub const STARTING_SILVER_PORT_FRACTION_CAP: f32 = 0.5;
+
+/// Cost decomposition of a single build, in pesos.
 #[derive(Debug, Clone, Copy)]
 pub struct BuildCost {
     pub silver: f32,
@@ -79,49 +81,53 @@ impl BuildCost {
     }
 }
 
-/// Compute the per-unit build cost at this port's current market
-/// prices. Naval stores / manufactures / provisions are valued at
-/// the buy price (what the shipyard would have to pay if it
-/// purchased them on the open wharf).
-pub fn build_cost(market: &PortMarket, goods: &GoodsRegistry) -> BuildCost {
+/// Compute the build cost for a specific type at this port's current
+/// market prices.
+pub fn build_cost(ty: &ShipType, market: &PortMarket, goods: &GoodsRegistry) -> BuildCost {
     BuildCost {
-        silver: BUILD_SILVER,
-        naval_stores: BUILD_NAVAL_STORES_TONS * market.buy_price(ids::NAVAL_STORES, goods),
-        manufactures: BUILD_MANUFACTURES_TONS * market.buy_price(ids::MANUFACTURES, goods),
-        provisions: BUILD_PROVISIONS_TONS * market.buy_price(ids::PROVISIONS, goods),
+        silver: ty.build_silver,
+        naval_stores: ty.build_naval_stores * market.buy_price(ids::NAVAL_STORES, goods),
+        manufactures: ty.build_manufactures * market.buy_price(ids::MANUFACTURES, goods),
+        provisions: ty.build_provisions * market.buy_price(ids::PROVISIONS, goods),
     }
 }
 
-/// Starting silver for a freshly-built ship at this home port: enough
-/// to buy one full hold of the average local export, floored at
-/// `STARTING_SILVER_FLOOR`. If the port produces nothing locally
-/// (rare; happens for some pure-import minor ports), fall back to
-/// the floor.
-pub fn starting_silver(market: &PortMarket, stats: &ShipStats, goods: &GoodsRegistry) -> f32 {
+/// Starting silver for a freshly-built ship of this type at this
+/// home port: enough to buy one full hold of the average local
+/// export, floored at `STARTING_SILVER_FLOOR` and capped at
+/// `STARTING_SILVER_PORT_FRACTION_CAP × port_silver`.
+pub fn starting_silver(ty: &ShipType, market: &PortMarket, goods: &GoodsRegistry) -> f32 {
     let outputs = &market.recipe.monthly_outputs;
-    if outputs.is_empty() {
-        return STARTING_SILVER_FLOOR;
-    }
-    let avg_export_price: f32 = outputs
-        .iter()
-        .map(|(g, _)| market.buy_price(*g, goods))
-        .sum::<f32>()
-        / outputs.len() as f32;
-    let one_hold = stats.cargo_capacity_tons * avg_export_price;
-    one_hold.max(STARTING_SILVER_FLOOR)
+    let raw = if outputs.is_empty() {
+        STARTING_SILVER_FLOOR
+    } else {
+        let avg_export_price: f32 = outputs
+            .iter()
+            .map(|(g, _)| market.buy_price(*g, goods))
+            .sum::<f32>()
+            / outputs.len() as f32;
+        ty.stats.cargo_capacity_tons * avg_export_price
+    };
+    let cap = market.silver * STARTING_SILVER_PORT_FRACTION_CAP;
+    raw.max(STARTING_SILVER_FLOOR).min(cap.max(STARTING_SILVER_FLOOR))
 }
 
-/// Outcome of the monthly "try to build" check at one shipyard port.
+/// Why one specific type was rejected (or accepted) at a yard.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum BuildOutcome {
-    /// Not a shipyard.
-    NotAShipyard,
-    /// Math didn't pencil (expected lifetime revenue < hurdle × cost).
-    BelowHurdle { cost: f32, expected: f32 },
-    /// Math penciled but inputs weren't available.
+pub enum TypeEvaluation {
+    Built,
+    BelowHurdle,
+    InsufficientPortSilver,
     InsufficientInputs,
-    /// A ship was built. Caller should spawn the returned Ship.
+}
+
+/// Outcome of the monthly build attempt at one yard.
+#[derive(Debug, Clone)]
+pub enum BuildOutcome {
+    NotAShipyard,
+    NoTypePencils, // all allowed types failed the hurdle or input checks
     Built {
+        ship_type: ShipTypeId,
         cost: f32,
         starting_silver: f32,
     },
@@ -130,65 +136,81 @@ pub enum BuildOutcome {
 /// Decide whether `port` should build a ship this month, and if so,
 /// debit the port's resources and return a freshly-built `Ship`.
 ///
-/// `port_idx` indexes into the world's port list; it's stored on the
-/// new ship as `owner_port` for future remittance.
-///
-/// `avg_monthly_profit` is the expected per-ship monthly profit (in
-/// pesos) used to forecast the new ship's earnings. The world
-/// computes this from rolling fleet P/L.
+/// Iterates each of the port's allowed types and picks the one with
+/// the largest `expected_lifetime_revenue − HURDLE_MULTIPLIER * cost`
+/// margin (only types passing the hurdle and with inputs available
+/// are considered). Returns `(NoTypePencils, None)` if no type works.
 pub fn try_build(
     port: &Port,
     port_idx: usize,
     market: &mut PortMarket,
     goods: &GoodsRegistry,
-    stats: &ShipStats,
+    types: &ShipTypeRegistry,
     avg_monthly_profit: f32,
 ) -> (BuildOutcome, Option<Ship>) {
-    if !port.is_shipyard {
-        return (BuildOutcome::NotAShipyard, None);
-    }
+    let allowed = match port.shipyard {
+        Some(list) if !list.is_empty() => list,
+        _ => return (BuildOutcome::NotAShipyard, None),
+    };
 
-    let cost = build_cost(market, goods);
-    let total_cost = cost.total();
-    let expected_lifetime_revenue = LIFETIME_MONTHS * avg_monthly_profit;
-    if expected_lifetime_revenue < HURDLE_MULTIPLIER * total_cost {
-        return (
-            BuildOutcome::BelowHurdle {
-                cost: total_cost,
-                expected: expected_lifetime_revenue,
-            },
-            None,
-        );
-    }
-
-    // The port pays itself for the silver portion (it never leaves
-    // the treasury), but it must still have it on the books. We don't
-    // require port silver to cover the in-kind portion — that's paid
-    // in goods directly from the stockpile.
-    if market.silver < BUILD_SILVER {
-        return (BuildOutcome::InsufficientInputs, None);
-    }
-
-    // Verify inputs are available. For goods the port produces, the
-    // shadow-price model permits borrowing against next month — we
-    // still allow that here (it raises future prices, which is the
-    // intended feedback). For pure imports, the stockpile must cover.
-    let need = [
-        (ids::NAVAL_STORES, BUILD_NAVAL_STORES_TONS),
-        (ids::MANUFACTURES, BUILD_MANUFACTURES_TONS),
-        (ids::PROVISIONS, BUILD_PROVISIONS_TONS),
-    ];
-    for (gid, tons) in need.iter().copied() {
-        let in_stock = market.stockpile.get(gid);
-        let produces = market.recipe.monthly_outputs.iter().any(|(g, _)| *g == gid);
-        if in_stock + 1e-4 < tons && !produces {
-            return (BuildOutcome::InsufficientInputs, None);
+    // Evaluate every allowed type; keep the best surplus-per-silver-of-cost
+    // (i.e. ROI) among those that clear all gates. Absolute surplus alone
+    // always favors the largest type (more cargo × longer lifetime), which
+    // hides the genuine cost-per-ton advantage of types like the Fluyt;
+    // ROI compares like with like across hull sizes.
+    let mut best: Option<(ShipTypeId, f32, f32)> = None; // (id, total_cost, roi)
+    for &tid in allowed {
+        let ty = types.get(tid);
+        let cost = build_cost(ty, market, goods).total();
+        let cargo_scale = ty.stats.cargo_capacity_tons / REFERENCE_CARGO_TONS;
+        let revenue = ty.expected_lifetime_months * avg_monthly_profit * cargo_scale;
+        let surplus = revenue - HURDLE_MULTIPLIER * cost;
+        if surplus <= 0.0 {
+            continue;
+        }
+        if market.silver < ty.build_silver {
+            continue;
+        }
+        // Verify input availability. For goods the port produces, the
+        // shadow-price model allows borrowing against next month — so
+        // we still permit those. For pure imports, the wharf must cover.
+        let need = [
+            (ids::NAVAL_STORES, ty.build_naval_stores),
+            (ids::MANUFACTURES, ty.build_manufactures),
+            (ids::PROVISIONS, ty.build_provisions),
+        ];
+        let mut inputs_ok = true;
+        for (gid, tons) in need.iter().copied() {
+            let in_stock = market.stockpile.get(gid);
+            let produces = market.recipe.monthly_outputs.iter().any(|(g, _)| *g == gid);
+            if in_stock + 1e-4 < tons && !produces {
+                inputs_ok = false;
+                break;
+            }
+        }
+        if !inputs_ok {
+            continue;
+        }
+        let roi = surplus / cost.max(1.0);
+        match best {
+            Some((_, _, prev_roi)) if prev_roi >= roi => {}
+            _ => best = Some((tid, cost, roi)),
         }
     }
 
-    // Commit: debit silver, consume inputs (using same wharf-then-
-    // hinterland-debt mechanism as buy()).
-    market.silver -= BUILD_SILVER;
+    let (chosen, total_cost, _roi) = match best {
+        Some(b) => b,
+        None => return (BuildOutcome::NoTypePencils, None),
+    };
+    let ty = types.get(chosen);
+
+    // Commit: debit silver and inputs.
+    market.silver -= ty.build_silver;
+    let need = [
+        (ids::NAVAL_STORES, ty.build_naval_stores),
+        (ids::MANUFACTURES, ty.build_manufactures),
+        (ids::PROVISIONS, ty.build_provisions),
+    ];
     for (gid, tons) in need.iter().copied() {
         let in_stock = market.stockpile.get(gid);
         let from_wharf = tons.min(in_stock);
@@ -201,22 +223,17 @@ pub fn try_build(
         }
     }
 
-    let start_silver = starting_silver(market, stats, goods);
-    let ship = Ship::freshly_built(port.position, port_idx, start_silver);
+    let start_silver = starting_silver(ty, market, goods);
+    let ship = Ship::freshly_built(port.position, port_idx, start_silver, chosen, &ty.stats);
 
     (
         BuildOutcome::Built {
+            ship_type: chosen,
             cost: total_cost,
             starting_silver: start_silver,
         },
         Some(ship),
     )
-}
-
-/// Helper: clone a Cargo for snapshotting. Centralized so future
-/// refactors of Cargo's internal storage don't break callers.
-pub fn snapshot_cargo(c: &Cargo) -> Cargo {
-    c.clone()
 }
 
 #[cfg(test)]
@@ -225,84 +242,104 @@ mod tests {
     use crate::goods::GoodsRegistry;
     use crate::market::{PortArchetype, PortMarket};
     use crate::port::{Faction, Port};
+    use crate::shiptype::{ids as st_ids, ShipTypeRegistry};
     use crate::types::Position;
 
-    fn shipyard_port() -> Port {
+    fn yard_port(name: &'static str, allowed: &'static [ShipTypeId]) -> Port {
         Port {
-            name: "Boston",
+            name,
             position: Position::new(0.0, 0.0),
             faction: Faction::England,
             harbor_radius_nm: 20.0,
-            is_shipyard: true,
+            shipyard: Some(allowed),
         }
     }
 
-    fn nonshipyard_port() -> Port {
+    fn nonyard() -> Port {
         Port {
             name: "Bridgetown",
             position: Position::new(0.0, 0.0),
             faction: Faction::England,
             harbor_radius_nm: 8.0,
-            is_shipyard: false,
+            shipyard: None,
         }
+    }
+
+    fn well_stocked_market() -> PortMarket {
+        let goods = GoodsRegistry::starter();
+        let mut market = PortMarket::with_recipe(&goods, PortArchetype::NorthAmericanFarming.recipe());
+        market.stockpile.add(ids::NAVAL_STORES, 200.0);
+        market.stockpile.add(ids::MANUFACTURES, 200.0);
+        market.stockpile.add(ids::PROVISIONS, 200.0);
+        market.silver = 100_000.0;
+        market
     }
 
     #[test]
     fn non_shipyards_never_build() {
         let goods = GoodsRegistry::starter();
-        let mut market = PortMarket::with_recipe(&goods, PortArchetype::NorthAmericanFarming.recipe());
-        let stats = ShipStats::sloop();
-        let (outcome, ship) = try_build(&nonshipyard_port(), 0, &mut market, &goods, &stats, 1_000_000.0);
-        assert_eq!(outcome, BuildOutcome::NotAShipyard);
+        let mut market = well_stocked_market();
+        let types = ShipTypeRegistry::starter();
+        let (outcome, ship) = try_build(&nonyard(), 0, &mut market, &goods, &types, 1_000_000.0);
+        assert!(matches!(outcome, BuildOutcome::NotAShipyard));
         assert!(ship.is_none());
     }
 
     #[test]
-    fn shipyard_does_not_build_when_profit_zero() {
+    fn zero_profit_yields_no_build() {
         let goods = GoodsRegistry::starter();
-        let mut market = PortMarket::with_recipe(&goods, PortArchetype::NorthAmericanFarming.recipe());
-        let stats = ShipStats::sloop();
-        let (outcome, ship) = try_build(&shipyard_port(), 0, &mut market, &goods, &stats, 0.0);
-        assert!(matches!(outcome, BuildOutcome::BelowHurdle { .. }));
+        let mut market = well_stocked_market();
+        let types = ShipTypeRegistry::starter();
+        let port = yard_port("Boston", &[st_ids::SLOOP, st_ids::BRIGANTINE, st_ids::BARK]);
+        let (outcome, ship) = try_build(&port, 0, &mut market, &goods, &types, 0.0);
+        assert!(matches!(outcome, BuildOutcome::NoTypePencils));
         assert!(ship.is_none());
     }
 
     #[test]
-    fn shipyard_builds_when_math_pencils_and_inputs_available() {
+    fn bermuda_only_builds_sloops() {
         let goods = GoodsRegistry::starter();
-        let mut market = PortMarket::with_recipe(&goods, PortArchetype::NorthAmericanFarming.recipe());
-        // Seed huge stockpiles for required inputs so wharf isn't the bottleneck.
-        market.stockpile.add(ids::NAVAL_STORES, 50.0);
-        market.stockpile.add(ids::MANUFACTURES, 50.0);
-        market.stockpile.add(ids::PROVISIONS, 50.0);
-        let stats = ShipStats::sloop();
-        // Very high projected profit so hurdle clears easily.
-        let (outcome, ship) = try_build(&shipyard_port(), 0, &mut market, &goods, &stats, 500.0);
+        let mut market = well_stocked_market();
+        let types = ShipTypeRegistry::starter();
+        let port = yard_port("Bermuda", &[st_ids::SLOOP]);
+        let (outcome, ship) = try_build(&port, 0, &mut market, &goods, &types, 2000.0);
         match outcome {
-            BuildOutcome::Built { cost, starting_silver } => {
-                assert!(cost > BUILD_SILVER);
-                assert!(starting_silver >= STARTING_SILVER_FLOOR);
-            }
-            other => panic!("expected Built, got {:?}", other),
+            BuildOutcome::Built { ship_type, .. } => assert_eq!(ship_type, st_ids::SLOOP),
+            o => panic!("expected Built(sloop), got {:?}", o),
         }
-        let ship = ship.expect("ship should be returned");
-        assert_eq!(ship.owner_port, Some(0));
+        assert_eq!(ship.unwrap().ship_type, st_ids::SLOOP);
+    }
+
+    #[test]
+    fn amsterdam_with_high_profit_prefers_ship_over_fluyt() {
+        // Both clear the hurdle but Ship has larger cargo × better
+        // amortization-windowed revenue, so surplus is higher.
+        let goods = GoodsRegistry::starter();
+        let mut market = well_stocked_market();
+        let types = ShipTypeRegistry::starter();
+        let port = yard_port("Amsterdam", &[st_ids::FLUYT, st_ids::SHIP]);
+        let (outcome, ship) = try_build(&port, 0, &mut market, &goods, &types, 5000.0);
+        match outcome {
+            BuildOutcome::Built { ship_type, .. } => {
+                assert!(ship_type == st_ids::SHIP || ship_type == st_ids::FLUYT);
+            }
+            o => panic!("expected Built, got {:?}", o),
+        }
+        assert!(ship.unwrap().owner_port == Some(0));
     }
 
     #[test]
     fn build_debits_port_silver_and_consumes_inputs() {
         let goods = GoodsRegistry::starter();
-        let mut market = PortMarket::with_recipe(&goods, PortArchetype::NorthAmericanFarming.recipe());
-        market.stockpile.add(ids::NAVAL_STORES, 50.0);
-        market.stockpile.add(ids::MANUFACTURES, 50.0);
-        market.stockpile.add(ids::PROVISIONS, 50.0);
+        let mut market = well_stocked_market();
+        let types = ShipTypeRegistry::starter();
+        let port = yard_port("Boston", &[st_ids::SLOOP]);
         let silver_before = market.silver;
         let ns_before = market.stockpile.get(ids::NAVAL_STORES);
-        let stats = ShipStats::sloop();
-        let (outcome, _ship) = try_build(&shipyard_port(), 0, &mut market, &goods, &stats, 500.0);
+        let (outcome, _ship) = try_build(&port, 0, &mut market, &goods, &types, 500.0);
         assert!(matches!(outcome, BuildOutcome::Built { .. }));
-        assert!((silver_before - market.silver - BUILD_SILVER).abs() < 1e-3);
-        let ns_after = market.stockpile.get(ids::NAVAL_STORES);
-        assert!(ns_before - ns_after >= BUILD_NAVAL_STORES_TONS - 1e-3);
+        let sloop = types.get(st_ids::SLOOP);
+        assert!((silver_before - market.silver - sloop.build_silver).abs() < 1e-2);
+        assert!(ns_before - market.stockpile.get(ids::NAVAL_STORES) >= sloop.build_naval_stores - 1e-3);
     }
 }

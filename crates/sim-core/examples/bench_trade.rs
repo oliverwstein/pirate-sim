@@ -111,8 +111,8 @@ fn main() {
     println!();
     println!("Per-ship P/L after {} days:", SIM_DAYS);
     println!(
-        "{:<3}  {:<14}  {:>10}  {:>10}  {:>10}  {:<10}  {:<30}",
-        "#", "from", "silver_in", "silver_out", "P/L", "state", "cargo"
+        "{:<3}  {:<14}  {:<10}  {:>10}  {:>10}  {:>10}  {:<10}  {:<30}",
+        "#", "from", "type", "silver_in", "silver_out", "P/L", "state", "cargo"
     );
     let mut total_pl = 0.0f32;
     let mut bankrupt = 0;
@@ -132,9 +132,10 @@ fn main() {
             .map(|(id, t)| format!("{}:{:.1}", world.goods.get(id).name, t))
             .collect();
         let built_tag = if i >= n_ships { " (built)" } else { "" };
+        let type_name = world.ship_types.get(ship.ship_type).name;
         println!(
-            "{:<3}  {:<14}  {:>10.0}  {:>10.0}  {:>+10.0}  {:<10}  {:<30}{}",
-            i, origin_names[i], starting_silver[i], ship.silver, pl, state, cargo.join(","), built_tag
+            "{:<3}  {:<14}  {:<10}  {:>10.0}  {:>10.0}  {:>+10.0}  {:<10}  {:<30}{}",
+            i, origin_names[i], type_name, starting_silver[i], ship.silver, pl, state, cargo.join(","), built_tag
         );
     }
     println!();
@@ -142,6 +143,22 @@ fn main() {
     println!("Bankrupt ships:  {}/{}", bankrupt, world.ships.len());
     println!("Ships built by shipyards: {}  (last_month_avg_profit = {:+.0})",
         world.ships_built, world.last_month_avg_profit);
+
+    // Builds-by-type summary: only count ships beyond the starter
+    // fleet (those are the shipyard's actual output, not what we
+    // seeded for the demo).
+    if world.ships.len() > n_ships {
+        let mut counts: std::collections::BTreeMap<&'static str, u32> =
+            std::collections::BTreeMap::new();
+        for ship in world.ships.iter().skip(n_ships) {
+            let name = world.ship_types.get(ship.ship_type).name;
+            *counts.entry(name).or_insert(0) += 1;
+        }
+        let parts: Vec<String> = counts.iter()
+            .map(|(n, c)| format!("{} {}", c, n))
+            .collect();
+        println!("  by type: {}", parts.join(", "));
+    }
 
     // ── Equilibrium divergence diagnostic. Solve the Kantorovich LP
     //    against the same world (linear and voyage-cost models). For

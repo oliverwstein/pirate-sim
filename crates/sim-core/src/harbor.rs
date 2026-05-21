@@ -192,7 +192,7 @@ mod tests {
             position: Position::new(20.0, 20.0),
             faction: Faction::Pirate,
             harbor_radius_nm: 5.0,
-            is_shipyard: false,
+            shipyard: None,
         };
         let map = HarborMap::build(&land, std::slice::from_ref(&port));
         assert_eq!(map.harbors.len(), 1);
@@ -220,7 +220,7 @@ mod tests {
             position: Position::new(8.0, 10.0), // west of wall
             faction: Faction::Pirate,
             harbor_radius_nm: 8.0, // would cross wall if straight-line
-            is_shipyard: false,
+            shipyard: None,
         };
         let map = HarborMap::build(&land, std::slice::from_ref(&port));
         let h0 = &map.harbors[0];

@@ -10,6 +10,7 @@ use crate::navmesh::Navmesh;
 use crate::pathfind::PathfindContext;
 use crate::port::{Port, all_ports};
 use crate::ship::{Ship, ShipState, ShipStats};
+use crate::shiptype::{self, ShipTypeRegistry};
 use crate::shipyard::{self, BuildOutcome};
 use crate::types::SimDate;
 use crate::weather::WeatherSystem;
@@ -23,6 +24,10 @@ pub struct World {
     pub coastline: CoastlineMap,
     pub land_mesh: LandMesh,
     pub goods: GoodsRegistry,
+    /// Catalog of ship designs. A `Ship` indexes in via its
+    /// `ship_type` field to fetch per-tick stats and (for shipyard
+    /// ports) build costs.
+    pub ship_types: ShipTypeRegistry,
     /// Per-port economic state, parallel to `ports` (index = port index).
     pub markets: Vec<PortMarket>,
     pub ships: Vec<Ship>,
@@ -79,6 +84,7 @@ impl World {
             coastline,
             land_mesh,
             goods,
+            ship_types: ShipTypeRegistry::starter(),
             markets,
             ships: Vec::new(),
             ship_ais: Vec::new(),
@@ -99,8 +105,14 @@ impl World {
 
     /// Advance the simulation by one hour.
     pub fn tick(&mut self) {
-        let stats = ShipStats::sloop();
         let month = self.date.month();
+        // PathfindContext uses a single "representative" stats — the
+        // sloop's profile — because the navmesh is shared and the
+        // wind-routed cost is the same shape for every merchant rig
+        // we currently model. A future refinement could maintain a
+        // per-type PathfindContext (or a per-type ship_stats lookup
+        // inside the planner) without changing the navmesh.
+        let pathfind_stats = self.ship_types.get(shiptype::ids::SLOOP).stats.clone();
 
         // Monthly economic tick: produce outputs, consume inputs at every
         // port. Fired exactly once per month transition. After production
@@ -134,7 +146,7 @@ impl World {
             // mutably in a single pass).
             let mut newly_built: Vec<(Ship, ShipAI)> = Vec::new();
             for (idx, port) in self.ports.iter().enumerate() {
-                if !port.is_shipyard {
+                if port.shipyard.is_none() {
                     continue;
                 }
                 let market = &mut self.markets[idx];
@@ -143,7 +155,7 @@ impl World {
                     idx,
                     market,
                     &self.goods,
-                    &stats,
+                    &self.ship_types,
                     self.last_month_avg_profit,
                 );
                 if let (BuildOutcome::Built { .. }, Some(ship)) = (outcome, ship) {
@@ -175,18 +187,20 @@ impl World {
         let pathfind = PathfindContext::new(
             &self.map.land,
             &self.weather.wind,
-            &stats,
+            &pathfind_stats,
             month,
             &self.navmesh,
         );
 
         for i in 0..self.ships.len() {
+            let ship_stats: ShipStats =
+                self.ship_types.get(self.ships[i].ship_type).stats.clone();
             let wind = self.weather.wind.wind_at(self.ships[i].position, month);
 
             // AI decides heading (or docks/undocks)
             self.ship_ais[i].tick(
                 &mut self.ships[i],
-                &stats,
+                &ship_stats,
                 &wind,
                 &self.ports,
                 &self.harbors,
@@ -196,7 +210,7 @@ impl World {
             );
 
             // Resource consumption
-            self.ships[i].tick_resources(&stats);
+            self.ships[i].tick_resources(&ship_stats);
 
             if self.ships[i].state != ShipState::Sailing {
                 continue;
@@ -218,7 +232,7 @@ impl World {
                 }
             }
 
-            let new_pos = self.ships[i].compute_next_position(&stats, &wind, 1.0);
+            let new_pos = self.ships[i].compute_next_position(&ship_stats, &wind, 1.0);
             let old_pos = self.ships[i].position;
             let safe_pos = self.map.land.farthest_clear_point(old_pos, new_pos);
 

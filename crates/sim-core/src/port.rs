@@ -1,3 +1,4 @@
+use crate::shiptype::{ids as st_ids, ShipTypeId};
 use crate::types::Position;
 
 /// Faction allegiance (simplified for Phase 1).
@@ -32,27 +33,28 @@ pub struct Port {
     /// arrival/docking purposes. Larger values are useful for ports that sit
     /// up rivers or estuaries (Philadelphia, New York, New Orleans, etc.).
     pub harbor_radius_nm: f32,
-    /// Whether this port operates a shipyard capable of constructing new
-    /// merchant vessels. Historically a small set: major European yards
-    /// (London, Amsterdam, Cadiz, Nantes), the North American hubs
-    /// (Boston, Philadelphia), and Bermuda (famous for cedar sloops).
-    pub is_shipyard: bool,
+    /// If this port has a shipyard, the list of ship types it is
+    /// equipped to build. `None` means no yard. Historically yards
+    /// specialized: Bermuda's cedar suited only sloops; Amsterdam
+    /// pioneered the fluyt; Cadiz's royal yards built large ships.
+    pub shipyard: Option<&'static [ShipTypeId]>,
 }
 
-/// Names of ports with active shipyards (1680s context). Lookup is by
-/// name match against `Port::name`.
-pub const SHIPYARD_NAMES: &[&str] = &[
-    "London",
-    "Amsterdam",
-    "Cadiz",
-    "Nantes",
-    "Boston",
-    "Philadelphia",
-    "Bermuda",
+/// Per-port shipyard specifications used by `all_ports()`. Yards not
+/// listed here have `shipyard: None`.
+const SHIPYARDS: &[(&str, &[ShipTypeId])] = &[
+    ("Bermuda",      &[st_ids::SLOOP]),
+    ("Boston",       &[st_ids::SLOOP, st_ids::BRIGANTINE, st_ids::BARK]),
+    ("Philadelphia", &[st_ids::SLOOP, st_ids::BRIGANTINE]),
+    ("Nantes",       &[st_ids::BARK, st_ids::SHIP]),
+    ("Cadiz",        &[st_ids::SHIP]),
+    ("London",       &[st_ids::BRIGANTINE, st_ids::BARK, st_ids::SHIP]),
+    ("Amsterdam",    &[st_ids::FLUYT, st_ids::SHIP]),
 ];
 
-fn is_shipyard_name(name: &str) -> bool {
-    SHIPYARD_NAMES.iter().any(|s| *s == name)
+/// Lookup helper: the buildable ship types at this port (or `None`).
+pub fn buildable_at(name: &str) -> Option<&'static [ShipTypeId]> {
+    SHIPYARDS.iter().find(|(n, _)| *n == name).map(|(_, list)| *list)
 }
 
 /// Default harbor radius (NM) used when a port doesn't specify one.
@@ -67,7 +69,7 @@ pub fn all_ports() -> Vec<Port> {
             position: Position::new(*x, *y),
             faction: *faction,
             harbor_radius_nm: *radius,
-            is_shipyard: is_shipyard_name(name),
+            shipyard: buildable_at(name),
         })
         .collect()
 }
