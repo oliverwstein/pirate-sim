@@ -15,7 +15,9 @@
 //! ]
 
 use crate::bt::{self, Behavior, BtContext, BtState, Status};
+use crate::goods::GoodsRegistry;
 use crate::harbor::HarborMap;
+use crate::market::PortMarket;
 use crate::nav::NavState;
 use crate::pathfind::{self, PathfindContext};
 use crate::port::Port;
@@ -29,20 +31,56 @@ const ACT_CAREEN: usize = 2;
 const ACT_UNDOCK: usize = 3;
 const ACT_CHOOSE_DESTINATION: usize = 4;
 const ACT_DIVERT_TO_PORT: usize = 5;
+const ACT_SELL_ALL: usize = 6;
+const ACT_BUY_BEST: usize = 7;
 
 // --- Condition IDs ---
 const COND_IS_DOCKED: usize = 0;
 const COND_HAS_DESTINATION: usize = 1;
 const COND_IS_LOW_PROVISIONS: usize = 2;
 
-/// Below this many days of provisions, divert to nearest port.
-const LOW_PROVISIONS_DAYS: f32 = 10.0;
+/// Hard panic floor: if a sailing ship has fewer than this many days
+/// of provisions left and no destination set, divert to the nearest
+/// port. The reachability-based check below handles the normal case
+/// where a destination exists; this is the safety net for ships that
+/// somehow lost their plan or are choosing one.
+const HARD_PANIC_DAYS: f32 = 2.0;
+
+/// Extra days the AI insists on having beyond the estimated voyage
+/// time before deciding it can still reach its destination. Smaller
+/// than the trade-planner buffer because at this point the voyage is
+/// underway and most of the uncertainty is already known.
+const REACHABILITY_BUFFER_DAYS: f32 = 3.0;
 
 /// If a ship's waypoint queue is empty but it is still farther than this
 /// from its destination, request a fresh plan. Larger than `ARRIVAL_NM` so
 /// that ships about to dock don't waste a planner call, but small enough
 /// that a ship drifting past its smoothed route promptly recovers.
 const REPLAN_DISTANCE_NM: f32 = 25.0;
+
+/// Operating float kept aboard after a home-port settlement: enough
+/// to top up provisions at any foreign port, plus a modest reserve
+/// for incidentals (pilotage fees, minor repairs). All silver above
+/// this is paid out to the owner port on docking.
+const HOME_PORT_FLOAT_SILVER: f32 = 500.0;
+
+/// On outfitting at home, the ship will try to top its strongbox up
+/// to this many times the estimated cost of one full outbound hold.
+/// Gives a cushion for partial-cargo top-ups at intermediate ports
+/// and small contingencies en route.
+const OUTFIT_DRAW_MULTIPLE: f32 = 2.0;
+
+/// No single outfit draw can take more than this fraction of the home
+/// port's silver. Prevents a busy yard's working capital from being
+/// drained by one ship's outbound cargo.
+const OUTFIT_PORT_FRACTION_CAP: f32 = 0.2;
+
+/// Tramping credit: at any non-home port, a captain with no silver
+/// but a profitable arbitrage opportunity may draw against the port
+/// factor (consigned cargo / freight charter) up to this fraction of
+/// the port's treasury. Booked as ship debt and repaid at the next
+/// docking from sale proceeds.
+const TRAMP_PORT_FRACTION_CAP: f32 = 0.10;
 
 /// What the ship is doing while docked (for display purposes).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -54,8 +92,13 @@ pub enum DockAction {
 
 /// Build the ship AI behavior tree.
 fn build_ship_bt() -> Behavior {
+    // Dock cycle: sell whatever we arrived with, top up provisions,
+    // load the most profitable next leg's cargo, careen if needed,
+    // and undock toward the new destination.
     let dock_tree = Behavior::Sequence(vec![
+        Behavior::Action(ACT_SELL_ALL),
         Behavior::Action(ACT_RESUPPLY),
+        Behavior::Action(ACT_BUY_BEST),
         Behavior::Action(ACT_CAREEN),
         Behavior::Action(ACT_UNDOCK),
     ]);
@@ -66,17 +109,24 @@ fn build_ship_bt() -> Behavior {
             Behavior::Condition(COND_IS_DOCKED),
             dock_tree,
         ]),
-        // Priority 2: If low on provisions, divert to nearest port
+        // Priority 2: If low on provisions, divert to nearest port and
+        // continue steering toward it. The Sail action *must* run after
+        // DivertToPort: DivertToPort only updates `nav.destination` and
+        // re-plans, but doesn't compute_steering. Without Sail in the
+        // same sequence, a low-provisions ship keeps its old heading
+        // forever, which is how ships used to drift to a halt and "get
+        // stuck" mid-voyage when provisions ran out before arrival.
         Behavior::Sequence(vec![
             Behavior::Condition(COND_IS_LOW_PROVISIONS),
             Behavior::Action(ACT_DIVERT_TO_PORT),
+            Behavior::Action(ACT_SAIL),
         ]),
         // Priority 3: If has destination, sail
         Behavior::Sequence(vec![
             Behavior::Condition(COND_HAS_DESTINATION),
             Behavior::Action(ACT_SAIL),
         ]),
-        // Priority 4: Choose a new destination
+        // Priority 4: Choose a new destination (random fallback)
         Behavior::Action(ACT_CHOOSE_DESTINATION),
     ])
 }
@@ -129,6 +179,11 @@ impl ShipAI {
     /// waypoint routes whenever it picks a new destination. When `None` it
     /// falls back to straight-line navigation (useful for unit tests with
     /// synthetic toy ports).
+    ///
+    /// `markets` and `goods`, when both `Some`, route resupply through the
+    /// docked port's market (consuming silver and stockpile). When either
+    /// is `None`, resupply is free — used by toy/demo tests that don't
+    /// model an economy.
     pub fn tick(
         &mut self,
         ship: &mut Ship,
@@ -137,6 +192,8 @@ impl ShipAI {
         ports: &[Port],
         harbors: &HarborMap,
         pathfind: Option<&PathfindContext<'_>>,
+        markets: Option<&mut [PortMarket]>,
+        goods: Option<&GoodsRegistry>,
     ) {
         let mut ctx = ShipBtContext {
             ship,
@@ -148,6 +205,8 @@ impl ShipAI {
             harbors,
             rng_state: &mut self.rng_state,
             pathfind,
+            markets,
+            goods,
         };
 
         let status = bt::tick(&self.tree, &mut self.state, &mut ctx, 0);
@@ -187,6 +246,8 @@ struct ShipBtContext<'a> {
     harbors: &'a HarborMap,
     rng_state: &'a mut u64,
     pathfind: Option<&'a PathfindContext<'a>>,
+    markets: Option<&'a mut [PortMarket]>,
+    goods: Option<&'a GoodsRegistry>,
 }
 
 impl<'a> ShipBtContext<'a> {
@@ -244,11 +305,42 @@ impl<'a> BtContext for ShipBtContext<'a> {
                 // port coordinate may still be far away (e.g., Philadelphia
                 // up the Delaware) — that's fine.
                 if self.in_destination_harbor() {
+                    let port_idx = self.nav.dest_port;
                     self.ship.dock();
                     *self.dock_action = DockAction::Idle;
+                    self.nav.docked_at_port = port_idx;
                     self.nav.destination = None;
                     self.nav.dest_port = None;
                     self.nav.clear_path();
+                    // Settle any outstanding chandler/freight debt at
+                    // this port first — creditors come before owners.
+                    // Fungible: it doesn't matter which port originally
+                    // advanced the credit; the merchant network settles
+                    // it via bills of exchange between correspondents.
+                    if let (Some(idx), Some(markets)) = (port_idx, self.markets.as_deref_mut()) {
+                        if idx < markets.len() {
+                            markets[idx].collect_debt(self.ship, HOME_PORT_FLOAT_SILVER);
+                        }
+                    }
+                    // Home-port settlement: if this is the owner port,
+                    // the supercargo books proceeds with the owners.
+                    // Silver above the operating float is paid into
+                    // the port treasury (dividend to shareholders);
+                    // the ship keeps just enough to cover provisions
+                    // and incidentals at the next port of call.
+                    if let (Some(idx), Some(owner)) = (port_idx, self.ship.owner_port) {
+                        if idx == owner {
+                            if let Some(markets) = self.markets.as_deref_mut() {
+                                if idx < markets.len() {
+                                    let paid = markets[idx].deposit_owner_profit(
+                                        self.ship,
+                                        HOME_PORT_FLOAT_SILVER,
+                                    );
+                                    self.ship.lifetime_dividends += paid;
+                                }
+                            }
+                        }
+                    }
                     return Status::Success;
                 }
 
@@ -271,6 +363,21 @@ impl<'a> BtContext for ShipBtContext<'a> {
                 if let Some(s) = self.nav.compute_steering(self.ship.position, self.stats, self.wind, land) {
                     self.ship.set_steering(s.heading, s.speed);
                     Status::Running
+                } else if self.nav.dest_port.is_some()
+                    && self.pathfind.is_some()
+                    && !self.in_destination_harbor()
+                {
+                    // We "arrived" at the path's last waypoint (the harbor
+                    // anchor) but the ship's actual position is just outside
+                    // the harbor cell set. Replan from here so the new path
+                    // ends with the ship inside the harbor zone, rather than
+                    // false-docking in open water (which is the canonical
+                    // way ships used to get stuck near small-harbor ports
+                    // like Amsterdam/Nantes).
+                    if let Some(idx) = self.nav.dest_port {
+                        self.replan_to_port(idx);
+                    }
+                    Status::Running
                 } else {
                     // Arrived at a free-form destination (no harbor zone).
                     self.ship.dock();
@@ -280,7 +387,15 @@ impl<'a> BtContext for ShipBtContext<'a> {
             }
             ACT_RESUPPLY => {
                 *self.dock_action = DockAction::Resupplying;
-                if self.ship.tick_resupply(self.stats) {
+                let done = match (self.nav.docked_at_port, self.markets.as_deref_mut(), self.goods) {
+                    (Some(idx), Some(markets), Some(goods)) if idx < markets.len() => {
+                        self.ship.tick_resupply_at_market(self.stats, &mut markets[idx], goods)
+                    }
+                    // No market wired (test scenario, or unknown port) —
+                    // fall back to free resupply so legacy tests pass.
+                    _ => self.ship.tick_resupply(self.stats),
+                };
+                if done {
                     *self.dock_action = DockAction::Idle;
                     Status::Success
                 } else {
@@ -299,6 +414,7 @@ impl<'a> BtContext for ShipBtContext<'a> {
             ACT_UNDOCK => {
                 if self.nav.destination.is_some() {
                     self.ship.undock();
+                    self.nav.docked_at_port = None;
                     *self.dock_action = DockAction::Idle;
                     Status::Success
                 } else {
@@ -315,6 +431,139 @@ impl<'a> BtContext for ShipBtContext<'a> {
                     idx = (idx + 1) % self.ports.len();
                 }
                 self.assign_destination_port(idx);
+                Status::Success
+            }
+            ACT_SELL_ALL => {
+                // Sell every ton of cargo we arrived with at the
+                // docked port's market. If markets/goods aren't wired
+                // (toy tests), this is a no-op success.
+                let (Some(idx), Some(markets), Some(goods)) =
+                    (self.nav.docked_at_port, self.markets.as_deref_mut(), self.goods)
+                else {
+                    return Status::Success;
+                };
+                if idx >= markets.len() {
+                    return Status::Success;
+                }
+                let market = &mut markets[idx];
+                let entries: Vec<(crate::goods::GoodId, f32)> =
+                    self.ship.cargo.iter().collect();
+                for (gid, tons) in entries {
+                    if tons > 0.0 {
+                        // Best-effort: ignore "port out of silver" by
+                        // selling whatever the port can afford. For
+                        // v1 we just attempt the full amount; if the
+                        // port can't pay, the cargo stays aboard and
+                        // we'll try again on the next leg.
+                        let _ = market.sell(self.ship, gid, tons, goods);
+                    }
+                }
+                Status::Success
+            }
+            ACT_BUY_BEST => {
+                // Pick the best (good, dest) and load up. Sets the
+                // ship's destination as a side effect so ACT_UNDOCK
+                // has somewhere to go.
+                let (Some(idx), Some(markets), Some(goods)) =
+                    (self.nav.docked_at_port, self.markets.as_deref_mut(), self.goods)
+                else {
+                    return Status::Success;
+                };
+                if idx >= markets.len() {
+                    return Status::Success;
+                }
+                // Reachability budget: assume we leave with a full
+                // provisions hold. The trade planner uses this to
+                // skip destinations we can't physically reach.
+                let daily = self.stats.daily_provision_consumption().max(1e-6);
+                let provision_budget_days = self.stats.provision_capacity / daily;
+                // Home bias: as the ship's strongbox swells above the
+                // operating float, increase its pull toward home. This
+                // models the supercargo's fiduciary duty to settle
+                // proceeds with the owners — a ship sitting on a fat
+                // purse won't keep chasing marginal arbitrage forever.
+                let home_bias = self.ship.owner_port.map(|home_idx| {
+                    let surplus = (self.ship.silver - HOME_PORT_FLOAT_SILVER).max(0.0);
+                    // Roughly: a ship sitting on +5k surplus pulls
+                    // toward home with a 25 peso/ton bias, fully
+                    // dominating ordinary arbitrage. The cap of 200
+                    // ensures a flush ship will home-in even against
+                    // the fattest opportunistic margin.
+                    crate::trade::HomeBias {
+                        home_port: home_idx,
+                        bias_pesos_per_ton: (surplus / 200.0).min(200.0),
+                    }
+                });
+                let plan = crate::trade::find_best_trade(
+                    idx,
+                    self.ports,
+                    markets,
+                    goods,
+                    self.stats,
+                    provision_budget_days,
+                    home_bias,
+                );
+                let plan = match plan {
+                    Some(p) => p,
+                    None => return Status::Success,
+                };
+
+                // Buy as many tons as we can afford, that fit in the
+                // hold, and that the port can supply.
+                let market = &mut markets[idx];
+                let unit = market.buy_price(plan.good, goods).max(0.0001);
+                let cargo_room = self.stats.cargo_capacity_tons
+                    - self.ship.cargo.total_tons();
+
+                // Outfitting draw: if this is the owner port, top the
+                // ship's strongbox up from the port treasury before
+                // computing what we can afford. Historically the
+                // outbound cargo was paid for with capital drawn from
+                // the home-port owners, not from cash earned on prior
+                // voyages — those proceeds were settled on arrival.
+                if let Some(owner) = self.ship.owner_port {
+                    if owner == idx {
+                        let want_tons = cargo_room.min(market.stockpile.get(plan.good));
+                        let target = unit * want_tons * OUTFIT_DRAW_MULTIPLE;
+                        market.draw_for_outfit(
+                            self.ship,
+                            target,
+                            OUTFIT_PORT_FRACTION_CAP,
+                        );
+                    }
+                }
+
+                // Tramping / freight credit: at any other port, if we
+                // still can't load anything meaningful (too little
+                // silver for the hold space we have), take cargo on
+                // consignment from the local factor. Booked as debt;
+                // repaid out of the sale proceeds at the destination.
+                let want_tons = cargo_room.min(market.stockpile.get(plan.good));
+                let need_silver = unit * want_tons;
+                if self.ship.silver < need_silver
+                    && self.ship.debt < crate::ship::MAX_SHIP_DEBT
+                    && want_tons > 0.0
+                {
+                    let shortfall = need_silver - self.ship.silver;
+                    market.extend_credit(
+                        self.ship,
+                        shortfall,
+                        TRAMP_PORT_FRACTION_CAP,
+                        crate::ship::MAX_SHIP_DEBT,
+                    );
+                }
+
+                let affordable = self.ship.silver / unit;
+                let in_stock = market.stockpile.get(plan.good);
+                let tons = cargo_room.min(affordable).min(in_stock).max(0.0);
+                if tons > 0.0 {
+                    let _ = market.buy(self.ship, self.stats, plan.good, tons, goods);
+                }
+
+                // Always set the destination — even when the buy fell
+                // through (broke / no room) — so the ship still sails
+                // to the chosen port and tries selling/buying again.
+                self.assign_destination_port(plan.dest_port);
                 Status::Success
             }
             ACT_DIVERT_TO_PORT => {
@@ -338,8 +587,25 @@ impl<'a> BtContext for ShipBtContext<'a> {
             COND_IS_DOCKED => self.ship.state == ShipState::Docked,
             COND_HAS_DESTINATION => self.nav.destination.is_some(),
             COND_IS_LOW_PROVISIONS => {
-                let days = self.ship.provisions_days_remaining(self.stats);
-                days < LOW_PROVISIONS_DAYS && self.ship.state == ShipState::Sailing
+                if self.ship.state != ShipState::Sailing {
+                    false
+                } else {
+                    let days_remaining = self.ship.provisions_days_remaining(self.stats);
+                    // If we have a planned destination, only flag low
+                    // provisions when we estimate we *cannot* reach it
+                    // with a small safety buffer. A ship within range
+                    // of its destination keeps pushing on even if the
+                    // hold is nearly empty — diverting at 80% of a
+                    // transatlantic voyage just wastes the trip.
+                    if let Some(dest) = self.nav.destination {
+                        let dist = self.ship.position.distance(dest);
+                        let voyage_days = self.stats.estimated_voyage_days(dist);
+                        days_remaining < voyage_days + REACHABILITY_BUFFER_DAYS
+                    } else {
+                        // No destination → use the hard panic floor.
+                        days_remaining < HARD_PANIC_DAYS
+                    }
+                }
             }
             _ => false,
         };

@@ -11,6 +11,7 @@ const COAST_COLOR: Color = Color::new(0.05, 0.15, 0.05, 0.9);
 const SHIP_COLOR: Color = Color::new(1.0, 0.9, 0.2, 1.0);
 const WIND_COLOR: Color = Color::new(0.5, 0.7, 1.0, 0.6);
 const PATH_COLOR: Color = Color::new(1.0, 0.9, 0.2, 0.5);
+const SELECT_COLOR: Color = Color::new(0.4, 0.9, 1.0, 1.0);
 
 /// Discrete level-of-detail zoom steps in pixels-per-NM. Mouse wheel
 /// snaps between adjacent levels; the camera additionally clamps zoom
@@ -48,6 +49,18 @@ impl Camera {
         let dy = pos.y - self.offset.y;
         let z = self.zoom();
         Vec2::new(sw / 2.0 + dx * z, sh / 2.0 - dy * z)
+    }
+
+    /// Inverse of `world_to_screen`: convert a screen-space pixel
+    /// (e.g., a mouse click) back to world coordinates.
+    fn screen_to_world(&self, screen: Vec2) -> Position {
+        let sw = screen_width();
+        let sh = screen_height();
+        let z = self.zoom();
+        Position::new(
+            (screen.x - sw / 2.0) / z + self.offset.x,
+            -(screen.y - sh / 2.0) / z + self.offset.y,
+        )
     }
 
     /// Update `fit_zoom` for the current viewport given the world extent.
@@ -245,7 +258,7 @@ fn draw_ports(world: &World, camera: &Camera) {
     }
 }
 
-fn draw_ships(world: &World, camera: &Camera) {
+fn draw_ships(world: &World, camera: &Camera, selected_ship: Option<usize>) {
     // Planned paths first, so ship triangles draw on top.
     for (i, ship) in world.ships.iter().enumerate() {
         let nav = &world.ship_ais[i].nav;
@@ -261,7 +274,7 @@ fn draw_ships(world: &World, camera: &Camera) {
         }
     }
 
-    for ship in &world.ships {
+    for (i, ship) in world.ships.iter().enumerate() {
         let sp = camera.world_to_screen(ship.position);
         let size = 6.0;
         let rad = ship.heading.to_radians();
@@ -278,6 +291,10 @@ fn draw_ships(world: &World, camera: &Camera) {
         );
 
         draw_triangle(tip, left, right, SHIP_COLOR);
+
+        if selected_ship == Some(i) {
+            draw_circle_lines(sp.x, sp.y, size * 2.2, 2.0, SELECT_COLOR);
+        }
     }
 }
 
@@ -287,54 +304,235 @@ fn draw_hud(world: &World, camera: &Camera, paused: bool, ticks_per_frame: u32) 
         world.date.year, world.date.day_of_year, world.date.hour
     );
     let status = if paused { "PAUSED" } else { "RUNNING" };
-    let info = format!(
-        "{} | Speed: {}h/frame | {} | Ships: {} | Zoom: {}/{} ({:.2}px/NM)",
+
+    // Compact fleet summary: counts by state + economic totals.
+    let mut n_sail = 0;
+    let mut n_dock = 0;
+    let mut n_anchor = 0;
+    let mut total_silver = 0.0_f32;
+    let mut total_dividends = 0.0_f32;
+    let mut total_debt = 0.0_f32;
+    let mut total_pnl = 0.0_f32;
+    for ship in &world.ships {
+        match ship.state {
+            ShipState::Sailing => n_sail += 1,
+            ShipState::Docked => n_dock += 1,
+            ShipState::Anchored => n_anchor += 1,
+        }
+        total_silver += ship.silver;
+        total_dividends += ship.lifetime_dividends;
+        total_debt += ship.debt;
+        total_pnl += (ship.silver - ship.starting_silver) + ship.lifetime_dividends - ship.debt;
+    }
+
+    let line1 = format!(
+        "{} | {} | {}h/frame | Zoom {}/{} ({:.2}px/NM)",
         date_str,
-        ticks_per_frame,
         status,
-        world.ships.len(),
+        ticks_per_frame,
         camera.lod_index + 1,
         LOD_LEVELS.len(),
         camera.zoom(),
     );
-    draw_text(&info, 10.0, 20.0, 20.0, WHITE);
+    let line2 = format!(
+        "Fleet: {} ships [{} sail, {} dock, {} anc] | silver ${:.0} | debt ${:.0} | div ${:.0} | P/L ${:+.0}",
+        world.ships.len(),
+        n_sail,
+        n_dock,
+        n_anchor,
+        total_silver,
+        total_debt,
+        total_dividends,
+        total_pnl,
+    );
+    draw_text(&line1, 10.0, 20.0, 20.0, WHITE);
+    draw_text(&line2, 10.0, 40.0, 16.0, LIGHTGRAY);
+    draw_text(
+        "Click a port or ship to inspect.  Esc clears selection.",
+        10.0,
+        screen_height() - 10.0,
+        14.0,
+        Color::new(0.6, 0.6, 0.6, 1.0),
+    );
+}
 
-    // Ship info
-    for (i, ship) in world.ships.iter().enumerate() {
-        let dist = world.ship_ais[i]
-            .nav
-            .destination
-            .map(|d| ship.position.distance(d))
-            .unwrap_or(0.0);
-        let state_str = match ship.state {
-            ShipState::Sailing => "SAILING".to_string(),
-            ShipState::Docked => {
-                match world.ship_ais[i].dock_action {
-                    sim_core::ai::DockAction::Idle => "DOCKED (idle)".to_string(),
-                    sim_core::ai::DockAction::Resupplying => "DOCKED (resupply)".to_string(),
-                    sim_core::ai::DockAction::Careening => "DOCKED (careen)".to_string(),
-                }
-            }
-            ShipState::Anchored => "ANCHORED".to_string(),
-        };
-        let stats = sim_core::ship::ShipStats::sloop();
-        let prov_pct = (ship.provisions / stats.provision_capacity * 100.0) as i32;
-        let ship_info = format!(
-            "Ship {}: {} | spd={:.1}kt dist={:.0}nm | food={}% foul={:.0}",
-            i, state_str, ship.speed, dist, prov_pct, ship.hull_fouling
-        );
-        draw_text(&ship_info, 10.0, 40.0 + i as f32 * 18.0, 16.0, LIGHTGRAY);
+/// Left-side panel showing a selected ship's full state. Mirrors the
+/// market panel on the right.
+fn draw_ship_panel(world: &World, ship_idx: usize) {
+    if ship_idx >= world.ships.len() {
+        return;
+    }
+    let ship = &world.ships[ship_idx];
+    let ai = &world.ship_ais[ship_idx];
+    let stype = world.ship_types.get(ship.ship_type);
+    let stats = &stype.stats;
+
+    let cargo_lines = ship.cargo.iter().count().max(1);
+    let panel_w: f32 = 320.0;
+    let panel_h: f32 = 28.0 + 18.0 * (10.0 + cargo_lines as f32);
+    let x = 10.0;
+    let y = 70.0;
+
+    draw_rectangle(x, y, panel_w, panel_h, Color::new(0.0, 0.0, 0.0, 0.7));
+    draw_rectangle_lines(x, y, panel_w, panel_h, 2.0, SELECT_COLOR);
+
+    let header = format!("Ship #{} — {}", ship_idx, stype.name);
+    draw_text(&header, x + 10.0, y + 22.0, 20.0, YELLOW);
+
+    let state_line = match ship.state {
+        ShipState::Sailing => {
+            let dest = ai.nav.dest_port
+                .and_then(|p| world.ports.get(p))
+                .map(|p| p.name)
+                .unwrap_or("(open sea)");
+            let dist_nm = ai.nav.destination
+                .map(|d| ship.position.distance(d))
+                .unwrap_or(0.0);
+            let eta_h = if ship.speed > 0.1 { dist_nm / ship.speed } else { 0.0 };
+            format!("SAILING → {}  ({:.0} NM, ETA {:.0}h)", dest, dist_nm, eta_h)
+        }
+        ShipState::Docked => {
+            let port = ai.nav.docked_at_port
+                .and_then(|p| world.ports.get(p))
+                .map(|p| p.name)
+                .unwrap_or("?");
+            let act = match ai.dock_action {
+                sim_core::ai::DockAction::Idle => "idle",
+                sim_core::ai::DockAction::Resupplying => "resupplying",
+                sim_core::ai::DockAction::Careening => "careening",
+            };
+            format!("DOCKED at {} ({})", port, act)
+        }
+        ShipState::Anchored => "ANCHORED".to_string(),
+    };
+
+    let prov_pct = (ship.provisions / stats.provision_capacity * 100.0) as i32;
+    let pnl = (ship.silver - ship.starting_silver) + ship.lifetime_dividends - ship.debt;
+
+    let lines: [(String, Color); 9] = [
+        (state_line,                                                                   LIGHTGRAY),
+        (format!("speed {:.1} kt   heading {:>3.0}°", ship.speed, ship.heading),      LIGHTGRAY),
+        (format!("provisions {} %  ({:.0}/{:.0} t)", prov_pct, ship.provisions, stats.provision_capacity), LIGHTGRAY),
+        (format!("hull fouling {:.0}", ship.hull_fouling),                            LIGHTGRAY),
+        (String::new(),                                                                LIGHTGRAY),
+        (format!("silver     ${:>9.0}", ship.silver),                                  WHITE),
+        (format!("debt       ${:>9.0}", ship.debt),
+         if ship.debt > 0.0 { ORANGE } else { LIGHTGRAY }),
+        (format!("dividends  ${:>9.0}   (start ${:.0})", ship.lifetime_dividends, ship.starting_silver), LIGHTGRAY),
+        (format!("P/L        ${:>+9.0}", pnl),
+         if pnl >= 0.0 { GREEN } else { RED }),
+    ];
+    for (i, (text, color)) in lines.iter().enumerate() {
+        draw_text(text, x + 10.0, y + 44.0 + i as f32 * 18.0, 14.0, *color);
+    }
+
+    let cargo_y = y + 44.0 + lines.len() as f32 * 18.0 + 6.0;
+    let header = format!("cargo  {:.0}/{:.0} t", ship.cargo.total_tons(), stats.cargo_capacity_tons);
+    draw_text(&header, x + 10.0, cargo_y, 14.0, YELLOW);
+    let mut row = 0;
+    for (gid, tons) in ship.cargo.iter() {
+        if tons <= 0.0 { continue; }
+        let name = world.goods.get(gid).name;
+        let line = format!("  {:<16} {:>5.1} t", name, tons);
+        draw_text(&line, x + 10.0, cargo_y + 18.0 + row as f32 * 16.0, 14.0, WHITE);
+        row += 1;
+    }
+    if row == 0 {
+        draw_text("  (empty)", x + 10.0, cargo_y + 18.0, 14.0, LIGHTGRAY);
     }
 }
 
-#[macroquad::main("Pirate Sim - Phase 1")]
+/// Right-side panel showing a selected port's market state: prices,
+/// stockpile, treasury, gateway flag.
+fn draw_market_panel(world: &World, port_idx: usize) {
+    if port_idx >= world.ports.len() || port_idx >= world.markets.len() {
+        return;
+    }
+    let port = &world.ports[port_idx];
+    let market = &world.markets[port_idx];
+
+    let panel_w: f32 = 320.0;
+    let panel_h: f32 = 28.0 + 18.0 * (world.goods.len() as f32 + 3.0);
+    let x = screen_width() - panel_w - 10.0;
+    let y = 10.0;
+
+    draw_rectangle(x, y, panel_w, panel_h, Color::new(0.0, 0.0, 0.0, 0.7));
+    draw_rectangle_lines(x, y, panel_w, panel_h, 2.0, WHITE);
+
+    draw_text(port.name, x + 10.0, y + 22.0, 20.0, YELLOW);
+    draw_text(
+        &format!("Treasury: ${:.0}", market.silver),
+        x + 10.0,
+        y + 42.0,
+        16.0,
+        LIGHTGRAY,
+    );
+    draw_text(
+        "Good          stk(t)   buy   sell",
+        x + 10.0,
+        y + 62.0,
+        14.0,
+        Color::new(0.7, 0.7, 0.7, 1.0),
+    );
+
+    for (i, good) in world.goods.iter().enumerate() {
+        let stk = market.stockpile.get(good.id);
+        let buy = market.buy_price(good.id, &world.goods);
+        let sell = market.sell_price(good.id, &world.goods);
+        let line = format!("{:<14}{:>7.0} {:>5.1} {:>5.1}", good.name, stk, buy, sell);
+        draw_text(
+            &line,
+            x + 10.0,
+            y + 80.0 + i as f32 * 18.0,
+            14.0,
+            WHITE,
+        );
+    }
+}
+
+/// Find the ship closest to the given world point within a screen-radius
+/// hit zone (converted to NM at the current zoom). Returns None if no
+/// ship is within range.
+fn pick_ship_at(world: &World, world_pos: Position, zoom_px_per_nm: f32) -> Option<usize> {
+    // ~12 pixels of click slop, regardless of zoom.
+    let click_r_nm = 12.0 / zoom_px_per_nm.max(0.05);
+    let mut best: Option<(usize, f32)> = None;
+    for (i, ship) in world.ships.iter().enumerate() {
+        let d = world_pos.distance(ship.position);
+        if d <= click_r_nm && best.map_or(true, |(_, db)| d < db) {
+            best = Some((i, d));
+        }
+    }
+    best.map(|(i, _)| i)
+}
+
+/// Find the port whose harbor radius contains the given world point,
+/// preferring the closer one if multiple match.
+fn pick_port_at(world: &World, world_pos: Position) -> Option<usize> {
+    let mut best: Option<(usize, f32)> = None;
+    for (i, port) in world.ports.iter().enumerate() {
+        let d = world_pos.distance(port.position);
+        // Use a generous click radius so small ports are still hittable.
+        let click_r = port.harbor_radius_nm.max(15.0);
+        if d <= click_r {
+            if best.map_or(true, |(_, db)| d < db) {
+                best = Some((i, d));
+            }
+        }
+    }
+    best.map(|(i, _)| i)
+}
+
+#[macroquad::main("Pirate Sim - Phase 2")]
 async fn main() {
     let mut world = World::load(Path::new("data/"));
-    spawn_demo_ship(&mut world);
+    spawn_demo_ships(&mut world);
 
     let mut camera = Camera::new();
     let mut paused = false;
     let mut ticks_per_frame: u32 = 1;
+    let mut selected_port: Option<usize> = None;
+    let mut selected_ship: Option<usize> = None;
 
     loop {
         // Input
@@ -351,8 +549,29 @@ async fn main() {
         }
         if is_key_pressed(KeyCode::R) {
             world = World::load(Path::new("data/"));
-            spawn_demo_ship(&mut world);
+            spawn_demo_ships(&mut world);
             ticks_per_frame = 1;
+            selected_port = None;
+            selected_ship = None;
+        }
+
+        // Click selects (or deselects) a ship or port. Ships take priority
+        // since their hit zone is small; an empty-water click keeps the
+        // current selection so the inspector doesn't flicker.
+        if is_mouse_button_pressed(MouseButton::Left) {
+            let (mx, my) = mouse_position();
+            let world_pos = camera.screen_to_world(Vec2::new(mx, my));
+            if let Some(i) = pick_ship_at(&world, world_pos, camera.zoom()) {
+                selected_ship = if selected_ship == Some(i) { None } else { Some(i) };
+                selected_port = None;
+            } else if let Some(i) = pick_port_at(&world, world_pos) {
+                selected_port = if selected_port == Some(i) { None } else { Some(i) };
+                selected_ship = None;
+            }
+        }
+        if is_key_pressed(KeyCode::Escape) {
+            selected_port = None;
+            selected_ship = None;
         }
 
         // Tick
@@ -368,16 +587,42 @@ async fn main() {
         draw_coastline(&world, &camera);
         draw_wind_arrows(&world, &camera);
         draw_ports(&world, &camera);
-        draw_ships(&world, &camera);
+        draw_ships(&world, &camera, selected_ship);
         draw_hud(&world, &camera, paused, ticks_per_frame);
+        if let Some(idx) = selected_port {
+            draw_market_panel(&world, idx);
+        }
+        if let Some(idx) = selected_ship {
+            draw_ship_panel(&world, idx);
+        }
 
         next_frame().await;
     }
 }
 
-fn spawn_demo_ship(world: &mut World) {
-    let barbados_pos = world.ports.iter().find(|p| p.name == "Bridgetown").unwrap().position;
-    let ship = Ship::new(barbados_pos, ShipState::Docked);
-    let ai = ShipAI::with_seed(7); // will choose a random destination on first tick
-    world.add_ship(ship, ai);
+fn spawn_demo_ships(world: &mut World) {
+    // A starter fleet spread across Caribbean, North America, and
+    // Europe — gives the trader AI all three legs of the triangular
+    // trade visible from tick zero.
+    let starts: &[(&str, u64)] = &[
+        ("Bridgetown", 7),
+        ("Port Royal", 13),
+        ("Boston", 21),
+        ("Charleston", 33),
+        ("Cartagena", 41),
+        ("Havana", 53),
+        ("Fort-Royal", 67),
+        ("London", 79),
+        ("Amsterdam", 89),
+        ("Nantes", 97),
+    ];
+    for (port_name, seed) in starts {
+        if let Some(idx) = world.ports.iter().position(|p| p.name == *port_name) {
+            let port_pos = world.ports[idx].position;
+            let ship = Ship::new(port_pos, ShipState::Docked);
+            let mut ai = ShipAI::with_seed(*seed);
+            ai.nav.docked_at_port = Some(idx);
+            world.add_ship(ship, ai);
+        }
+    }
 }

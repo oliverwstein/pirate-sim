@@ -15,9 +15,9 @@ fn calm_wind() -> WindVector {
 /// Helper: some test ports for the AI to use.
 fn test_ports() -> Vec<Port> {
     vec![
-        Port { name: "PortA", position: Position { x: 100.0, y: 0.0 }, faction: sim_core::port::Faction::England, harbor_radius_nm: DEFAULT_HARBOR_RADIUS_NM },
-        Port { name: "PortB", position: Position { x: -100.0, y: 0.0 }, faction: sim_core::port::Faction::Spain, harbor_radius_nm: DEFAULT_HARBOR_RADIUS_NM },
-        Port { name: "PortC", position: Position { x: 0.0, y: 100.0 }, faction: sim_core::port::Faction::France, harbor_radius_nm: DEFAULT_HARBOR_RADIUS_NM },
+        Port { name: "PortA", position: Position { x: 100.0, y: 0.0 }, faction: sim_core::port::Faction::England, harbor_radius_nm: DEFAULT_HARBOR_RADIUS_NM, shipyard: None },
+        Port { name: "PortB", position: Position { x: -100.0, y: 0.0 }, faction: sim_core::port::Faction::Spain, harbor_radius_nm: DEFAULT_HARBOR_RADIUS_NM, shipyard: None },
+        Port { name: "PortC", position: Position { x: 0.0, y: 100.0 }, faction: sim_core::port::Faction::France, harbor_radius_nm: DEFAULT_HARBOR_RADIUS_NM, shipyard: None },
     ]
 }
 
@@ -50,7 +50,7 @@ fn tick_until(
         if predicate(ship, ai) {
             return t;
         }
-        ai.tick(ship, stats, wind, ports, &empty_harbors(), None);
+        ai.tick(ship, stats, wind, ports, &empty_harbors(), None, None, None);
         ship.tick_resources(stats);
     }
     max_ticks
@@ -62,7 +62,7 @@ fn tick_until(
 
 #[rstest]
 #[case::empty_provisions(0.5, 0.0, DockAction::Resupplying)]
-#[case::dirty_hull(3.0, 50.0, DockAction::Careening)]
+#[case::dirty_hull(6.0, 50.0, DockAction::Careening)]
 #[case::both_depleted(1.0, 40.0, DockAction::Resupplying)] // resupply first
 fn dock_sequence_starts_correct_action(
     #[case] provisions: f32,
@@ -75,7 +75,7 @@ fn dock_sequence_starts_correct_action(
     let mut ai = ShipAI::new(); // no destination
 
     // One tick should start the appropriate action
-    ai.tick(&mut ship, &stats, &wind, &test_ports(), &empty_harbors(), None);
+    ai.tick(&mut ship, &stats, &wind, &test_ports(), &empty_harbors(), None, None, None);
 
     assert_eq!(ai.dock_action, expected_first_action);
 }
@@ -88,7 +88,7 @@ fn dock_sequence_resupply_then_careen() {
     let mut ai = ShipAI::new();
 
     // Should resupply first
-    ai.tick(&mut ship, &stats, &wind, &test_ports(), &empty_harbors(), None);
+    ai.tick(&mut ship, &stats, &wind, &test_ports(), &empty_harbors(), None, None, None);
     assert_eq!(ai.dock_action, DockAction::Resupplying);
 
     // Tick until resupply completes (action transitions away from Resupplying)
@@ -105,12 +105,12 @@ fn dock_sequence_resupply_then_careen() {
 fn dock_sequence_careen_completes_to_zero() {
     let stats = ShipStats::sloop();
     let wind = calm_wind();
-    let mut ship = docked_ship(3.0, 30.0); // full provisions, dirty hull
+    let mut ship = docked_ship(6.0, 30.0); // full provisions, dirty hull
     let mut ai = ShipAI::new();
 
     // Tick until careening completes (action transitions away from Careening)
     // First tick starts careening, subsequent ticks reduce fouling
-    ai.tick(&mut ship, &stats, &wind, &test_ports(), &empty_harbors(), None);
+    ai.tick(&mut ship, &stats, &wind, &test_ports(), &empty_harbors(), None, None, None);
     ship.tick_resources(&stats);
     assert_eq!(ai.dock_action, DockAction::Careening);
 
@@ -138,7 +138,7 @@ fn dock_sequence_no_ping_pong() {
     let mut last_action = DockAction::Idle;
 
     for _ in 0..500 {
-        ai.tick(&mut ship, &stats, &wind, &test_ports(), &empty_harbors(), None);
+        ai.tick(&mut ship, &stats, &wind, &test_ports(), &empty_harbors(), None, None, None);
         ship.tick_resources(&stats);
 
         if ai.dock_action == DockAction::Resupplying && last_action != DockAction::Resupplying {
@@ -157,14 +157,14 @@ fn dock_sequence_chooses_destination_after_servicing() {
     let stats = ShipStats::sloop();
     let wind = calm_wind();
     let ports = test_ports();
-    let mut ship = docked_ship(3.0, 0.0); // fully supplied, clean hull
+    let mut ship = docked_ship(6.0, 0.0); // fully supplied, clean hull
     let mut ai = ShipAI::new(); // NO destination initially
 
     // With ports available, AI should: resupply(instant) → careen(instant) → undock(needs dest)
     // Undock fails (no dest), dock_tree fails, so selector falls through to ChooseDestination
     // Next tick: HasDestination → Sail → undock
     for _ in 0..5 {
-        ai.tick(&mut ship, &stats, &wind, &ports, &empty_harbors(), None);
+        ai.tick(&mut ship, &stats, &wind, &ports, &empty_harbors(), None, None, None);
         ship.tick_resources(&stats);
     }
 
@@ -177,14 +177,14 @@ fn dock_sequence_chooses_destination_after_servicing() {
 fn dock_sequence_undocks_when_destination_set() {
     let stats = ShipStats::sloop();
     let wind = calm_wind();
-    let mut ship = docked_ship(3.0, 0.0); // fully supplied, clean
+    let mut ship = docked_ship(6.0, 0.0); // fully supplied, clean
     let mut ai = ShipAI::new();
 
     // Set a destination
     ai.set_destination(Position { x: 100.0, y: 0.0 });
 
     // Should undock after processing the dock sequence (resupply=instant, careen=instant, undock)
-    ai.tick(&mut ship, &stats, &wind, &test_ports(), &empty_harbors(), None);
+    ai.tick(&mut ship, &stats, &wind, &test_ports(), &empty_harbors(), None, None, None);
 
     assert_eq!(ship.state, ShipState::Sailing);
 }
@@ -226,13 +226,13 @@ fn crew_eats_during_dock_actions(#[case] provisions: f32, #[case] fouling: f32) 
     let mut ai = ShipAI::new();
 
     // Record starting provisions (after first tick which may add resupply)
-    ai.tick(&mut ship, &stats, &wind, &test_ports(), &empty_harbors(), None);
+    ai.tick(&mut ship, &stats, &wind, &test_ports(), &empty_harbors(), None, None, None);
     ship.tick_resources(&stats);
     let after_first_tick = ship.provisions;
 
     // If careening, provisions should be decreasing each tick
     if fouling > 0.0 && provisions >= stats.provision_capacity {
-        ai.tick(&mut ship, &stats, &wind, &test_ports(), &empty_harbors(), None);
+        ai.tick(&mut ship, &stats, &wind, &test_ports(), &empty_harbors(), None, None, None);
         ship.tick_resources(&stats);
         // Provisions decrease because crew eats, and we're careening (not resupplying)
         assert!(
@@ -252,7 +252,7 @@ fn fouling_accumulates_while_resupplying() {
     let initial_fouling = ship.hull_fouling;
 
     // Tick once (starts resupplying)
-    ai.tick(&mut ship, &stats, &wind, &test_ports(), &empty_harbors(), None);
+    ai.tick(&mut ship, &stats, &wind, &test_ports(), &empty_harbors(), None, None, None);
     ship.tick_resources(&stats);
 
     // Fouling should increase slightly (tick_resources adds 0.0083/hr)
@@ -277,7 +277,7 @@ fn full_scenario_depleted_ship_docks_and_services() {
     let mut actions_seen: Vec<DockAction> = vec![];
 
     for _ in 0..200 {
-        ai.tick(&mut ship, &stats, &wind, &test_ports(), &empty_harbors(), None);
+        ai.tick(&mut ship, &stats, &wind, &test_ports(), &empty_harbors(), None, None, None);
         ship.tick_resources(&stats);
         
         if actions_seen.last() != Some(&ai.dock_action) {
@@ -308,8 +308,8 @@ fn trace_sailing_to_port_royal() {
     
     // Include Port Royal in the port list so diversion works sensibly
     let ports = vec![
-        Port { name: "Port Royal", position: port_royal, faction: sim_core::port::Faction::England, harbor_radius_nm: DEFAULT_HARBOR_RADIUS_NM },
-        Port { name: "Bridgetown", position: barbados, faction: sim_core::port::Faction::England, harbor_radius_nm: DEFAULT_HARBOR_RADIUS_NM },
+        Port { name: "Port Royal", position: port_royal, faction: sim_core::port::Faction::England, harbor_radius_nm: DEFAULT_HARBOR_RADIUS_NM, shipyard: None },
+        Port { name: "Bridgetown", position: barbados, faction: sim_core::port::Faction::England, harbor_radius_nm: DEFAULT_HARBOR_RADIUS_NM, shipyard: None },
     ];
     
     let mut ship = Ship::new(barbados, ShipState::Sailing);
@@ -322,7 +322,7 @@ fn trace_sailing_to_port_royal() {
     
     for t in 0..720 {
         let wind = WindVector { u: -4.0, v: -2.0 }; // trade wind (ENE)
-        ai.tick(&mut ship, &stats, &wind, &ports, &empty_harbors(), None);
+        ai.tick(&mut ship, &stats, &wind, &ports, &empty_harbors(), None, None, None);
         ship.tick_resources(&stats);
         
         // Physics (only if sailing)
@@ -352,16 +352,16 @@ fn low_provisions_diverts_to_nearest_port() {
     let stats = ShipStats::sloop();
     let wind = calm_wind();
     let ports = vec![
-        Port { name: "NearPort", position: Position { x: 50.0, y: 0.0 }, faction: sim_core::port::Faction::England, harbor_radius_nm: DEFAULT_HARBOR_RADIUS_NM },
-        Port { name: "FarPort", position: Position { x: 500.0, y: 0.0 }, faction: sim_core::port::Faction::Spain, harbor_radius_nm: DEFAULT_HARBOR_RADIUS_NM },
+        Port { name: "NearPort", position: Position { x: 50.0, y: 0.0 }, faction: sim_core::port::Faction::England, harbor_radius_nm: DEFAULT_HARBOR_RADIUS_NM, shipyard: None },
+        Port { name: "FarPort", position: Position { x: 500.0, y: 0.0 }, faction: sim_core::port::Faction::Spain, harbor_radius_nm: DEFAULT_HARBOR_RADIUS_NM, shipyard: None },
     ];
 
-    // Ship at origin, heading to far port, but very low on provisions (< 10 days)
+    // Ship at origin, heading to far port, but very low on provisions (< 4 days)
     let mut ship = Ship::new(Position { x: 0.0, y: 0.0 }, ShipState::Sailing);
-    ship.provisions = 0.3; // ~6.7 days at 25 crew — below 10-day threshold
+    ship.provisions = 0.15; // ~3.3 days at 25 crew — below 4-day threshold
     let mut ai = ShipAI::with_destination(Position { x: 500.0, y: 0.0 });
 
-    ai.tick(&mut ship, &stats, &wind, &ports, &empty_harbors(), None);
+    ai.tick(&mut ship, &stats, &wind, &ports, &empty_harbors(), None, None, None);
 
     // Should have diverted to nearest port (NearPort at 50,0)
     assert_eq!(ai.nav.destination, Some(Position { x: 50.0, y: 0.0 }),
@@ -383,7 +383,7 @@ fn chooses_random_destination_when_idle() {
     ship.provisions = 3.0; // plenty of food
     let mut ai = ShipAI::new(); // no destination
 
-    ai.tick(&mut ship, &stats, &wind, &ports, &empty_harbors(), None);
+    ai.tick(&mut ship, &stats, &wind, &ports, &empty_harbors(), None, None, None);
 
     // Should have chosen a destination from available ports
     assert!(ai.nav.destination.is_some(), "should choose a random destination");
@@ -395,8 +395,8 @@ fn continuous_sailing_with_port_visits() {
     let stats = ShipStats::sloop();
     let wind = calm_wind();
     let ports = vec![
-        Port { name: "Home", position: Position { x: 0.0, y: 0.0 }, faction: sim_core::port::Faction::England, harbor_radius_nm: DEFAULT_HARBOR_RADIUS_NM },
-        Port { name: "Dest", position: Position { x: 30.0, y: 0.0 }, faction: sim_core::port::Faction::Spain, harbor_radius_nm: DEFAULT_HARBOR_RADIUS_NM },
+        Port { name: "Home", position: Position { x: 0.0, y: 0.0 }, faction: sim_core::port::Faction::England, harbor_radius_nm: DEFAULT_HARBOR_RADIUS_NM, shipyard: None },
+        Port { name: "Dest", position: Position { x: 30.0, y: 0.0 }, faction: sim_core::port::Faction::Spain, harbor_radius_nm: DEFAULT_HARBOR_RADIUS_NM, shipyard: None },
     ];
 
     let mut ship = Ship::new(Position { x: 0.0, y: 0.0 }, ShipState::Sailing);
@@ -405,7 +405,7 @@ fn continuous_sailing_with_port_visits() {
     let mut dock_count = 0;
     
     for _ in 0..500 {
-        ai.tick(&mut ship, &stats, &wind, &ports, &empty_harbors(), None);
+        ai.tick(&mut ship, &stats, &wind, &ports, &empty_harbors(), None, None, None);
         ship.tick_resources(&stats);
         
         // Simplified physics
@@ -424,4 +424,111 @@ fn continuous_sailing_with_port_visits() {
     // Should have picked destinations and be sailing or docked (not stuck)
     assert!(ai.nav.destination.is_some() || ship.state == ShipState::Docked,
         "ship should always have a goal");
+}
+
+// ============================================================
+// Trade cycle integration tests (with markets wired in)
+// ============================================================
+
+#[test]
+fn dock_cycle_sells_arriving_cargo_and_buys_outgoing() {
+    use sim_core::goods::{ids, GoodsRegistry};
+    use sim_core::market::{PortArchetype, PortMarket};
+
+    let goods = GoodsRegistry::starter();
+    let stats = ShipStats::sloop();
+    let wind = calm_wind();
+
+    // Two ports far enough apart that arbitrage clears the distance
+    // cost: a sugar surplus at Home, a sugar deficit at Dest.
+    let ports = vec![
+        Port { name: "Home", position: Position { x: 0.0, y: 0.0 }, faction: sim_core::port::Faction::England, harbor_radius_nm: DEFAULT_HARBOR_RADIUS_NM, shipyard: None },
+        Port { name: "Dest", position: Position { x: 30.0, y: 0.0 }, faction: sim_core::port::Faction::Spain, harbor_radius_nm: DEFAULT_HARBOR_RADIUS_NM, shipyard: None },
+    ];
+    let mut markets = vec![
+        PortMarket::with_recipe(&goods, PortArchetype::SugarIsland.recipe()),
+        PortMarket::with_recipe(&goods, PortArchetype::NorthAmericanFarming.recipe()),
+    ];
+    // Bias: surplus of sugar at Home, drain Dest's sugar to zero.
+    markets[0].stockpile.add(ids::SUGAR, 5_000.0);
+    let dest_sugar = markets[1].stockpile.get(ids::SUGAR);
+    markets[1].stockpile.remove(ids::SUGAR, dest_sugar);
+
+    // Ship starts docked at Home with fresh provisions (skip resupply
+    // dwell time) and a small dirty hull so careen passes quickly.
+    let mut ship = Ship::new(Position { x: 0.0, y: 0.0 }, ShipState::Docked);
+    ship.provisions = stats.provision_capacity;
+    ship.hull_fouling = 0.0;
+    let mut ai = ShipAI::with_seed(42);
+    ai.nav.docked_at_port = Some(0); // simulate arrival at Home
+
+    let silver_before = ship.silver;
+
+    // One tick should: SELL_ALL (no-op, empty cargo) → RESUPPLY (no-op, full)
+    // → BUY_BEST (loads sugar, sets destination=Dest) → CAREEN (no-op)
+    // → UNDOCK (success, transitions to Sailing).
+    ai.tick(
+        &mut ship,
+        &stats,
+        &wind,
+        &ports,
+        &empty_harbors(),
+        None,
+        Some(&mut markets),
+        Some(&goods),
+    );
+
+    assert_eq!(ship.state, ShipState::Sailing, "should have undocked");
+    assert_eq!(ai.nav.dest_port, Some(1), "destination should be Dest");
+    assert!(ship.cargo.get(ids::SUGAR) > 0.0, "should have bought sugar");
+    assert!(ship.silver < silver_before, "should have spent silver buying cargo");
+}
+
+#[test]
+fn ship_with_no_profitable_trade_still_undocks() {
+    use sim_core::goods::GoodsRegistry;
+    use sim_core::market::{PortArchetype, PortMarket};
+
+    let goods = GoodsRegistry::starter();
+    let stats = ShipStats::sloop();
+    let wind = calm_wind();
+
+    // Two identical Minor ports — find_best_trade returns None.
+    let ports = vec![
+        Port { name: "A", position: Position { x: 0.0, y: 0.0 }, faction: sim_core::port::Faction::England, harbor_radius_nm: DEFAULT_HARBOR_RADIUS_NM, shipyard: None },
+        Port { name: "B", position: Position { x: 30.0, y: 0.0 }, faction: sim_core::port::Faction::England, harbor_radius_nm: DEFAULT_HARBOR_RADIUS_NM, shipyard: None },
+    ];
+    let mut markets = vec![
+        PortMarket::with_recipe(&goods, PortArchetype::Minor.recipe()),
+        PortMarket::with_recipe(&goods, PortArchetype::Minor.recipe()),
+    ];
+
+    let mut ship = Ship::new(Position { x: 0.0, y: 0.0 }, ShipState::Docked);
+    ship.provisions = stats.provision_capacity;
+    ship.hull_fouling = 0.0;
+    let mut ai = ShipAI::with_seed(42);
+    ai.nav.docked_at_port = Some(0);
+
+    // Up to a few ticks: BUY_BEST returns Success without setting a
+    // destination, so UNDOCK fails, falls through to ACT_CHOOSE_DESTINATION,
+    // then on a subsequent tick UNDOCK succeeds.
+    let mut undocked = false;
+    for _ in 0..5 {
+        ai.tick(
+            &mut ship,
+            &stats,
+            &wind,
+            &ports,
+            &empty_harbors(),
+            None,
+            Some(&mut markets),
+            Some(&goods),
+        );
+        if ship.state == ShipState::Sailing {
+            undocked = true;
+            break;
+        }
+    }
+    assert!(undocked, "ship should still undock via random fallback");
+    assert!(ship.cargo.is_empty(), "no cargo should have been loaded");
 }

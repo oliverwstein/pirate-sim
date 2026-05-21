@@ -47,6 +47,10 @@ pub struct NavState {
     /// harbor-zone arrival in the AI layer; geometric arrival is still used
     /// for free-form destinations (None).
     pub dest_port: Option<usize>,
+    /// Index of the port the ship is currently docked at, if any. Set when
+    /// `ACT_SAIL` transitions into Docked, cleared on undock. Lets dock-time
+    /// behaviors (resupply, careen, trade) find the right port market.
+    pub docked_at_port: Option<usize>,
     /// Ordered intermediate waypoints (front = next target). The final
     /// element should equal `destination` when a path was planned.
     pub waypoints: VecDeque<Position>,
@@ -57,6 +61,7 @@ impl NavState {
         Self {
             destination: None,
             dest_port: None,
+            docked_at_port: None,
             waypoints: VecDeque::new(),
         }
     }
@@ -65,6 +70,7 @@ impl NavState {
         Self {
             destination: Some(dest),
             dest_port: None,
+            docked_at_port: None,
             waypoints: VecDeque::new(),
         }
     }

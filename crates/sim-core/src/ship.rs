@@ -1,13 +1,16 @@
+use crate::cargo::Cargo;
 use crate::types::{Position, WindVector};
 
 /// Ship performance characteristics.
+#[derive(Clone, Debug)]
 pub struct ShipStats {
     pub speed_typical: f32,    // knots in moderate trade winds
     pub speed_max: f32,        // absolute maximum
     pub windward_ability: f32, // 0.0-1.0 (how well it sails upwind)
     pub no_go_half_angle: f32, // degrees from wind that ship cannot sail into
     pub crew: u32,             // crew complement (determines provision consumption)
-    pub provision_capacity: f32, // max tons of provisions
+    pub provision_capacity: f32, // max tons of provisions (separate from trade hold)
+    pub cargo_capacity_tons: f32, // max tons of trade cargo
 }
 
 impl ShipStats {
@@ -18,7 +21,8 @@ impl ShipStats {
             windward_ability: 0.8,
             no_go_half_angle: 40.0,
             crew: 25,
-            provision_capacity: 3.0, // ~40 days of food for 25 crew
+            provision_capacity: 6.0, // ~130 days of food for 25 crew — historical 17C ocean-going ships carried 3–4 months of provisions for transatlantic crossings
+            cargo_capacity_tons: 60.0, // typical sloop trade hold (Phase 2 starter)
         }
     }
 
@@ -26,6 +30,15 @@ impl ShipStats {
     /// Historical: ~4 lbs/man/day total food = 0.0018 tons/man/day.
     pub fn daily_provision_consumption(&self) -> f32 {
         self.crew as f32 * 0.0018
+    }
+
+    /// Estimated voyage time in days for a great-circle distance, used
+    /// for AI reachability/provisioning decisions. The 0.55 factor
+    /// derates `speed_typical` for tacking, calms, and storm slow-downs;
+    /// it's deliberately conservative so the AI plans with a margin.
+    pub fn estimated_voyage_days(&self, distance_nm: f32) -> f32 {
+        let avg_kt = (self.speed_typical * 0.55).max(0.1);
+        distance_nm / (avg_kt * 24.0)
     }
 }
 
@@ -37,14 +50,52 @@ pub enum ShipState {
     Anchored,
 }
 
+/// Default starting silver (pesos) for a freshly-spawned merchant ship.
+/// Roughly enough to fill its provision hold and bunkers a few times over,
+/// and to buy a partial speculative cargo of sugar at base price.
+pub const STARTING_SILVER_PESOS: f32 = 5000.0;
+
 /// A ship: purely physical entity. Heading is set externally by AI/player.
 pub struct Ship {
     pub position: Position,
     pub heading: f32,          // degrees (0=N, 90=E, clockwise)
     pub speed: f32,            // current speed in knots
     pub state: ShipState,
-    pub provisions: f32,       // tons of food remaining
+    pub provisions: f32,       // tons of food remaining (separate from trade hold)
+    pub cargo: Cargo,          // trade goods (subject to cargo_capacity_tons)
     pub hull_fouling: f32,     // 0 = clean, 100 = fully encrusted
+    /// Pesos in the ship's strongbox. Spent at port markets to buy
+    /// provisions and trade goods; earned by selling cargo.
+    pub silver: f32,
+    /// The port that originally launched this ship (its "home port"
+    /// for owner-of-record purposes). `None` for ships spawned by
+    /// tests or seeded into the world outside the shipyard system.
+    /// Stage 2 of the shipbuilding system will use this for
+    /// profit-remittance and refinancing at the home port.
+    pub owner_port: Option<usize>,
+    /// What kind of ship this is. Indexes into the world's
+    /// `ShipTypeRegistry` to look up stats, build cost, etc. Defaults
+    /// to `shiptype::ids::SLOOP` for back-compat with `Ship::new`.
+    pub ship_type: crate::shiptype::ShipTypeId,
+    /// The silver this ship was born with. Stays constant for the
+    /// life of the ship; used by analytics (P/L = silver - starting_silver)
+    /// so newly-built ships can be reported accurately without the
+    /// caller having to race against the build moment.
+    pub starting_silver: f32,
+    /// Cumulative silver this ship has paid back to its owner port
+    /// across all completed voyages. Each time the ship docks at its
+    /// `owner_port`, any silver above the operating float is deposited
+    /// into the port treasury and added here. True lifetime P/L for a
+    /// home-ported ship is `(silver - starting_silver) + lifetime_dividends`.
+    pub lifetime_dividends: f32,
+    /// Outstanding credit drawn from port chandlers/factors —
+    /// either provisions taken on tick when broke, or freight cargo
+    /// (tramping) advanced against the next sale. Repaid out of any
+    /// surplus silver at the next port docking, before dividends.
+    /// Settles fungibly across the port network — historically this
+    /// is what bills of exchange between merchant correspondents
+    /// enabled.
+    pub debt: f32,
 }
 
 impl Ship {
@@ -56,7 +107,42 @@ impl Ship {
             speed: 0.0,
             state,
             provisions: stats.provision_capacity,
+            cargo: Cargo::new(),
             hull_fouling: 0.0,
+            silver: STARTING_SILVER_PESOS,
+            owner_port: None,
+            ship_type: crate::shiptype::ids::SLOOP,
+            starting_silver: STARTING_SILVER_PESOS,
+            lifetime_dividends: 0.0,
+            debt: 0.0,
+        }
+    }
+
+    /// Construct a ship freshly built at a specific shipyard port, with
+    /// a custom amount of starting silver (sized at build time to be
+    /// roughly enough to buy one hold of cargo at the home port). The
+    /// ship's `owner_port` is set so future remittance logic can find it.
+    pub fn freshly_built(
+        position: Position,
+        owner_port: usize,
+        starting_silver: f32,
+        ship_type: crate::shiptype::ShipTypeId,
+        stats: &ShipStats,
+    ) -> Self {
+        Self {
+            position,
+            heading: 0.0,
+            speed: 0.0,
+            state: ShipState::Docked,
+            provisions: stats.provision_capacity,
+            cargo: Cargo::new(),
+            hull_fouling: 0.0,
+            silver: starting_silver,
+            owner_port: Some(owner_port),
+            ship_type,
+            starting_silver,
+            lifetime_dividends: 0.0,
+            debt: 0.0,
         }
     }
 
@@ -127,11 +213,70 @@ impl Ship {
         self.provisions <= 0.0
     }
 
-    /// Resupply provisions for one hour at a port. Returns `true` once
-    /// provisions have reached capacity (the AI uses this as a "done" flag).
+    /// Resupply provisions for one hour at a port without payment. Used
+    /// by tests/scenarios that don't model markets. Returns `true` once
+    /// provisions have reached capacity.
     pub fn tick_resupply(&mut self, stats: &ShipStats) -> bool {
         self.provisions = (self.provisions + RESUPPLY_RATE_PER_HOUR).min(stats.provision_capacity);
         self.provisions >= stats.provision_capacity
+    }
+
+    /// Resupply provisions for one hour at a port market: buy provisions
+    /// from the port's stockpile, paying out of `self.silver` at the
+    /// market's buy price. Returns `true` when no further resupply is
+    /// possible — either the hold is full, the ship is broke, or the
+    /// market is dry.
+    ///
+    /// `goods` provides the canonical PROVISIONS handle and base price.
+    pub fn tick_resupply_at_market(
+        &mut self,
+        stats: &ShipStats,
+        market: &mut crate::market::PortMarket,
+        goods: &crate::goods::GoodsRegistry,
+    ) -> bool {
+        let provisions_id = crate::goods::ids::PROVISIONS;
+        let space = (stats.provision_capacity - self.provisions).max(0.0);
+        if space <= 0.0 {
+            return true;
+        }
+
+        let stockpile = market.stockpile.get(provisions_id);
+        if stockpile <= 0.0 {
+            return true;
+        }
+
+        let unit_price = market.buy_price(provisions_id, goods).max(0.0001);
+
+        // Chandler credit: if we can't pay cash but have debt
+        // headroom (and the port chandler has any silver to lend),
+        // take provisions on tick. The advance is sized to one hour's
+        // resupply rate — small, repeated calls accumulate naturally
+        // for a multi-hour top-up.
+        if self.silver < unit_price * RESUPPLY_RATE_PER_HOUR && self.debt < MAX_SHIP_DEBT {
+            let target_advance = unit_price * RESUPPLY_RATE_PER_HOUR;
+            market.extend_credit(self, target_advance, CHANDLER_PORT_FRACTION_CAP, MAX_SHIP_DEBT);
+        }
+
+        let affordable = self.silver / unit_price;
+
+        let desired = RESUPPLY_RATE_PER_HOUR.min(space).min(stockpile).min(affordable);
+        if desired <= 0.0 {
+            return true;
+        }
+
+        let cost = desired * unit_price;
+        self.silver -= cost;
+        market.silver += cost;
+        market.stockpile.remove(provisions_id, desired);
+        self.provisions += desired;
+
+        // Done when full, broke, or market dry. The "broke" case only
+        // returns true when we couldn't afford even the next slice —
+        // we keep going as long as there's *some* progress this tick.
+        let full = self.provisions >= stats.provision_capacity - 1e-4;
+        let market_dry = market.stockpile.get(provisions_id) <= 0.0;
+        let broke = self.silver < unit_price * 0.05; // less than 5% of an hour's rate
+        full || market_dry || broke
     }
 
     /// Careen the hull for one hour at a port. Returns `true` once the
@@ -153,6 +298,16 @@ const RESUPPLY_RATE_PER_HOUR: f32 = 0.5;
 
 /// Fouling points removed per hour while careening at a port.
 const CAREEN_RATE_PER_HOUR: f32 = 3.0;
+
+/// Maximum outstanding chandler/factor debt a single ship can
+/// accumulate before further credit is refused. Sized to cover a
+/// few hold-fillings of cheap cargo plus a season's provisions.
+pub const MAX_SHIP_DEBT: f32 = 5000.0;
+
+/// Fraction of a port's silver that any single chandler-credit
+/// advance may consume. Keeps a string of broke ships from
+/// draining a small port's working capital.
+pub const CHANDLER_PORT_FRACTION_CAP: f32 = 0.05;
 pub fn speed_at_heading(heading: f32, stats: &ShipStats, wind: &WindVector) -> f32 {
     let wind_to = wind.direction_to();
     let relative_angle = angle_diff(heading, wind_to).abs();
@@ -273,7 +428,88 @@ mod tests {
         let ship = Ship::new(Position::ZERO, ShipState::Sailing);
         let stats = ShipStats::sloop();
         let days = ship.provisions_days_remaining(&stats);
-        // 3.0 tons / (25 * 0.0018 tons/day) = ~66.7 days
-        assert!(days > 60.0 && days < 70.0, "Expected ~67 days, got {}", days);
+        // 6.0 tons / (25 * 0.0018 tons/day) = ~133 days
+        assert!(days > 120.0 && days < 140.0, "Expected ~133 days, got {}", days);
+    }
+
+    #[test]
+    fn test_new_ship_has_empty_cargo() {
+        let ship = Ship::new(Position::ZERO, ShipState::Docked);
+        assert!(ship.cargo.is_empty());
+        assert_eq!(ship.cargo.total_tons(), 0.0);
+    }
+
+    #[test]
+    fn test_cargo_capacity_is_separate_from_provisions() {
+        let stats = ShipStats::sloop();
+        // Cargo hold and provisions hold are independent budgets — a fully
+        // provisioned ship has its entire trade hold still available.
+        assert!(stats.cargo_capacity_tons > 0.0);
+        assert!(stats.provision_capacity > 0.0);
+        assert!(stats.cargo_capacity_tons > stats.provision_capacity,
+            "Trade hold should dwarf the provisions hold for a merchant ship");
+    }
+
+    #[test]
+    fn test_ship_starts_with_silver() {
+        let ship = Ship::new(Position::ZERO, ShipState::Docked);
+        assert!(ship.silver > 0.0);
+    }
+
+    #[test]
+    fn test_market_resupply_consumes_silver_and_stockpile() {
+        use crate::goods::{GoodsRegistry, ids};
+        use crate::market::{PortArchetype, PortMarket};
+
+        let goods = GoodsRegistry::starter();
+        let mut market = PortMarket::with_recipe(&goods, PortArchetype::NorthAmericanFarming.recipe());
+        let stats = ShipStats::sloop();
+        let mut ship = Ship::new(Position::ZERO, ShipState::Docked);
+        ship.provisions = 0.0; // Empty hold.
+
+        let ship_silver_before = ship.silver;
+        let port_silver_before = market.silver;
+        let stockpile_before = market.stockpile.get(ids::PROVISIONS);
+
+        // Tick to completion (or 200 hours, whichever first).
+        let mut iters = 0;
+        while !ship.tick_resupply_at_market(&stats, &mut market, &goods) && iters < 200 {
+            iters += 1;
+        }
+
+        // Hold should be at (or very near) capacity.
+        assert!(ship.provisions > stats.provision_capacity * 0.99,
+            "expected near-full provisions, got {}", ship.provisions);
+        // Silver moved from ship to port.
+        assert!(ship.silver < ship_silver_before, "ship should have spent silver");
+        assert!(market.silver > port_silver_before, "port should have earned silver");
+        // Spent ≈ earned (no leakage; small float drift over many ticks).
+        let spent = ship_silver_before - ship.silver;
+        let earned = market.silver - port_silver_before;
+        assert!((spent - earned).abs() < 0.5,
+            "spent {} vs earned {}", spent, earned);
+        // Stockpile dropped by ≈ amount loaded.
+        assert!(market.stockpile.get(ids::PROVISIONS) < stockpile_before);
+    }
+
+    #[test]
+    fn test_market_resupply_halts_when_market_dry() {
+        use crate::goods::{GoodsRegistry, ids};
+        use crate::market::{PortArchetype, PortMarket};
+
+        let goods = GoodsRegistry::starter();
+        let mut market = PortMarket::with_recipe(&goods, PortArchetype::NorthAmericanFarming.recipe());
+        // Drain the market.
+        let stockpile = market.stockpile.get(ids::PROVISIONS);
+        market.stockpile.remove(ids::PROVISIONS, stockpile);
+
+        let stats = ShipStats::sloop();
+        let mut ship = Ship::new(Position::ZERO, ShipState::Docked);
+        ship.provisions = 0.0;
+        let provisions_before = ship.provisions;
+        // Single tick should flag done immediately.
+        let done = ship.tick_resupply_at_market(&stats, &mut market, &goods);
+        assert!(done);
+        assert_eq!(ship.provisions, provisions_before, "no provisions should load when market is dry");
     }
 }

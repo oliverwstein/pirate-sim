@@ -1,3 +1,4 @@
+use crate::shiptype::{ids as st_ids, ShipTypeId};
 use crate::types::Position;
 
 /// Faction allegiance (simplified for Phase 1).
@@ -32,6 +33,28 @@ pub struct Port {
     /// arrival/docking purposes. Larger values are useful for ports that sit
     /// up rivers or estuaries (Philadelphia, New York, New Orleans, etc.).
     pub harbor_radius_nm: f32,
+    /// If this port has a shipyard, the list of ship types it is
+    /// equipped to build. `None` means no yard. Historically yards
+    /// specialized: Bermuda's cedar suited only sloops; Amsterdam
+    /// pioneered the fluyt; Cadiz's royal yards built large ships.
+    pub shipyard: Option<&'static [ShipTypeId]>,
+}
+
+/// Per-port shipyard specifications used by `all_ports()`. Yards not
+/// listed here have `shipyard: None`.
+const SHIPYARDS: &[(&str, &[ShipTypeId])] = &[
+    ("Bermuda",      &[st_ids::SLOOP]),
+    ("Boston",       &[st_ids::SLOOP, st_ids::BRIGANTINE, st_ids::BARK]),
+    ("Philadelphia", &[st_ids::SLOOP, st_ids::BRIGANTINE]),
+    ("Nantes",       &[st_ids::BARK, st_ids::SHIP]),
+    ("Cadiz",        &[st_ids::SHIP]),
+    ("London",       &[st_ids::BRIGANTINE, st_ids::BARK, st_ids::SHIP]),
+    ("Amsterdam",    &[st_ids::FLUYT, st_ids::SHIP]),
+];
+
+/// Lookup helper: the buildable ship types at this port (or `None`).
+pub fn buildable_at(name: &str) -> Option<&'static [ShipTypeId]> {
+    SHIPYARDS.iter().find(|(n, _)| *n == name).map(|(_, list)| *list)
 }
 
 /// Default harbor radius (NM) used when a port doesn't specify one.
@@ -46,6 +69,7 @@ pub fn all_ports() -> Vec<Port> {
             position: Position::new(*x, *y),
             faction: *faction,
             harbor_radius_nm: *radius,
+            shipyard: buildable_at(name),
         })
         .collect()
 }
@@ -90,4 +114,25 @@ const PORTS: &[(&str, f32, f32, Faction, f32)] = &[
     ("Tortuga", -16.8, 152.4, Faction::Pirate, D),
     ("Nassau", -291.0, 453.0, Faction::Pirate, D),
     ("Tobago", 709.8, -375.0, Faction::Pirate, D),
+    // === EUROPE ===
+    // Coordinates are equirectangular: x = (lon - (-72.5°)) × 60,
+    // Coords approximate equirectangular: x = (lon + 72.5) × 60,
+    // y = (lat - 17.5°) × 60. Map extends to x ≈ 5250, y ≈ 2550, so
+    // these all fit. Larger harbor radii because real-world approaches
+    // (Thames, Ijmuiden, Bay of Cadiz, Loire estuary) span 10–30 NM.
+    // London is placed at the Nore anchorage (Thames Estuary mouth, ~51.5°N
+    // 1°E) rather than the City — at 1-NM grid resolution the Thames itself
+    // is too narrow to leave open-water cells, and ocean-going ships of the
+    // 1680s anchored at the Nore for cargo transfer to lighters anyway.
+    ("London", 4410.0, 2040.0, Faction::England, 30.0),       // 51.5°N 1°E (Nore anchorage)
+    ("Amsterdam", 4644.0, 2092.0, Faction::Holland, 25.0),    // 52.4°N 4.9°E (Ijmuiden / North Sea)
+    ("Cadiz", 3972.0, 1142.0, Faction::Spain, 20.0),          // 36.5°N 6.3°W (Bay of Cadiz)
+    // Nantes proper sits 30 NM up the Loire — the seagoing anchorage was at
+    // Paimboeuf / mouth of the estuary near St-Nazaire (47.3°N, 2.2°W).
+    ("Nantes", 4218.0, 1788.0, Faction::France, 25.0),        // 47.3°N 2.2°W (Loire estuary mouth)
+    // === WEST AFRICA ===
+    // Slave-trade ports. Stand-ins for the much wider Gold Coast and
+    // Bight of Benin trade networks.
+    ("Elmina", 4269.0, -745.0, Faction::Holland, 15.0),       // 5.1°N 1.4°W (Dutch since 1637)
+    ("Ouidah", 4470.0, -666.0, Faction::France, 15.0),        // 6.4°N 2.1°E
 ];

@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 glam = "0.29"
 bytemuck = { version = "1", features = ["derive"] }
+microlp = "0.4"
 
 [dev-dependencies]
 rstest = "0.23"
