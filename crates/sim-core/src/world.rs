@@ -111,6 +111,8 @@ impl World {
                 &self.ports,
                 &self.harbors,
                 Some(&pathfind),
+                Some(&mut self.markets),
+                Some(&self.goods),
             );
 
             // Resource consumption

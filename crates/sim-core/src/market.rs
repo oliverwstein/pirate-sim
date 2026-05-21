@@ -17,6 +17,11 @@ use crate::goods::{GoodId, GoodsRegistry};
 /// in step 4.
 const INITIAL_STOCKPILE_TONS: f32 = 1000.0;
 
+/// Starting silver in a port's treasury. Used to settle ship sales
+/// against the port. Big enough that no port goes broke in the first
+/// month of trading; production tick doesn't (yet) replenish it.
+const INITIAL_PORT_SILVER_PESOS: f32 = 50_000.0;
+
 /// Buy/sell spread (port "vig"). Buying costs base × (1 + SPREAD);
 /// selling earns base × (1 - SPREAD). Stops infinite arbitrage of a
 /// stationary stockpile.
@@ -74,7 +79,7 @@ impl PortMarket {
         }
         Self {
             stockpile,
-            silver: 0.0,
+            silver: INITIAL_PORT_SILVER_PESOS,
             recipe: ProductionRecipe::empty(),
             is_europe_gateway: false,
         }
@@ -104,7 +109,7 @@ impl PortMarket {
         }
         Self {
             stockpile,
-            silver: 0.0,
+            silver: INITIAL_PORT_SILVER_PESOS,
             recipe,
             is_europe_gateway,
         }
@@ -164,6 +169,80 @@ impl PortMarket {
             .map(|(_, t)| *t * 6.0);
         from_outputs.or(from_inputs).unwrap_or(0.0)
     }
+
+    /// Buy `requested_tons` of `id` from this market on behalf of `ship`.
+    /// Atomic: either the full requested amount transacts or nothing
+    /// changes. Returns the cost in pesos on success.
+    ///
+    /// Fails when the ship lacks silver, the cargo hold lacks room, or
+    /// the market lacks stockpile.
+    pub fn buy(
+        &mut self,
+        ship: &mut crate::ship::Ship,
+        ship_stats: &crate::ship::ShipStats,
+        id: GoodId,
+        requested_tons: f32,
+        registry: &GoodsRegistry,
+    ) -> Result<f32, TradeError> {
+        if requested_tons <= 0.0 {
+            return Err(TradeError::NonPositiveAmount);
+        }
+        let unit = self.buy_price(id, registry);
+        let cost = unit * requested_tons;
+        if cost > ship.silver + 1e-4 {
+            return Err(TradeError::InsufficientSilver);
+        }
+        let cargo_room = ship_stats.cargo_capacity_tons - ship.cargo.total_tons();
+        if requested_tons > cargo_room + 1e-4 {
+            return Err(TradeError::InsufficientCargoSpace);
+        }
+        if requested_tons > self.stockpile.get(id) + 1e-4 {
+            return Err(TradeError::InsufficientStockpile);
+        }
+        ship.silver -= cost;
+        self.silver += cost;
+        self.stockpile.remove(id, requested_tons);
+        ship.cargo.add(id, requested_tons);
+        Ok(cost)
+    }
+
+    /// Sell `requested_tons` of `id` from `ship` into this market.
+    /// Atomic. Returns proceeds in pesos on success.
+    pub fn sell(
+        &mut self,
+        ship: &mut crate::ship::Ship,
+        id: GoodId,
+        requested_tons: f32,
+        registry: &GoodsRegistry,
+    ) -> Result<f32, TradeError> {
+        if requested_tons <= 0.0 {
+            return Err(TradeError::NonPositiveAmount);
+        }
+        if requested_tons > ship.cargo.get(id) + 1e-4 {
+            return Err(TradeError::InsufficientShipCargo);
+        }
+        let unit = self.sell_price(id, registry);
+        let proceeds = unit * requested_tons;
+        if proceeds > self.silver + 1e-4 {
+            return Err(TradeError::InsufficientPortSilver);
+        }
+        ship.cargo.remove(id, requested_tons);
+        self.stockpile.add(id, requested_tons);
+        self.silver -= proceeds;
+        ship.silver += proceeds;
+        Ok(proceeds)
+    }
+}
+
+/// Why a buy/sell transaction was rejected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TradeError {
+    NonPositiveAmount,
+    InsufficientSilver,
+    InsufficientCargoSpace,
+    InsufficientStockpile,
+    InsufficientShipCargo,
+    InsufficientPortSilver,
 }
 
 /// Historical archetype for a port, used to assign a default recipe.
@@ -422,5 +501,111 @@ mod tests {
         assert!(matches!(archetype_for("Tortuga").0, PortArchetype::PirateHaven));
         // Unknown port falls back to Minor.
         assert!(matches!(archetype_for("Atlantis").0, PortArchetype::Minor));
+    }
+
+    #[test]
+    fn buy_transfers_goods_silver_and_stockpile() {
+        use crate::ship::{Ship, ShipState, ShipStats};
+        use crate::types::Position;
+
+        let registry = GoodsRegistry::starter();
+        let mut market = PortMarket::with_recipe(
+            &registry,
+            PortArchetype::SugarIsland.recipe(),
+            false,
+        );
+        let stats = ShipStats::sloop();
+        let mut ship = Ship::new(Position::ZERO, ShipState::Docked);
+
+        let ship_silver_before = ship.silver;
+        let port_silver_before = market.silver;
+        let stockpile_before = market.stockpile.get(ids::SUGAR);
+        let cost = market.buy(&mut ship, &stats, ids::SUGAR, 5.0, &registry).unwrap();
+
+        // Ship paid; port received; stockpile decreased; cargo grew.
+        assert!((ship.silver - (ship_silver_before - cost)).abs() < 1e-3);
+        assert!((market.silver - (port_silver_before + cost)).abs() < 1e-3);
+        assert!((market.stockpile.get(ids::SUGAR) - (stockpile_before - 5.0)).abs() < 1e-3);
+        assert!((ship.cargo.get(ids::SUGAR) - 5.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn buy_rejects_when_broke() {
+        use crate::ship::{Ship, ShipState, ShipStats};
+        use crate::types::Position;
+
+        let registry = GoodsRegistry::starter();
+        let mut market = PortMarket::with_recipe(
+            &registry,
+            PortArchetype::SugarIsland.recipe(),
+            false,
+        );
+        let stats = ShipStats::sloop();
+        let mut ship = Ship::new(Position::ZERO, ShipState::Docked);
+        ship.silver = 1.0;
+        let result = market.buy(&mut ship, &stats, ids::SUGAR, 50.0, &registry);
+        assert_eq!(result, Err(TradeError::InsufficientSilver));
+        // Ship still has its silver; cargo still empty.
+        assert_eq!(ship.silver, 1.0);
+        assert!(ship.cargo.is_empty());
+    }
+
+    #[test]
+    fn buy_rejects_when_hold_full() {
+        use crate::ship::{Ship, ShipState, ShipStats};
+        use crate::types::Position;
+
+        let registry = GoodsRegistry::starter();
+        let mut market = PortMarket::with_recipe(
+            &registry,
+            PortArchetype::SugarIsland.recipe(),
+            false,
+        );
+        let stats = ShipStats::sloop();
+        let mut ship = Ship::new(Position::ZERO, ShipState::Docked);
+        // Pre-load cargo to capacity.
+        ship.cargo.add(ids::TOBACCO, stats.cargo_capacity_tons);
+        let result = market.buy(&mut ship, &stats, ids::SUGAR, 1.0, &registry);
+        assert_eq!(result, Err(TradeError::InsufficientCargoSpace));
+    }
+
+    #[test]
+    fn sell_round_trip_loses_money_to_spread() {
+        use crate::ship::{Ship, ShipState, ShipStats};
+        use crate::types::Position;
+
+        let registry = GoodsRegistry::starter();
+        let mut market = PortMarket::with_recipe(
+            &registry,
+            PortArchetype::SugarIsland.recipe(),
+            false,
+        );
+        let stats = ShipStats::sloop();
+        let mut ship = Ship::new(Position::ZERO, ShipState::Docked);
+        let initial_silver = ship.silver;
+
+        // Tiny round trip: buy 1t and immediately sell it back.
+        market.buy(&mut ship, &stats, ids::SUGAR, 1.0, &registry).unwrap();
+        market.sell(&mut ship, ids::SUGAR, 1.0, &registry).unwrap();
+
+        // Spread must take a bite — ship strictly poorer.
+        assert!(ship.silver < initial_silver);
+        assert!(ship.cargo.is_empty());
+    }
+
+    #[test]
+    fn sell_rejects_more_than_ship_carries() {
+        use crate::ship::{Ship, ShipState};
+        use crate::types::Position;
+
+        let registry = GoodsRegistry::starter();
+        let mut market = PortMarket::with_recipe(
+            &registry,
+            PortArchetype::SugarIsland.recipe(),
+            false,
+        );
+        let mut ship = Ship::new(Position::ZERO, ShipState::Docked);
+        let result = market.sell(&mut ship, ids::SUGAR, 1.0, &registry);
+        assert_eq!(result, Err(TradeError::InsufficientShipCargo));
     }
 }

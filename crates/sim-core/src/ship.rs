@@ -40,6 +40,11 @@ pub enum ShipState {
     Anchored,
 }
 
+/// Default starting silver (pesos) for a freshly-spawned merchant ship.
+/// Roughly enough to fill its provision hold and bunkers a few times over,
+/// and to buy a partial speculative cargo of sugar at base price.
+pub const STARTING_SILVER_PESOS: f32 = 5000.0;
+
 /// A ship: purely physical entity. Heading is set externally by AI/player.
 pub struct Ship {
     pub position: Position,
@@ -49,6 +54,9 @@ pub struct Ship {
     pub provisions: f32,       // tons of food remaining (separate from trade hold)
     pub cargo: Cargo,          // trade goods (subject to cargo_capacity_tons)
     pub hull_fouling: f32,     // 0 = clean, 100 = fully encrusted
+    /// Pesos in the ship's strongbox. Spent at port markets to buy
+    /// provisions and trade goods; earned by selling cargo.
+    pub silver: f32,
 }
 
 impl Ship {
@@ -62,6 +70,7 @@ impl Ship {
             provisions: stats.provision_capacity,
             cargo: Cargo::new(),
             hull_fouling: 0.0,
+            silver: STARTING_SILVER_PESOS,
         }
     }
 
@@ -132,11 +141,59 @@ impl Ship {
         self.provisions <= 0.0
     }
 
-    /// Resupply provisions for one hour at a port. Returns `true` once
-    /// provisions have reached capacity (the AI uses this as a "done" flag).
+    /// Resupply provisions for one hour at a port without payment. Used
+    /// by tests/scenarios that don't model markets. Returns `true` once
+    /// provisions have reached capacity.
     pub fn tick_resupply(&mut self, stats: &ShipStats) -> bool {
         self.provisions = (self.provisions + RESUPPLY_RATE_PER_HOUR).min(stats.provision_capacity);
         self.provisions >= stats.provision_capacity
+    }
+
+    /// Resupply provisions for one hour at a port market: buy provisions
+    /// from the port's stockpile, paying out of `self.silver` at the
+    /// market's buy price. Returns `true` when no further resupply is
+    /// possible — either the hold is full, the ship is broke, or the
+    /// market is dry.
+    ///
+    /// `goods` provides the canonical PROVISIONS handle and base price.
+    pub fn tick_resupply_at_market(
+        &mut self,
+        stats: &ShipStats,
+        market: &mut crate::market::PortMarket,
+        goods: &crate::goods::GoodsRegistry,
+    ) -> bool {
+        let provisions_id = crate::goods::ids::PROVISIONS;
+        let space = (stats.provision_capacity - self.provisions).max(0.0);
+        if space <= 0.0 {
+            return true;
+        }
+
+        let stockpile = market.stockpile.get(provisions_id);
+        if stockpile <= 0.0 {
+            return true;
+        }
+
+        let unit_price = market.buy_price(provisions_id, goods).max(0.0001);
+        let affordable = self.silver / unit_price;
+
+        let desired = RESUPPLY_RATE_PER_HOUR.min(space).min(stockpile).min(affordable);
+        if desired <= 0.0 {
+            return true;
+        }
+
+        let cost = desired * unit_price;
+        self.silver -= cost;
+        market.silver += cost;
+        market.stockpile.remove(provisions_id, desired);
+        self.provisions += desired;
+
+        // Done when full, broke, or market dry. The "broke" case only
+        // returns true when we couldn't afford even the next slice —
+        // we keep going as long as there's *some* progress this tick.
+        let full = self.provisions >= stats.provision_capacity - 1e-4;
+        let market_dry = market.stockpile.get(provisions_id) <= 0.0;
+        let broke = self.silver < unit_price * 0.05; // less than 5% of an hour's rate
+        full || market_dry || broke
     }
 
     /// Careen the hull for one hour at a port. Returns `true` once the
@@ -298,5 +355,75 @@ mod tests {
         assert!(stats.provision_capacity > 0.0);
         assert!(stats.cargo_capacity_tons > stats.provision_capacity,
             "Trade hold should dwarf the provisions hold for a merchant ship");
+    }
+
+    #[test]
+    fn test_ship_starts_with_silver() {
+        let ship = Ship::new(Position::ZERO, ShipState::Docked);
+        assert!(ship.silver > 0.0);
+    }
+
+    #[test]
+    fn test_market_resupply_consumes_silver_and_stockpile() {
+        use crate::goods::{GoodsRegistry, ids};
+        use crate::market::{PortArchetype, PortMarket};
+
+        let goods = GoodsRegistry::starter();
+        let mut market = PortMarket::with_recipe(
+            &goods,
+            PortArchetype::NorthAmericanFarming.recipe(),
+            true,
+        );
+        let stats = ShipStats::sloop();
+        let mut ship = Ship::new(Position::ZERO, ShipState::Docked);
+        ship.provisions = 0.0; // Empty hold.
+
+        let ship_silver_before = ship.silver;
+        let port_silver_before = market.silver;
+        let stockpile_before = market.stockpile.get(ids::PROVISIONS);
+
+        // Tick to completion (or 200 hours, whichever first).
+        let mut iters = 0;
+        while !ship.tick_resupply_at_market(&stats, &mut market, &goods) && iters < 200 {
+            iters += 1;
+        }
+
+        // Hold should be at (or very near) capacity.
+        assert!(ship.provisions > stats.provision_capacity * 0.99,
+            "expected near-full provisions, got {}", ship.provisions);
+        // Silver moved from ship to port.
+        assert!(ship.silver < ship_silver_before, "ship should have spent silver");
+        assert!(market.silver > port_silver_before, "port should have earned silver");
+        // Spent ≈ earned (no leakage).
+        let spent = ship_silver_before - ship.silver;
+        let earned = market.silver - port_silver_before;
+        assert!((spent - earned).abs() < 1e-2);
+        // Stockpile dropped by ≈ amount loaded.
+        assert!(market.stockpile.get(ids::PROVISIONS) < stockpile_before);
+    }
+
+    #[test]
+    fn test_market_resupply_halts_when_market_dry() {
+        use crate::goods::{GoodsRegistry, ids};
+        use crate::market::{PortArchetype, PortMarket};
+
+        let goods = GoodsRegistry::starter();
+        let mut market = PortMarket::with_recipe(
+            &goods,
+            PortArchetype::NorthAmericanFarming.recipe(),
+            false,
+        );
+        // Drain the market.
+        let stockpile = market.stockpile.get(ids::PROVISIONS);
+        market.stockpile.remove(ids::PROVISIONS, stockpile);
+
+        let stats = ShipStats::sloop();
+        let mut ship = Ship::new(Position::ZERO, ShipState::Docked);
+        ship.provisions = 0.0;
+        let provisions_before = ship.provisions;
+        // Single tick should flag done immediately.
+        let done = ship.tick_resupply_at_market(&stats, &mut market, &goods);
+        assert!(done);
+        assert_eq!(ship.provisions, provisions_before, "no provisions should load when market is dry");
     }
 }

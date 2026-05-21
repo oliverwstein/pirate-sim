@@ -15,7 +15,9 @@
 //! ]
 
 use crate::bt::{self, Behavior, BtContext, BtState, Status};
+use crate::goods::GoodsRegistry;
 use crate::harbor::HarborMap;
+use crate::market::PortMarket;
 use crate::nav::NavState;
 use crate::pathfind::{self, PathfindContext};
 use crate::port::Port;
@@ -129,6 +131,11 @@ impl ShipAI {
     /// waypoint routes whenever it picks a new destination. When `None` it
     /// falls back to straight-line navigation (useful for unit tests with
     /// synthetic toy ports).
+    ///
+    /// `markets` and `goods`, when both `Some`, route resupply through the
+    /// docked port's market (consuming silver and stockpile). When either
+    /// is `None`, resupply is free — used by toy/demo tests that don't
+    /// model an economy.
     pub fn tick(
         &mut self,
         ship: &mut Ship,
@@ -137,6 +144,8 @@ impl ShipAI {
         ports: &[Port],
         harbors: &HarborMap,
         pathfind: Option<&PathfindContext<'_>>,
+        markets: Option<&mut [PortMarket]>,
+        goods: Option<&GoodsRegistry>,
     ) {
         let mut ctx = ShipBtContext {
             ship,
@@ -148,6 +157,8 @@ impl ShipAI {
             harbors,
             rng_state: &mut self.rng_state,
             pathfind,
+            markets,
+            goods,
         };
 
         let status = bt::tick(&self.tree, &mut self.state, &mut ctx, 0);
@@ -187,6 +198,8 @@ struct ShipBtContext<'a> {
     harbors: &'a HarborMap,
     rng_state: &'a mut u64,
     pathfind: Option<&'a PathfindContext<'a>>,
+    markets: Option<&'a mut [PortMarket]>,
+    goods: Option<&'a GoodsRegistry>,
 }
 
 impl<'a> ShipBtContext<'a> {
@@ -244,8 +257,10 @@ impl<'a> BtContext for ShipBtContext<'a> {
                 // port coordinate may still be far away (e.g., Philadelphia
                 // up the Delaware) — that's fine.
                 if self.in_destination_harbor() {
+                    let port_idx = self.nav.dest_port;
                     self.ship.dock();
                     *self.dock_action = DockAction::Idle;
+                    self.nav.docked_at_port = port_idx;
                     self.nav.destination = None;
                     self.nav.dest_port = None;
                     self.nav.clear_path();
@@ -280,7 +295,15 @@ impl<'a> BtContext for ShipBtContext<'a> {
             }
             ACT_RESUPPLY => {
                 *self.dock_action = DockAction::Resupplying;
-                if self.ship.tick_resupply(self.stats) {
+                let done = match (self.nav.docked_at_port, self.markets.as_deref_mut(), self.goods) {
+                    (Some(idx), Some(markets), Some(goods)) if idx < markets.len() => {
+                        self.ship.tick_resupply_at_market(self.stats, &mut markets[idx], goods)
+                    }
+                    // No market wired (test scenario, or unknown port) —
+                    // fall back to free resupply so legacy tests pass.
+                    _ => self.ship.tick_resupply(self.stats),
+                };
+                if done {
                     *self.dock_action = DockAction::Idle;
                     Status::Success
                 } else {
@@ -299,6 +322,7 @@ impl<'a> BtContext for ShipBtContext<'a> {
             ACT_UNDOCK => {
                 if self.nav.destination.is_some() {
                     self.ship.undock();
+                    self.nav.docked_at_port = None;
                     *self.dock_action = DockAction::Idle;
                     Status::Success
                 } else {
