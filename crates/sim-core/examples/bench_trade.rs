@@ -37,7 +37,6 @@ fn main() {
         ("Amsterdam", 89),
         ("Nantes", 97),
     ];
-    let mut starting_silver = Vec::new();
     let mut origin_names = Vec::new();
     for (name, seed) in starts {
         let Some(idx) = world.ports.iter().position(|p| p.name == *name) else {
@@ -48,7 +47,6 @@ fn main() {
         let ship = Ship::new(port_pos, ShipState::Docked);
         let mut ai = ShipAI::with_seed(*seed);
         ai.nav.docked_at_port = Some(idx);
-        starting_silver.push(ship.silver);
         origin_names.push(*name);
         world.add_ship(ship, ai);
     }
@@ -82,11 +80,11 @@ fn main() {
     // Simulate.
     for h in 1..=SIM_HOURS {
         world.tick();
-        // Snapshot any newly-built ships' starting silver so we can
-        // report a meaningful P/L for them at the end.
-        while world.ships.len() > starting_silver.len() {
-            let i = starting_silver.len();
-            starting_silver.push(world.ships[i].silver);
+        // Track origin names for any newly-built ships so the report
+        // can label them. Their starting silver lives on the Ship
+        // itself (`ship.starting_silver`), so there's no race here.
+        while world.ships.len() > origin_names.len() {
+            let i = origin_names.len();
             let owner_name = world.ships[i]
                 .owner_port
                 .and_then(|idx| world.ports.get(idx).map(|p| p.name))
@@ -117,7 +115,7 @@ fn main() {
     let mut total_pl = 0.0f32;
     let mut bankrupt = 0;
     for (i, ship) in world.ships.iter().enumerate() {
-        let pl = ship.silver - starting_silver[i];
+        let pl = ship.silver - ship.starting_silver;
         total_pl += pl;
         if ship.silver < 50.0 {
             bankrupt += 1;
@@ -135,7 +133,7 @@ fn main() {
         let type_name = world.ship_types.get(ship.ship_type).name;
         println!(
             "{:<3}  {:<14}  {:<10}  {:>10.0}  {:>10.0}  {:>+10.0}  {:<10}  {:<30}{}",
-            i, origin_names[i], type_name, starting_silver[i], ship.silver, pl, state, cargo.join(","), built_tag
+            i, origin_names[i], type_name, ship.starting_silver, ship.silver, pl, state, cargo.join(","), built_tag
         );
     }
     println!();
@@ -246,8 +244,8 @@ fn main() {
     // (geography matters).
     println!();
     println!("Calibration verdict:");
-    let losers = world.ships.iter().enumerate()
-        .filter(|(i, s)| *i < starting_silver.len() && s.silver < starting_silver[*i])
+    let losers = world.ships.iter()
+        .filter(|s| s.silver < s.starting_silver)
         .count();
     if bankrupt > 0 {
         println!(
@@ -259,7 +257,7 @@ fn main() {
             "  ⚠ {} ship(s) ended in the red — successful voyages should reliably profit",
             losers
         );
-    } else if total_pl < starting_silver.iter().sum::<f32>() * 0.5 {
+    } else if total_pl < world.ships.iter().map(|s| s.starting_silver).sum::<f32>() * 0.5 {
         println!(
             "  ⚠ fleet barely profitable — trade margins or world prices may be too thin"
         );

@@ -77,6 +77,11 @@ pub struct Ship {
     /// `ShipTypeRegistry` to look up stats, build cost, etc. Defaults
     /// to `shiptype::ids::SLOOP` for back-compat with `Ship::new`.
     pub ship_type: crate::shiptype::ShipTypeId,
+    /// The silver this ship was born with. Stays constant for the
+    /// life of the ship; used by analytics (P/L = silver - starting_silver)
+    /// so newly-built ships can be reported accurately without the
+    /// caller having to race against the build moment.
+    pub starting_silver: f32,
 }
 
 impl Ship {
@@ -93,6 +98,7 @@ impl Ship {
             silver: STARTING_SILVER_PESOS,
             owner_port: None,
             ship_type: crate::shiptype::ids::SLOOP,
+            starting_silver: STARTING_SILVER_PESOS,
         }
     }
 
@@ -118,6 +124,7 @@ impl Ship {
             silver: starting_silver,
             owner_port: Some(owner_port),
             ship_type,
+            starting_silver,
         }
     }
 
