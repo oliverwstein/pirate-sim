@@ -5,6 +5,7 @@ use crate::coastline::{CoastlineMap, LandMesh};
 use crate::goods::GoodsRegistry;
 use crate::harbor::HarborMap;
 use crate::map::MapSystem;
+use crate::market::PortMarket;
 use crate::navmesh::Navmesh;
 use crate::pathfind::PathfindContext;
 use crate::port::{Port, all_ports};
@@ -21,6 +22,8 @@ pub struct World {
     pub coastline: CoastlineMap,
     pub land_mesh: LandMesh,
     pub goods: GoodsRegistry,
+    /// Per-port economic state, parallel to `ports` (index = port index).
+    pub markets: Vec<PortMarket>,
     pub ships: Vec<Ship>,
     pub ship_ais: Vec<ShipAI>,
     pub date: SimDate,
@@ -37,6 +40,11 @@ impl World {
             .unwrap_or_default();
         let land_mesh = LandMesh::load(&data_dir.join("grids/land_polys.bin"))
             .unwrap_or_default();
+        let goods = GoodsRegistry::starter();
+        let markets: Vec<PortMarket> = ports
+            .iter()
+            .map(|_| PortMarket::with_initial_stockpile(&goods))
+            .collect();
 
         Self {
             map,
@@ -46,7 +54,8 @@ impl World {
             navmesh,
             coastline,
             land_mesh,
-            goods: GoodsRegistry::starter(),
+            goods,
+            markets,
             ships: Vec::new(),
             ship_ais: Vec::new(),
             date: SimDate::new(1680, 0, 1),
