@@ -13,10 +13,13 @@ use crate::market::PortMarket;
 use crate::port::Port;
 
 /// Approximate per-ton-mile cost charged against arbitrage profits.
-/// Captures wages, victualling, hull wear, insurance, and convoy fees
-/// in a single coarse number. Tuned so a 1500 NM run costs ~3 pesos/t,
-/// leaving room for arbitrage on most goods.
-pub const TRADE_COST_PER_TON_NM: f32 = 0.002;
+/// Captures wages, victualling, hull wear, and convoy fees in a single
+/// coarse number. Tuned so a 1500 NM run costs ~1.5 pesos/t — long
+/// hauls remain viable so non-gateway ports can profitably feed
+/// gateways. (Piracy/wreck risk is intentionally NOT priced in here;
+/// in the absence of those threats, successful voyages should be
+/// reliably profitable.)
+pub const TRADE_COST_PER_TON_NM: f32 = 0.001;
 
 /// Below this margin (pesos / ton) we consider a trade not worth doing
 /// and the ship sails ballast to the next port the AI picks.

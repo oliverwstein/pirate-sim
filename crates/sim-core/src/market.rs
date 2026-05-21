@@ -26,7 +26,7 @@ const INITIAL_PORT_SILVER_PESOS: f32 = 50_000.0;
 /// a ship hauling 60 t of sugar Caribbean→England-gateway makes a
 /// solid profit even after the Atlantic-leg distance cost the planner
 /// will model in later phases. Tuned coarsely; revisit in step 9.
-pub const WORLD_EXPORT_PREMIUM: f32 = 1.30;
+pub const WORLD_EXPORT_PREMIUM: f32 = 1.40;
 
 /// What Europe sells imported goods for (per ton, at base price).
 pub const WORLD_IMPORT_DISCOUNT: f32 = 0.90;
@@ -173,29 +173,44 @@ impl PortMarket {
     /// Price a ship pays per ton to buy `id` (above the local mid).
     /// At a Europe-gateway port, import goods are capped at the world
     /// price — Europe is an infinite supplier, so the local market
-    /// can't gouge above that ceiling.
+    /// can't gouge above that ceiling. Symmetrically, export goods are
+    /// floored at the world premium: Europe is also there to buy at
+    /// world rate, so a ship can't undercut Europe and scoop up cheap
+    /// gluts. (Without this, a ship could buy local-glut tobacco at
+    /// 0.25× base and resell at the next gateway's world floor for a
+    /// 5× margin.)
     pub fn buy_price(&self, id: GoodId, registry: &GoodsRegistry) -> f32 {
         let local = self.price(id, registry) * (1.0 + PRICE_SPREAD);
-        if self.is_europe_gateway && is_europe_import(id) {
-            let world = registry.get(id).base_price_pesos * WORLD_IMPORT_DISCOUNT;
-            local.min(world)
-        } else {
-            local
+        if self.is_europe_gateway {
+            let base = registry.get(id).base_price_pesos;
+            if is_europe_import(id) {
+                return local.min(base * WORLD_IMPORT_DISCOUNT);
+            }
+            if is_europe_export(id) {
+                return local.max(base * WORLD_EXPORT_PREMIUM);
+            }
         }
+        local
     }
 
     /// Price a ship receives per ton selling `id` (below the local mid).
     /// At a Europe-gateway port, export goods are floored at the world
-    /// price — Europe is an infinite buyer, so a local sugar glut can't
-    /// crush the price below the Europe-bound ship's reservation.
+    /// premium — Europe is an infinite buyer at that rate. Imports at
+    /// a gateway are capped at the world discount: Europe is also
+    /// dumping manufactures locally at world price, so a ship arriving
+    /// with manufactures can't extract more than that.
     pub fn sell_price(&self, id: GoodId, registry: &GoodsRegistry) -> f32 {
         let local = self.price(id, registry) * (1.0 - PRICE_SPREAD);
-        if self.is_europe_gateway && is_europe_export(id) {
-            let world = registry.get(id).base_price_pesos * WORLD_EXPORT_PREMIUM;
-            local.max(world)
-        } else {
-            local
+        if self.is_europe_gateway {
+            let base = registry.get(id).base_price_pesos;
+            if is_europe_export(id) {
+                return local.max(base * WORLD_EXPORT_PREMIUM);
+            }
+            if is_europe_import(id) {
+                return local.min(base * WORLD_IMPORT_DISCOUNT);
+            }
         }
+        local
     }
 
     /// Implicit "target" stockpile: 6 months of the recipe's output
