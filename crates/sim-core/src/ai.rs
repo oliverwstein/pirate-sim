@@ -31,6 +31,8 @@ const ACT_CAREEN: usize = 2;
 const ACT_UNDOCK: usize = 3;
 const ACT_CHOOSE_DESTINATION: usize = 4;
 const ACT_DIVERT_TO_PORT: usize = 5;
+const ACT_SELL_ALL: usize = 6;
+const ACT_BUY_BEST: usize = 7;
 
 // --- Condition IDs ---
 const COND_IS_DOCKED: usize = 0;
@@ -56,8 +58,13 @@ pub enum DockAction {
 
 /// Build the ship AI behavior tree.
 fn build_ship_bt() -> Behavior {
+    // Dock cycle: sell whatever we arrived with, top up provisions,
+    // load the most profitable next leg's cargo, careen if needed,
+    // and undock toward the new destination.
     let dock_tree = Behavior::Sequence(vec![
+        Behavior::Action(ACT_SELL_ALL),
         Behavior::Action(ACT_RESUPPLY),
+        Behavior::Action(ACT_BUY_BEST),
         Behavior::Action(ACT_CAREEN),
         Behavior::Action(ACT_UNDOCK),
     ]);
@@ -78,7 +85,7 @@ fn build_ship_bt() -> Behavior {
             Behavior::Condition(COND_HAS_DESTINATION),
             Behavior::Action(ACT_SAIL),
         ]),
-        // Priority 4: Choose a new destination
+        // Priority 4: Choose a new destination (random fallback)
         Behavior::Action(ACT_CHOOSE_DESTINATION),
     ])
 }
@@ -339,6 +346,70 @@ impl<'a> BtContext for ShipBtContext<'a> {
                     idx = (idx + 1) % self.ports.len();
                 }
                 self.assign_destination_port(idx);
+                Status::Success
+            }
+            ACT_SELL_ALL => {
+                // Sell every ton of cargo we arrived with at the
+                // docked port's market. If markets/goods aren't wired
+                // (toy tests), this is a no-op success.
+                let (Some(idx), Some(markets), Some(goods)) =
+                    (self.nav.docked_at_port, self.markets.as_deref_mut(), self.goods)
+                else {
+                    return Status::Success;
+                };
+                if idx >= markets.len() {
+                    return Status::Success;
+                }
+                let market = &mut markets[idx];
+                let entries: Vec<(crate::goods::GoodId, f32)> =
+                    self.ship.cargo.iter().collect();
+                for (gid, tons) in entries {
+                    if tons > 0.0 {
+                        // Best-effort: ignore "port out of silver" by
+                        // selling whatever the port can afford. For
+                        // v1 we just attempt the full amount; if the
+                        // port can't pay, the cargo stays aboard and
+                        // we'll try again on the next leg.
+                        let _ = market.sell(self.ship, gid, tons, goods);
+                    }
+                }
+                Status::Success
+            }
+            ACT_BUY_BEST => {
+                // Pick the best (good, dest) and load up. Sets the
+                // ship's destination as a side effect so ACT_UNDOCK
+                // has somewhere to go.
+                let (Some(idx), Some(markets), Some(goods)) =
+                    (self.nav.docked_at_port, self.markets.as_deref_mut(), self.goods)
+                else {
+                    return Status::Success;
+                };
+                if idx >= markets.len() {
+                    return Status::Success;
+                }
+                let plan = crate::trade::find_best_trade(idx, self.ports, markets, goods);
+                let plan = match plan {
+                    Some(p) => p,
+                    None => return Status::Success,
+                };
+
+                // Buy as many tons as we can afford, that fit in the
+                // hold, and that the port can supply.
+                let market = &mut markets[idx];
+                let unit = market.buy_price(plan.good, goods).max(0.0001);
+                let cargo_room = self.stats.cargo_capacity_tons
+                    - self.ship.cargo.total_tons();
+                let affordable = self.ship.silver / unit;
+                let in_stock = market.stockpile.get(plan.good);
+                let tons = cargo_room.min(affordable).min(in_stock).max(0.0);
+                if tons > 0.0 {
+                    let _ = market.buy(self.ship, self.stats, plan.good, tons, goods);
+                }
+
+                // Always set the destination — even when the buy fell
+                // through (broke / no room) — so the ship still sails
+                // to the chosen port and tries selling/buying again.
+                self.assign_destination_port(plan.dest_port);
                 Status::Success
             }
             ACT_DIVERT_TO_PORT => {

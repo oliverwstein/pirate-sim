@@ -425,3 +425,110 @@ fn continuous_sailing_with_port_visits() {
     assert!(ai.nav.destination.is_some() || ship.state == ShipState::Docked,
         "ship should always have a goal");
 }
+
+// ============================================================
+// Trade cycle integration tests (with markets wired in)
+// ============================================================
+
+#[test]
+fn dock_cycle_sells_arriving_cargo_and_buys_outgoing() {
+    use sim_core::goods::{ids, GoodsRegistry};
+    use sim_core::market::{PortArchetype, PortMarket};
+
+    let goods = GoodsRegistry::starter();
+    let stats = ShipStats::sloop();
+    let wind = calm_wind();
+
+    // Two ports far enough apart that arbitrage clears the distance
+    // cost: a sugar surplus at Home, a sugar deficit at Dest.
+    let ports = vec![
+        Port { name: "Home", position: Position { x: 0.0, y: 0.0 }, faction: sim_core::port::Faction::England, harbor_radius_nm: DEFAULT_HARBOR_RADIUS_NM },
+        Port { name: "Dest", position: Position { x: 30.0, y: 0.0 }, faction: sim_core::port::Faction::Spain, harbor_radius_nm: DEFAULT_HARBOR_RADIUS_NM },
+    ];
+    let mut markets = vec![
+        PortMarket::with_recipe(&goods, PortArchetype::SugarIsland.recipe(), false),
+        PortMarket::with_recipe(&goods, PortArchetype::NorthAmericanFarming.recipe(), false),
+    ];
+    // Bias: surplus of sugar at Home, drain Dest's sugar to zero.
+    markets[0].stockpile.add(ids::SUGAR, 5_000.0);
+    let dest_sugar = markets[1].stockpile.get(ids::SUGAR);
+    markets[1].stockpile.remove(ids::SUGAR, dest_sugar);
+
+    // Ship starts docked at Home with fresh provisions (skip resupply
+    // dwell time) and a small dirty hull so careen passes quickly.
+    let mut ship = Ship::new(Position { x: 0.0, y: 0.0 }, ShipState::Docked);
+    ship.provisions = stats.provision_capacity;
+    ship.hull_fouling = 0.0;
+    let mut ai = ShipAI::with_seed(42);
+    ai.nav.docked_at_port = Some(0); // simulate arrival at Home
+
+    let silver_before = ship.silver;
+
+    // One tick should: SELL_ALL (no-op, empty cargo) → RESUPPLY (no-op, full)
+    // → BUY_BEST (loads sugar, sets destination=Dest) → CAREEN (no-op)
+    // → UNDOCK (success, transitions to Sailing).
+    ai.tick(
+        &mut ship,
+        &stats,
+        &wind,
+        &ports,
+        &empty_harbors(),
+        None,
+        Some(&mut markets),
+        Some(&goods),
+    );
+
+    assert_eq!(ship.state, ShipState::Sailing, "should have undocked");
+    assert_eq!(ai.nav.dest_port, Some(1), "destination should be Dest");
+    assert!(ship.cargo.get(ids::SUGAR) > 0.0, "should have bought sugar");
+    assert!(ship.silver < silver_before, "should have spent silver buying cargo");
+}
+
+#[test]
+fn ship_with_no_profitable_trade_still_undocks() {
+    use sim_core::goods::GoodsRegistry;
+    use sim_core::market::{PortArchetype, PortMarket};
+
+    let goods = GoodsRegistry::starter();
+    let stats = ShipStats::sloop();
+    let wind = calm_wind();
+
+    // Two identical Minor ports — find_best_trade returns None.
+    let ports = vec![
+        Port { name: "A", position: Position { x: 0.0, y: 0.0 }, faction: sim_core::port::Faction::England, harbor_radius_nm: DEFAULT_HARBOR_RADIUS_NM },
+        Port { name: "B", position: Position { x: 30.0, y: 0.0 }, faction: sim_core::port::Faction::England, harbor_radius_nm: DEFAULT_HARBOR_RADIUS_NM },
+    ];
+    let mut markets = vec![
+        PortMarket::with_recipe(&goods, PortArchetype::Minor.recipe(), false),
+        PortMarket::with_recipe(&goods, PortArchetype::Minor.recipe(), false),
+    ];
+
+    let mut ship = Ship::new(Position { x: 0.0, y: 0.0 }, ShipState::Docked);
+    ship.provisions = stats.provision_capacity;
+    ship.hull_fouling = 0.0;
+    let mut ai = ShipAI::with_seed(42);
+    ai.nav.docked_at_port = Some(0);
+
+    // Up to a few ticks: BUY_BEST returns Success without setting a
+    // destination, so UNDOCK fails, falls through to ACT_CHOOSE_DESTINATION,
+    // then on a subsequent tick UNDOCK succeeds.
+    let mut undocked = false;
+    for _ in 0..5 {
+        ai.tick(
+            &mut ship,
+            &stats,
+            &wind,
+            &ports,
+            &empty_harbors(),
+            None,
+            Some(&mut markets),
+            Some(&goods),
+        );
+        if ship.state == ShipState::Sailing {
+            undocked = true;
+            break;
+        }
+    }
+    assert!(undocked, "ship should still undock via random fallback");
+    assert!(ship.cargo.is_empty(), "no cargo should have been loaded");
+}

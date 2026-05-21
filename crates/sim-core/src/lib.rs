@@ -13,4 +13,5 @@ pub mod coastline;
 pub mod goods;
 pub mod cargo;
 pub mod market;
+pub mod trade;
 pub mod world;
