@@ -10,4 +10,5 @@ pub mod bt;
 pub mod ai;
 pub mod port;
 pub mod coastline;
+pub mod goods;
 pub mod world;
