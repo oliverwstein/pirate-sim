@@ -377,6 +377,67 @@ impl PortMarket {
         ship.silver += drawn;
         drawn
     }
+
+    /// Extend chandler/factor credit to a docked ship: advance silver
+    /// from the port's treasury into the ship's strongbox and add the
+    /// same amount to `ship.debt`. The advance is capped by the
+    /// remaining headroom under `max_total_debt`, the port's available
+    /// liquidity, and `port_fraction_cap × self.silver`.
+    ///
+    /// Returns the actual silver advanced (always ≥ 0). Used for two
+    /// historically distinct purposes:
+    ///   * **Chandler credit** — provisions taken on tick when broke
+    ///     (`target` ≈ cost of topping up the larder).
+    ///   * **Tramping / freight** — cargo advanced on consignment when
+    ///     no profitable arbitrage is in reach (`target` ≈ cost of
+    ///     filling the hold with a local export).
+    ///
+    /// Settles fungibly: although the loan is granted by this port,
+    /// repayment goes to whichever port the ship next docks at —
+    /// historically arranged via bills of exchange between merchant
+    /// correspondents.
+    pub fn extend_credit(
+        &mut self,
+        ship: &mut crate::ship::Ship,
+        target: f32,
+        port_fraction_cap: f32,
+        max_total_debt: f32,
+    ) -> f32 {
+        let needed = target.max(0.0);
+        let debt_headroom = (max_total_debt - ship.debt).max(0.0);
+        let liquidity_cap = (self.silver * port_fraction_cap).max(0.0);
+        let advance = needed.min(debt_headroom).min(liquidity_cap);
+        if advance <= 0.0 {
+            return 0.0;
+        }
+        self.silver -= advance;
+        ship.silver += advance;
+        ship.debt += advance;
+        advance
+    }
+
+    /// Settle outstanding ship debt against the current port's treasury,
+    /// out of any silver the ship holds above `float`. Returns the
+    /// amount repaid. Called at every dock arrival before dividends
+    /// or other port settlement, so creditors are paid first.
+    pub fn collect_debt(
+        &mut self,
+        ship: &mut crate::ship::Ship,
+        float: f32,
+    ) -> f32 {
+        if ship.debt <= 0.0 {
+            return 0.0;
+        }
+        let available = (ship.silver - float).max(0.0);
+        let payment = available.min(ship.debt);
+        if payment <= 0.0 {
+            return 0.0;
+        }
+        ship.silver -= payment;
+        ship.debt -= payment;
+        self.silver += payment;
+        payment
+    }
 }
 
 /// Why a buy/sell transaction was rejected.

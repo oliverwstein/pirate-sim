@@ -182,18 +182,20 @@ fn main() {
     println!();
     println!("Per-ship P/L after {} days:", SIM_DAYS);
     println!(
-        "{:<3}  {:<14}  {:<10}  {:>10}  {:>10}  {:>10}  {:>10}  {:<10}  {:<24}",
-        "#", "from", "type", "silver_in", "silver_out", "dividends", "P/L", "state", "cargo"
+        "{:<3}  {:<14}  {:<10}  {:>10}  {:>10}  {:>10}  {:>8}  {:>10}  {:<10}  {:<24}",
+        "#", "from", "type", "silver_in", "silver_out", "dividends", "debt", "P/L", "state", "cargo"
     );
     let mut total_pl = 0.0f32;
+    let mut total_debt = 0.0f32;
     let mut bankrupt = 0;
     for (i, ship) in world.ships.iter().enumerate() {
         // True lifetime P/L includes dividends paid back to the
-        // owner port — otherwise a profitable home-ported ship that
-        // just settled looks "flat" because its strongbox was reset
-        // to the operating float.
-        let pl = (ship.silver - ship.starting_silver) + ship.lifetime_dividends;
+        // owner port (which may have settled silver out of the
+        // strongbox) and subtracts any outstanding chandler/freight
+        // debt the captain still owes the merchant network.
+        let pl = (ship.silver - ship.starting_silver) + ship.lifetime_dividends - ship.debt;
         total_pl += pl;
+        total_debt += ship.debt;
         if ship.silver < 50.0 && ship.lifetime_dividends < 1.0 {
             bankrupt += 1;
         }
@@ -209,13 +211,13 @@ fn main() {
         let built_tag = if i >= n_ships { " (built)" } else { "" };
         let type_name = world.ship_types.get(ship.ship_type).name;
         println!(
-            "{:<3}  {:<14}  {:<10}  {:>10.0}  {:>10.0}  {:>10.0}  {:>+10.0}  {:<10}  {:<24}{}",
+            "{:<3}  {:<14}  {:<10}  {:>10.0}  {:>10.0}  {:>10.0}  {:>8.0}  {:>+10.0}  {:<10}  {:<24}{}",
             i, origin_names[i], type_name, ship.starting_silver, ship.silver,
-            ship.lifetime_dividends, pl, state, cargo.join(","), built_tag
+            ship.lifetime_dividends, ship.debt, pl, state, cargo.join(","), built_tag
         );
     }
     println!();
-    println!("Fleet total P/L: {:+.0} pesos", total_pl);
+    println!("Fleet total P/L: {:+.0} pesos   (outstanding debt: {:.0})", total_pl, total_debt);
     println!("Bankrupt ships:  {}/{}", bankrupt, world.ships.len());
     println!("Ships built by shipyards: {}  (last_month_avg_profit = {:+.0})",
         world.ships_built, world.last_month_avg_profit);

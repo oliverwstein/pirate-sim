@@ -75,6 +75,13 @@ const OUTFIT_DRAW_MULTIPLE: f32 = 2.0;
 /// drained by one ship's outbound cargo.
 const OUTFIT_PORT_FRACTION_CAP: f32 = 0.2;
 
+/// Tramping credit: at any non-home port, a captain with no silver
+/// but a profitable arbitrage opportunity may draw against the port
+/// factor (consigned cargo / freight charter) up to this fraction of
+/// the port's treasury. Booked as ship debt and repaid at the next
+/// docking from sale proceeds.
+const TRAMP_PORT_FRACTION_CAP: f32 = 0.10;
+
 /// What the ship is doing while docked (for display purposes).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum DockAction {
@@ -305,6 +312,16 @@ impl<'a> BtContext for ShipBtContext<'a> {
                     self.nav.destination = None;
                     self.nav.dest_port = None;
                     self.nav.clear_path();
+                    // Settle any outstanding chandler/freight debt at
+                    // this port first — creditors come before owners.
+                    // Fungible: it doesn't matter which port originally
+                    // advanced the credit; the merchant network settles
+                    // it via bills of exchange between correspondents.
+                    if let (Some(idx), Some(markets)) = (port_idx, self.markets.as_deref_mut()) {
+                        if idx < markets.len() {
+                            markets[idx].collect_debt(self.ship, HOME_PORT_FLOAT_SILVER);
+                        }
+                    }
                     // Home-port settlement: if this is the owner port,
                     // the supercargo books proceeds with the owners.
                     // Silver above the operating float is paid into
@@ -514,6 +531,26 @@ impl<'a> BtContext for ShipBtContext<'a> {
                             OUTFIT_PORT_FRACTION_CAP,
                         );
                     }
+                }
+
+                // Tramping / freight credit: at any other port, if we
+                // still can't load anything meaningful (too little
+                // silver for the hold space we have), take cargo on
+                // consignment from the local factor. Booked as debt;
+                // repaid out of the sale proceeds at the destination.
+                let want_tons = cargo_room.min(market.stockpile.get(plan.good));
+                let need_silver = unit * want_tons;
+                if self.ship.silver < need_silver
+                    && self.ship.debt < crate::ship::MAX_SHIP_DEBT
+                    && want_tons > 0.0
+                {
+                    let shortfall = need_silver - self.ship.silver;
+                    market.extend_credit(
+                        self.ship,
+                        shortfall,
+                        TRAMP_PORT_FRACTION_CAP,
+                        crate::ship::MAX_SHIP_DEBT,
+                    );
                 }
 
                 let affordable = self.ship.silver / unit;

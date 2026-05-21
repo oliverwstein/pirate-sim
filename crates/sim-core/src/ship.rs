@@ -88,6 +88,14 @@ pub struct Ship {
     /// into the port treasury and added here. True lifetime P/L for a
     /// home-ported ship is `(silver - starting_silver) + lifetime_dividends`.
     pub lifetime_dividends: f32,
+    /// Outstanding credit drawn from port chandlers/factors —
+    /// either provisions taken on tick when broke, or freight cargo
+    /// (tramping) advanced against the next sale. Repaid out of any
+    /// surplus silver at the next port docking, before dividends.
+    /// Settles fungibly across the port network — historically this
+    /// is what bills of exchange between merchant correspondents
+    /// enabled.
+    pub debt: f32,
 }
 
 impl Ship {
@@ -106,6 +114,7 @@ impl Ship {
             ship_type: crate::shiptype::ids::SLOOP,
             starting_silver: STARTING_SILVER_PESOS,
             lifetime_dividends: 0.0,
+            debt: 0.0,
         }
     }
 
@@ -133,6 +142,7 @@ impl Ship {
             ship_type,
             starting_silver,
             lifetime_dividends: 0.0,
+            debt: 0.0,
         }
     }
 
@@ -236,6 +246,17 @@ impl Ship {
         }
 
         let unit_price = market.buy_price(provisions_id, goods).max(0.0001);
+
+        // Chandler credit: if we can't pay cash but have debt
+        // headroom (and the port chandler has any silver to lend),
+        // take provisions on tick. The advance is sized to one hour's
+        // resupply rate — small, repeated calls accumulate naturally
+        // for a multi-hour top-up.
+        if self.silver < unit_price * RESUPPLY_RATE_PER_HOUR && self.debt < MAX_SHIP_DEBT {
+            let target_advance = unit_price * RESUPPLY_RATE_PER_HOUR;
+            market.extend_credit(self, target_advance, CHANDLER_PORT_FRACTION_CAP, MAX_SHIP_DEBT);
+        }
+
         let affordable = self.silver / unit_price;
 
         let desired = RESUPPLY_RATE_PER_HOUR.min(space).min(stockpile).min(affordable);
@@ -277,6 +298,16 @@ const RESUPPLY_RATE_PER_HOUR: f32 = 0.5;
 
 /// Fouling points removed per hour while careening at a port.
 const CAREEN_RATE_PER_HOUR: f32 = 3.0;
+
+/// Maximum outstanding chandler/factor debt a single ship can
+/// accumulate before further credit is refused. Sized to cover a
+/// few hold-fillings of cheap cargo plus a season's provisions.
+pub const MAX_SHIP_DEBT: f32 = 5000.0;
+
+/// Fraction of a port's silver that any single chandler-credit
+/// advance may consume. Keeps a string of broke ships from
+/// draining a small port's working capital.
+pub const CHANDLER_PORT_FRACTION_CAP: f32 = 0.05;
 pub fn speed_at_heading(heading: f32, stats: &ShipStats, wind: &WindVector) -> f32 {
     let wind_to = wind.direction_to();
     let relative_angle = angle_diff(heading, wind_to).abs();
