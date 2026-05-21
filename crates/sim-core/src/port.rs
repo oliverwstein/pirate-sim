@@ -90,4 +90,25 @@ const PORTS: &[(&str, f32, f32, Faction, f32)] = &[
     ("Tortuga", -16.8, 152.4, Faction::Pirate, D),
     ("Nassau", -291.0, 453.0, Faction::Pirate, D),
     ("Tobago", 709.8, -375.0, Faction::Pirate, D),
+    // === EUROPE ===
+    // Coordinates are equirectangular: x = (lon - (-72.5°)) × 60,
+    // Coords approximate equirectangular: x = (lon + 72.5) × 60,
+    // y = (lat - 17.5°) × 60. Map extends to x ≈ 5250, y ≈ 2550, so
+    // these all fit. Larger harbor radii because real-world approaches
+    // (Thames, Ijmuiden, Bay of Cadiz, Loire estuary) span 10–30 NM.
+    // London is placed at the Nore anchorage (Thames Estuary mouth, ~51.5°N
+    // 1°E) rather than the City — at 1-NM grid resolution the Thames itself
+    // is too narrow to leave open-water cells, and ocean-going ships of the
+    // 1680s anchored at the Nore for cargo transfer to lighters anyway.
+    ("London", 4410.0, 2040.0, Faction::England, 30.0),       // 51.5°N 1°E (Nore anchorage)
+    ("Amsterdam", 4644.0, 2092.0, Faction::Holland, 25.0),    // 52.4°N 4.9°E (Ijmuiden / North Sea)
+    ("Cadiz", 3972.0, 1142.0, Faction::Spain, 20.0),          // 36.5°N 6.3°W (Bay of Cadiz)
+    // Nantes proper sits 30 NM up the Loire — the seagoing anchorage was at
+    // Paimboeuf / mouth of the estuary near St-Nazaire (47.3°N, 2.2°W).
+    ("Nantes", 4218.0, 1788.0, Faction::France, 25.0),        // 47.3°N 2.2°W (Loire estuary mouth)
+    // === WEST AFRICA ===
+    // Slave-trade ports. Stand-ins for the much wider Gold Coast and
+    // Bight of Benin trade networks.
+    ("Elmina", 4269.0, -745.0, Faction::Holland, 15.0),       // 5.1°N 1.4°W (Dutch since 1637)
+    ("Ouidah", 4470.0, -666.0, Faction::France, 15.0),        // 6.4°N 2.1°E
 ];

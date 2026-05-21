@@ -377,12 +377,7 @@ fn draw_market_panel(world: &World, port_idx: usize) {
     draw_rectangle(x, y, panel_w, panel_h, Color::new(0.0, 0.0, 0.0, 0.7));
     draw_rectangle_lines(x, y, panel_w, panel_h, 2.0, WHITE);
 
-    let header = if market.is_europe_gateway {
-        format!("{} (Europe gateway)", port.name)
-    } else {
-        port.name.to_string()
-    };
-    draw_text(&header, x + 10.0, y + 22.0, 20.0, YELLOW);
+    draw_text(port.name, x + 10.0, y + 22.0, 20.0, YELLOW);
     draw_text(
         &format!("Treasury: ${:.0}", market.silver),
         x + 10.0,
@@ -500,19 +495,27 @@ async fn main() {
 }
 
 fn spawn_demo_ships(world: &mut World) {
-    // A small starter fleet so the trader AI has visible activity.
-    // Three ships spread across export-rich Caribbean ports — they
-    // discover the Atlantic→sugar→manufactures loop on their own.
-    for (port_name, seed) in [("Bridgetown", 7), ("Port Royal", 13), ("Boston", 21)] {
-        if let Some(port) = world.ports.iter().find(|p| p.name == port_name) {
-            let ship = Ship::new(port.position, ShipState::Docked);
-            let mut ai = ShipAI::with_seed(seed);
-            // Mark the ship as docked at this port so the trader AI's
-            // first dock-cycle tick sells nothing (empty hold) and
-            // immediately picks a profitable outbound cargo.
-            if let Some(idx) = world.ports.iter().position(|p| p.name == port_name) {
-                ai.nav.docked_at_port = Some(idx);
-            }
+    // A starter fleet spread across Caribbean, North America, and
+    // Europe — gives the trader AI all three legs of the triangular
+    // trade visible from tick zero.
+    let starts: &[(&str, u64)] = &[
+        ("Bridgetown", 7),
+        ("Port Royal", 13),
+        ("Boston", 21),
+        ("Charleston", 33),
+        ("Cartagena", 41),
+        ("Havana", 53),
+        ("Fort-Royal", 67),
+        ("London", 79),
+        ("Amsterdam", 89),
+        ("Nantes", 97),
+    ];
+    for (port_name, seed) in starts {
+        if let Some(idx) = world.ports.iter().position(|p| p.name == *port_name) {
+            let port_pos = world.ports[idx].position;
+            let ship = Ship::new(port_pos, ShipState::Docked);
+            let mut ai = ShipAI::with_seed(*seed);
+            ai.nav.docked_at_port = Some(idx);
             world.add_ship(ship, ai);
         }
     }

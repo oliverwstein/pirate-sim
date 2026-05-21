@@ -22,30 +22,6 @@ const INITIAL_STOCKPILE_TONS: f32 = 1000.0;
 /// month of trading; production tick doesn't (yet) replenish it.
 const INITIAL_PORT_SILVER_PESOS: f32 = 50_000.0;
 
-/// What Europe pays for export goods (per ton, at base price). Set so
-/// a ship hauling 60 t of sugar Caribbean→England-gateway makes a
-/// solid profit even after the Atlantic-leg distance cost the planner
-/// will model in later phases. Tuned coarsely; revisit in step 9.
-pub const WORLD_EXPORT_PREMIUM: f32 = 1.40;
-
-/// What Europe sells imported goods for (per ton, at base price).
-pub const WORLD_IMPORT_DISCOUNT: f32 = 0.90;
-
-/// Goods Europe is an infinite *buyer* of (gateway ports always sell
-/// these at a stable world price, regardless of local stockpile).
-fn is_europe_export(id: GoodId) -> bool {
-    use crate::goods::ids::*;
-    id == SUGAR || id == MOLASSES || id == RUM || id == TOBACCO
-        || id == NAVAL_STORES || id == SILVER
-}
-
-/// Goods Europe is an infinite *seller* of (gateway ports always
-/// supply these at a stable world price).
-fn is_europe_import(id: GoodId) -> bool {
-    use crate::goods::ids::*;
-    id == MANUFACTURES || id == ENSLAVED_PERSONS
-}
-
 /// Buy/sell spread (port "vig"). Buying costs base × (1 + SPREAD);
 /// selling earns base × (1 - SPREAD). Stops infinite arbitrage of a
 /// stationary stockpile.
@@ -86,9 +62,6 @@ pub struct PortMarket {
     /// Pesos in the port's treasury. Unused until step 5.
     pub silver: f32,
     pub recipe: ProductionRecipe,
-    /// True for Atlantic-facing ports (Boston, Philadelphia, Charles
-    /// Town, Bridgetown). Step 7 will route exports here at world price.
-    pub is_europe_gateway: bool,
 }
 
 impl PortMarket {
@@ -105,37 +78,49 @@ impl PortMarket {
             stockpile,
             silver: INITIAL_PORT_SILVER_PESOS,
             recipe: ProductionRecipe::empty(),
-            is_europe_gateway: false,
         }
     }
 
     /// Construct a market initialized to the recipe's *target* stock
-    /// for every good it produces or consumes. This makes the opening
-    /// price for each recipe-good equal to `base_price`, so the
-    /// economy starts in equilibrium and drifts as production and
-    /// trade happen.
+    /// Construct a market keyed off a `ProductionRecipe`. Seeds an
+    /// asymmetric opening stockpile that reflects each port's role:
+    ///
+    /// * Output goods start at **12× monthly output** (~2× the price
+    ///   target), so a producer port enters with surplus and
+    ///   therefore *cheap* prices for what it makes.
+    /// * Input goods start at **3× monthly input** (half the price
+    ///   target), so a consumer port enters with shortage and
+    ///   therefore *expensive* prices for what it consumes — but it
+    ///   does still hold a real stockpile, e.g. so a sugar island
+    ///   has provisions to sell to visiting ships at high prices
+    ///   rather than going completely dry.
+    ///
+    /// This puts arbitrage on the table from tick 0 instead of waiting
+    /// for the first monthly production+consumption pass to skew the
+    /// stockpiles. Without it, every recipe-good would start at
+    /// exactly its target stockpile and prices would be flat (= base
+    /// price) everywhere on day 0, so ships would dock and undock
+    /// empty until the economy warmed up.
     pub fn with_recipe(
         _registry: &GoodsRegistry,
         recipe: ProductionRecipe,
-        is_europe_gateway: bool,
     ) -> Self {
         let mut stockpile = Cargo::new();
         for (id, tons) in &recipe.monthly_outputs {
-            stockpile.add(*id, *tons * 6.0);
+            stockpile.add(*id, *tons * 12.0);
         }
         for (id, tons) in &recipe.monthly_inputs {
             // If a good is both produced and consumed (rare), the
-            // input pass would double-add — guard with current value.
-            let already = stockpile.get(*id);
-            if already <= 0.0 {
-                stockpile.add(*id, *tons * 6.0);
+            // output pass already gave it the surplus seeding — don't
+            // overwrite that with a shortage value.
+            if stockpile.get(*id) <= 0.0 {
+                stockpile.add(*id, *tons * 3.0);
             }
         }
         Self {
             stockpile,
             silver: INITIAL_PORT_SILVER_PESOS,
             recipe,
-            is_europe_gateway,
         }
     }
 
@@ -171,46 +156,16 @@ impl PortMarket {
     }
 
     /// Price a ship pays per ton to buy `id` (above the local mid).
-    /// At a Europe-gateway port, import goods are capped at the world
-    /// price — Europe is an infinite supplier, so the local market
-    /// can't gouge above that ceiling. Symmetrically, export goods are
-    /// floored at the world premium: Europe is also there to buy at
-    /// world rate, so a ship can't undercut Europe and scoop up cheap
-    /// gluts. (Without this, a ship could buy local-glut tobacco at
-    /// 0.25× base and resell at the next gateway's world floor for a
-    /// 5× margin.)
+    /// Pure local price + spread — no gateway magic. Europe is on the
+    /// map as four real ports (London, Amsterdam, Cadiz, Nantes); to
+    /// trade with Europe a ship sails there.
     pub fn buy_price(&self, id: GoodId, registry: &GoodsRegistry) -> f32 {
-        let local = self.price(id, registry) * (1.0 + PRICE_SPREAD);
-        if self.is_europe_gateway {
-            let base = registry.get(id).base_price_pesos;
-            if is_europe_import(id) {
-                return local.min(base * WORLD_IMPORT_DISCOUNT);
-            }
-            if is_europe_export(id) {
-                return local.max(base * WORLD_EXPORT_PREMIUM);
-            }
-        }
-        local
+        self.price(id, registry) * (1.0 + PRICE_SPREAD)
     }
 
     /// Price a ship receives per ton selling `id` (below the local mid).
-    /// At a Europe-gateway port, export goods are floored at the world
-    /// premium — Europe is an infinite buyer at that rate. Imports at
-    /// a gateway are capped at the world discount: Europe is also
-    /// dumping manufactures locally at world price, so a ship arriving
-    /// with manufactures can't extract more than that.
     pub fn sell_price(&self, id: GoodId, registry: &GoodsRegistry) -> f32 {
-        let local = self.price(id, registry) * (1.0 - PRICE_SPREAD);
-        if self.is_europe_gateway {
-            let base = registry.get(id).base_price_pesos;
-            if is_europe_export(id) {
-                return local.max(base * WORLD_EXPORT_PREMIUM);
-            }
-            if is_europe_import(id) {
-                return local.min(base * WORLD_IMPORT_DISCOUNT);
-            }
-        }
-        local
+        self.price(id, registry) * (1.0 - PRICE_SPREAD)
     }
 
     /// Implicit "target" stockpile: 6 months of the recipe's output
@@ -230,14 +185,6 @@ impl PortMarket {
     /// Buy `requested_tons` of `id` from this market on behalf of `ship`.
     /// Atomic: either the full requested amount transacts or nothing
     /// changes. Returns the cost in pesos on success.
-    ///
-    /// At a Europe-gateway port, *import* goods are sourced from Europe
-    /// at the world price — the local stockpile is bypassed (Europe is
-    /// an infinite supplier) and the port's treasury is unaffected (the
-    /// silver leaves the simulation, off-map).
-    ///
-    /// Fails when the ship lacks silver or the cargo hold lacks room.
-    /// Fails for non-portal flows when the local market lacks stockpile.
     pub fn buy(
         &mut self,
         ship: &mut crate::ship::Ship,
@@ -258,27 +205,18 @@ impl PortMarket {
         if requested_tons > cargo_room + 1e-4 {
             return Err(TradeError::InsufficientCargoSpace);
         }
-        let via_europe = self.is_europe_gateway && is_europe_import(id);
-        if !via_europe && requested_tons > self.stockpile.get(id) + 1e-4 {
+        if requested_tons > self.stockpile.get(id) + 1e-4 {
             return Err(TradeError::InsufficientStockpile);
         }
         ship.silver -= cost;
-        if !via_europe {
-            self.silver += cost;
-            self.stockpile.remove(id, requested_tons);
-        }
+        self.silver += cost;
+        self.stockpile.remove(id, requested_tons);
         ship.cargo.add(id, requested_tons);
         Ok(cost)
     }
 
     /// Sell `requested_tons` of `id` from `ship` into this market.
     /// Atomic. Returns proceeds in pesos on success.
-    ///
-    /// At a Europe-gateway port, *export* goods are bought by Europe at
-    /// the world price — the local stockpile is unaffected (the goods
-    /// leave the simulation) and the silver paid to the ship is
-    /// likewise sourced off-map (the local treasury is unchanged, and
-    /// the port-silver check is bypassed).
     pub fn sell(
         &mut self,
         ship: &mut crate::ship::Ship,
@@ -294,15 +232,12 @@ impl PortMarket {
         }
         let unit = self.sell_price(id, registry);
         let proceeds = unit * requested_tons;
-        let via_europe = self.is_europe_gateway && is_europe_export(id);
-        if !via_europe && proceeds > self.silver + 1e-4 {
+        if proceeds > self.silver + 1e-4 {
             return Err(TradeError::InsufficientPortSilver);
         }
         ship.cargo.remove(id, requested_tons);
-        if !via_europe {
-            self.stockpile.add(id, requested_tons);
-            self.silver -= proceeds;
-        }
+        self.stockpile.add(id, requested_tons);
+        self.silver -= proceeds;
         ship.silver += proceeds;
         Ok(proceeds)
     }
@@ -341,6 +276,29 @@ pub enum PortArchetype {
     PirateHaven,
     /// Generic minor port: imports provisions and manufactures.
     Minor,
+    /// London — the largest European entrepôt for the Atlantic trade.
+    /// Big sugar refiner, biggest tobacco re-exporter, finance and
+    /// shipping center; outputs manufactures (cloth/iron/firearms).
+    EuropeanLondon,
+    /// Amsterdam — Dutch entrepôt; sugar refining, banking,
+    /// re-exports Asian textiles. Outputs manufactures + naval stores
+    /// (Baltic timber/tar via Dutch shipping).
+    EuropeanAmsterdam,
+    /// Cadiz — Spanish silver entry point. Modest manufactures output;
+    /// dominant feature is the silver sink (silver flows in from the
+    /// Spanish Main and is consumed locally / passed on outside our
+    /// model to mint/Asia).
+    EuropeanCadiz,
+    /// Nantes — leading French slave-trade and sugar-refining port.
+    /// Outputs manufactures (textiles, brandy → modeled as
+    /// manufactures + rum).
+    EuropeanNantes,
+    /// Elmina — Gold Coast slave-trade fort. Demands manufactures,
+    /// rum, tobacco; produces enslaved persons.
+    AfricanElmina,
+    /// Ouidah — Bight of Benin slave-trade port. Same trade goods but
+    /// regional differences (more rum, less iron).
+    AfricanOuidah,
 }
 
 impl PortArchetype {
@@ -362,12 +320,18 @@ impl PortArchetype {
                 &[(SUGAR, 15.0), (MOLASSES, 25.0), (MANUFACTURES, 10.0)],
             ),
             PortArchetype::SpanishTreasure => (
-                &[(SILVER, 5.0)],
-                &[(MANUFACTURES, 8.0), (PROVISIONS, 6.0), (ENSLAVED_PERSONS, 2.0)],
+                // Spanish Main mainland (Cartagena, Portobelo) had
+                // significant cattle ranching and maize agriculture
+                // in the hinterland — historically a *net* provisions
+                // exporter, victualling fleets and treasure convoys.
+                &[(SILVER, 5.0), (PROVISIONS, 30.0)],
+                &[(MANUFACTURES, 8.0), (ENSLAVED_PERSONS, 2.0)],
             ),
             PortArchetype::SpanishEntrepot => (
-                &[(SUGAR, 20.0), (TOBACCO, 15.0)],
-                &[(MANUFACTURES, 5.0), (PROVISIONS, 5.0)],
+                // Cuba/Hispaniola: cattle, cassava, plantains. Modest
+                // provisions surplus on top of sugar/tobacco re-export.
+                &[(SUGAR, 20.0), (TOBACCO, 15.0), (PROVISIONS, 20.0)],
+                &[(MANUFACTURES, 5.0)],
             ),
             PortArchetype::PirateHaven => (
                 &[],
@@ -376,6 +340,79 @@ impl PortArchetype {
             PortArchetype::Minor => (
                 &[],
                 &[(PROVISIONS, 2.0), (MANUFACTURES, 1.0)],
+            ),
+            // === EUROPE ===
+            // Numbers reflect each port's relative economic gravity
+            // (London ~3× Amsterdam ~Nantes >> Cadiz). Sketched from
+            // general knowledge; revisit once
+            // `planning/research/european-markets.md` lands.
+            //
+            // All European ports are net food producers — England,
+            // Holland, France, and Spain all victualled their own
+            // fleets and exported grain/salt-meat to colonies. So
+            // every European archetype produces provisions in addition
+            // to manufactures.
+            PortArchetype::EuropeanLondon => (
+                &[(MANUFACTURES, 200.0), (PROVISIONS, 100.0)],
+                &[
+                    (SUGAR, 200.0),
+                    (TOBACCO, 80.0),
+                    (RUM, 30.0),
+                    (MOLASSES, 30.0),
+                    (NAVAL_STORES, 20.0),
+                    (SILVER, 0.3),
+                ],
+            ),
+            PortArchetype::EuropeanAmsterdam => (
+                &[(MANUFACTURES, 120.0), (NAVAL_STORES, 30.0), (PROVISIONS, 80.0)],
+                &[
+                    (SUGAR, 120.0),
+                    (TOBACCO, 30.0),
+                    (RUM, 15.0),
+                    (MOLASSES, 15.0),
+                    (SILVER, 0.2),
+                ],
+            ),
+            PortArchetype::EuropeanCadiz => (
+                &[(MANUFACTURES, 30.0), (PROVISIONS, 60.0)],
+                &[
+                    (SILVER, 1.0),
+                    (SUGAR, 40.0),
+                    (TOBACCO, 20.0),
+                ],
+            ),
+            PortArchetype::EuropeanNantes => (
+                &[(MANUFACTURES, 80.0), (RUM, 20.0), (PROVISIONS, 70.0)],
+                &[
+                    (SUGAR, 80.0),
+                    (TOBACCO, 30.0),
+                    (MOLASSES, 20.0),
+                ],
+            ),
+            // === WEST AFRICA ===
+            // Slave-trade ports. Captives sourced from inland trade
+            // networks (modeled as monthly output of ENSLAVED_PERSONS).
+            // Inputs are the trade-goods baskets European/Caribbean
+            // ships paid in: textiles + ironware + firearms collapsed
+            // into MANUFACTURES, plus alcohol (rum) and tobacco. No
+            // silver — slave-coast traders generally took goods, not
+            // coin. Differentiated regionally: Ouidah took relatively
+            // more rum, Elmina relatively more iron/manufactures.
+            PortArchetype::AfricanElmina => (
+                &[(ENSLAVED_PERSONS, 8.0)],
+                &[
+                    (MANUFACTURES, 12.0),
+                    (RUM, 4.0),
+                    (TOBACCO, 3.0),
+                ],
+            ),
+            PortArchetype::AfricanOuidah => (
+                &[(ENSLAVED_PERSONS, 10.0)],
+                &[
+                    (MANUFACTURES, 8.0),
+                    (RUM, 8.0),
+                    (TOBACCO, 4.0),
+                ],
             ),
         };
         ProductionRecipe {
@@ -386,41 +423,51 @@ impl PortArchetype {
     }
 }
 
-/// Map a port name to its archetype + Europe-gateway flag. Atlantic
-/// gateway ports both have local recipes *and* expose the off-map
-/// world price (step 7).
-pub fn archetype_for(port_name: &str) -> (PortArchetype, bool) {
+/// Map a port name to its archetype. Europe and West Africa are now
+/// real nodes on the map (not "gateway" magic on Caribbean ports);
+/// transatlantic trade is just the longest arbitrage in the system.
+pub fn archetype_for(port_name: &str) -> PortArchetype {
     use PortArchetype::*;
     match port_name {
         // Sugar islands
-        "Bridgetown" => (SugarIsland, true),  // Barbados — England gateway
-        "Port Royal" | "Kingston" => (SugarIsland, false),
-        "Basseterre" | "English Harbour" => (SugarIsland, false),
-        "Fort-Royal" | "Basse-Terre" => (SugarIsland, false),
-        "Cap-Français" | "Petit-Goâve" => (SugarIsland, false),
-        "Paramaribo" | "Cayenne" => (SugarIsland, false),
-        "Willemstad" | "St. Eustatius" => (SugarIsland, false),
+        "Bridgetown" => SugarIsland,
+        "Port Royal" | "Kingston" => SugarIsland,
+        "Basseterre" | "English Harbour" => SugarIsland,
+        "Fort-Royal" | "Basse-Terre" => SugarIsland,
+        "Cap-Français" | "Petit-Goâve" => SugarIsland,
+        "Paramaribo" | "Cayenne" => SugarIsland,
+        "Willemstad" | "St. Eustatius" => SugarIsland,
 
         // Tobacco
-        "Charleston" => (TobaccoColony, true),
+        "Charleston" => TobaccoColony,
 
         // North American farming
-        "Boston" | "Philadelphia" | "New York" => (NorthAmericanFarming, true),
+        "Boston" | "Philadelphia" | "New York" => NorthAmericanFarming,
 
         // Spanish silver
-        "Cartagena" | "Portobelo" => (SpanishTreasure, false),
+        "Cartagena" | "Portobelo" => SpanishTreasure,
 
         // Spanish entrepôt
-        "Havana" | "Santo Domingo" | "Santiago de Cuba" | "San Juan" => (SpanishEntrepot, false),
+        "Havana" | "Santo Domingo" | "Santiago de Cuba" | "San Juan" => SpanishEntrepot,
 
         // Pirate
-        "Tortuga" | "Nassau" | "Tobago" => (PirateHaven, false),
+        "Tortuga" | "Nassau" | "Tobago" => PirateHaven,
 
         // Bermuda — naval stores transshipment
-        "Bermuda" => (NorthAmericanFarming, false),
+        "Bermuda" => NorthAmericanFarming,
+
+        // Europe
+        "London" => EuropeanLondon,
+        "Amsterdam" => EuropeanAmsterdam,
+        "Cadiz" => EuropeanCadiz,
+        "Nantes" => EuropeanNantes,
+
+        // West Africa
+        "Elmina" => AfricanElmina,
+        "Ouidah" => AfricanOuidah,
 
         // Minor / other
-        _ => (Minor, false),
+        _ => Minor,
     }
 }
 
@@ -511,28 +558,32 @@ mod tests {
     }
 
     #[test]
-    fn with_recipe_starts_at_target() {
+    fn with_recipe_starts_with_asymmetric_stockpile() {
         let registry = GoodsRegistry::starter();
         let recipe = PortArchetype::SugarIsland.recipe();
-        let market = PortMarket::with_recipe(&registry, recipe.clone(), true);
-        // Each output and input should sit at 6× monthly throughput.
+        let market = PortMarket::with_recipe(&registry, recipe.clone());
+        // Outputs sit at 12× monthly throughput (year of surplus).
         for (id, tons) in &recipe.monthly_outputs {
-            assert_eq!(market.stockpile.get(*id), *tons * 6.0);
+            assert_eq!(market.stockpile.get(*id), *tons * 12.0);
         }
+        // Inputs sit at 3× monthly throughput (3 months' buffer).
         for (id, tons) in &recipe.monthly_inputs {
-            assert_eq!(market.stockpile.get(*id), *tons * 6.0);
+            assert_eq!(market.stockpile.get(*id), *tons * 3.0);
         }
-        // Prices should equal base because stockpile == target.
-        let base = registry.get(ids::SUGAR).base_price_pesos;
-        let p = market.price(ids::SUGAR, &registry);
-        assert!((p - base).abs() < 1e-3);
+        // Output prices should be cheap (surplus); input prices expensive.
+        let sugar_base = registry.get(ids::SUGAR).base_price_pesos;
+        let manuf_base = registry.get(ids::MANUFACTURES).base_price_pesos;
+        assert!(market.price(ids::SUGAR, &registry) < sugar_base,
+            "producer port should price its output below base");
+        assert!(market.price(ids::MANUFACTURES, &registry) > manuf_base,
+            "consumer port should price its input above base");
     }
 
     #[test]
     fn tick_month_produces_outputs_and_consumes_inputs() {
         let registry = GoodsRegistry::starter();
         let recipe = PortArchetype::SugarIsland.recipe();
-        let mut market = PortMarket::with_recipe(&registry, recipe.clone(), false);
+        let mut market = PortMarket::with_recipe(&registry, recipe.clone());
         let sugar_before = market.stockpile.get(ids::SUGAR);
         let provisions_before = market.stockpile.get(ids::PROVISIONS);
 
@@ -553,28 +604,33 @@ mod tests {
         let registry = GoodsRegistry::starter();
         let mut recipe = ProductionRecipe::empty();
         recipe.monthly_inputs.push((ids::PROVISIONS, 1000.0));
-        let mut market = PortMarket::with_recipe(&registry, recipe, false);
-        // Stockpile = 6000 (target), tick_month consumes 1000 → 5000.
+        let mut market = PortMarket::with_recipe(&registry, recipe);
+        // Input stockpile starts at 3× monthly = 3000. Three ticks
+        // drain it to zero exactly.
         market.tick_month();
-        assert_eq!(market.stockpile.get(ids::PROVISIONS), 5000.0);
-        // Run more ticks than there is stockpile.
+        assert_eq!(market.stockpile.get(ids::PROVISIONS), 2000.0);
+        market.tick_month();
+        market.tick_month();
+        assert_eq!(market.stockpile.get(ids::PROVISIONS), 0.0);
+        // Run more ticks; stays at zero (clamped, no negatives).
         for _ in 0..10 {
             market.tick_month();
         }
-        // Should bottom out at zero, not go negative.
         assert_eq!(market.stockpile.get(ids::PROVISIONS), 0.0);
     }
 
     #[test]
     fn archetype_for_known_ports() {
-        let (a, gw) = archetype_for("Bridgetown");
-        assert!(matches!(a, PortArchetype::SugarIsland));
-        assert!(gw);
-        assert!(matches!(archetype_for("Boston").0, PortArchetype::NorthAmericanFarming));
-        assert!(matches!(archetype_for("Cartagena").0, PortArchetype::SpanishTreasure));
-        assert!(matches!(archetype_for("Tortuga").0, PortArchetype::PirateHaven));
+        assert!(matches!(archetype_for("Bridgetown"), PortArchetype::SugarIsland));
+        assert!(matches!(archetype_for("Boston"), PortArchetype::NorthAmericanFarming));
+        assert!(matches!(archetype_for("Cartagena"), PortArchetype::SpanishTreasure));
+        assert!(matches!(archetype_for("Tortuga"), PortArchetype::PirateHaven));
+        assert!(matches!(archetype_for("London"), PortArchetype::EuropeanLondon));
+        assert!(matches!(archetype_for("Cadiz"), PortArchetype::EuropeanCadiz));
+        assert!(matches!(archetype_for("Elmina"), PortArchetype::AfricanElmina));
+        assert!(matches!(archetype_for("Ouidah"), PortArchetype::AfricanOuidah));
         // Unknown port falls back to Minor.
-        assert!(matches!(archetype_for("Atlantis").0, PortArchetype::Minor));
+        assert!(matches!(archetype_for("Atlantis"), PortArchetype::Minor));
     }
 
     #[test]
@@ -583,11 +639,7 @@ mod tests {
         use crate::types::Position;
 
         let registry = GoodsRegistry::starter();
-        let mut market = PortMarket::with_recipe(
-            &registry,
-            PortArchetype::SugarIsland.recipe(),
-            false,
-        );
+        let mut market = PortMarket::with_recipe(&registry, PortArchetype::SugarIsland.recipe());
         let stats = ShipStats::sloop();
         let mut ship = Ship::new(Position::ZERO, ShipState::Docked);
 
@@ -609,11 +661,7 @@ mod tests {
         use crate::types::Position;
 
         let registry = GoodsRegistry::starter();
-        let mut market = PortMarket::with_recipe(
-            &registry,
-            PortArchetype::SugarIsland.recipe(),
-            false,
-        );
+        let mut market = PortMarket::with_recipe(&registry, PortArchetype::SugarIsland.recipe());
         let stats = ShipStats::sloop();
         let mut ship = Ship::new(Position::ZERO, ShipState::Docked);
         ship.silver = 1.0;
@@ -630,11 +678,7 @@ mod tests {
         use crate::types::Position;
 
         let registry = GoodsRegistry::starter();
-        let mut market = PortMarket::with_recipe(
-            &registry,
-            PortArchetype::SugarIsland.recipe(),
-            false,
-        );
+        let mut market = PortMarket::with_recipe(&registry, PortArchetype::SugarIsland.recipe());
         let stats = ShipStats::sloop();
         let mut ship = Ship::new(Position::ZERO, ShipState::Docked);
         // Pre-load cargo to capacity.
@@ -649,11 +693,7 @@ mod tests {
         use crate::types::Position;
 
         let registry = GoodsRegistry::starter();
-        let mut market = PortMarket::with_recipe(
-            &registry,
-            PortArchetype::SugarIsland.recipe(),
-            false,
-        );
+        let mut market = PortMarket::with_recipe(&registry, PortArchetype::SugarIsland.recipe());
         let stats = ShipStats::sloop();
         let mut ship = Ship::new(Position::ZERO, ShipState::Docked);
         let initial_silver = ship.silver;
@@ -673,126 +713,36 @@ mod tests {
         use crate::types::Position;
 
         let registry = GoodsRegistry::starter();
-        let mut market = PortMarket::with_recipe(
-            &registry,
-            PortArchetype::SugarIsland.recipe(),
-            false,
-        );
+        let mut market = PortMarket::with_recipe(&registry, PortArchetype::SugarIsland.recipe());
         let mut ship = Ship::new(Position::ZERO, ShipState::Docked);
         let result = market.sell(&mut ship, ids::SUGAR, 1.0, &registry);
         assert_eq!(result, Err(TradeError::InsufficientShipCargo));
     }
 
     #[test]
-    fn gateway_floors_export_sell_price_at_world_rate() {
+    fn european_port_drained_of_imports_carries_high_sugar_premium() {
+        // London's recipe consumes 200 t/mo sugar (target 1200 t).
+        // Drain its stockpile fully → factor → 2.0 → ceiling-driven
+        // local price ≈ 2× base. That high price is what makes the
+        // transatlantic route profitable; no special "world price"
+        // mechanism needed.
         let registry = GoodsRegistry::starter();
-        // Sugar island gateway with a giant local sugar surplus → local
-        // sell price would crash to floor (0.25× base). The world
-        // premium (1.30× base) should kick in.
-        let mut gateway = PortMarket::with_recipe(
-            &registry,
-            PortArchetype::SugarIsland.recipe(),
-            true,
-        );
-        gateway.stockpile.add(ids::SUGAR, 100_000.0);
+        let mut london = PortMarket::with_recipe(&registry, PortArchetype::EuropeanLondon.recipe());
+        let stk = london.stockpile.get(ids::SUGAR);
+        london.stockpile.remove(ids::SUGAR, stk);
         let base = registry.get(ids::SUGAR).base_price_pesos;
-        let p = gateway.sell_price(ids::SUGAR, &registry);
-        assert!((p - base * WORLD_EXPORT_PREMIUM).abs() < 1e-3,
-            "expected world export floor {} got {}", base * WORLD_EXPORT_PREMIUM, p);
+        let p = london.sell_price(ids::SUGAR, &registry);
+        // Mid was 2× base, sell = 0.95 × that = 1.9× base.
+        assert!(p > base * 1.5,
+            "expected drained London sugar sell price well above base; got {} (base {})", p, base);
     }
 
     #[test]
-    fn gateway_caps_import_buy_price_at_world_rate() {
+    fn african_slave_port_produces_enslaved_persons() {
         let registry = GoodsRegistry::starter();
-        // Gateway port with a starved stockpile of manufactures →
-        // local buy price would soar; world price (0.90× base) caps it.
-        let mut gateway = PortMarket::with_recipe(
-            &registry,
-            PortArchetype::Minor.recipe(),
-            true,
-        );
-        let stk = gateway.stockpile.get(ids::MANUFACTURES);
-        gateway.stockpile.remove(ids::MANUFACTURES, stk);
-        let base = registry.get(ids::MANUFACTURES).base_price_pesos;
-        let p = gateway.buy_price(ids::MANUFACTURES, &registry);
-        assert!((p - base * WORLD_IMPORT_DISCOUNT).abs() < 1e-3,
-            "expected world import cap {} got {}", base * WORLD_IMPORT_DISCOUNT, p);
-    }
-
-    #[test]
-    fn gateway_export_sell_bypasses_treasury_and_stockpile() {
-        use crate::ship::{Ship, ShipState};
-        use crate::types::Position;
-
-        let registry = GoodsRegistry::starter();
-        let mut gateway = PortMarket::with_recipe(
-            &registry,
-            PortArchetype::SugarIsland.recipe(),
-            true,
-        );
-        // Drain port silver to (almost) zero — would normally fail a sale.
-        gateway.silver = 1.0;
-        let stockpile_before = gateway.stockpile.get(ids::SUGAR);
-        let port_silver_before = gateway.silver;
-
-        let mut ship = Ship::new(Position::ZERO, ShipState::Docked);
-        ship.cargo.add(ids::SUGAR, 10.0);
-        let ship_silver_before = ship.silver;
-
-        let proceeds = gateway.sell(&mut ship, ids::SUGAR, 10.0, &registry).unwrap();
-
-        // Ship got world-price proceeds.
-        let base = registry.get(ids::SUGAR).base_price_pesos;
-        assert!((proceeds - 10.0 * base * WORLD_EXPORT_PREMIUM).abs() < 1e-2);
-        assert!((ship.silver - (ship_silver_before + proceeds)).abs() < 1e-2);
-        // Stockpile and port silver UNCHANGED — goods went to Europe,
-        // silver came from off-map.
-        assert!((gateway.stockpile.get(ids::SUGAR) - stockpile_before).abs() < 1e-3);
-        assert!((gateway.silver - port_silver_before).abs() < 1e-3);
-    }
-
-    #[test]
-    fn gateway_import_buy_bypasses_stockpile() {
-        use crate::ship::{Ship, ShipState, ShipStats};
-        use crate::types::Position;
-
-        let registry = GoodsRegistry::starter();
-        let mut gateway = PortMarket::with_recipe(
-            &registry,
-            PortArchetype::Minor.recipe(),
-            true,
-        );
-        // Empty manufactures stockpile — local would refuse to sell.
-        let stk = gateway.stockpile.get(ids::MANUFACTURES);
-        gateway.stockpile.remove(ids::MANUFACTURES, stk);
-        let stats = ShipStats::sloop();
-        let mut ship = Ship::new(Position::ZERO, ShipState::Docked);
-        let port_silver_before = gateway.silver;
-
-        let cost = gateway.buy(&mut ship, &stats, ids::MANUFACTURES, 5.0, &registry).unwrap();
-
-        let base = registry.get(ids::MANUFACTURES).base_price_pesos;
-        assert!((cost - 5.0 * base * WORLD_IMPORT_DISCOUNT).abs() < 1e-2);
-        assert!((ship.cargo.get(ids::MANUFACTURES) - 5.0).abs() < 1e-3);
-        // Stockpile stays empty (came from Europe), port silver unchanged
-        // (silver went off-map).
-        assert!(gateway.stockpile.get(ids::MANUFACTURES) <= 1e-3);
-        assert!((gateway.silver - port_silver_before).abs() < 1e-3);
-    }
-
-    #[test]
-    fn non_gateway_still_uses_local_prices() {
-        let registry = GoodsRegistry::starter();
-        let mut local = PortMarket::with_recipe(
-            &registry,
-            PortArchetype::SugarIsland.recipe(),
-            false,
-        );
-        local.stockpile.add(ids::SUGAR, 100_000.0);
-        let base = registry.get(ids::SUGAR).base_price_pesos;
-        // Non-gateway: heavy surplus crushes price to floor.
-        let p = local.sell_price(ids::SUGAR, &registry);
-        assert!(p < base * WORLD_EXPORT_PREMIUM,
-            "non-gateway should crash below world floor; got {}", p);
+        let elmina = PortMarket::with_recipe(&registry, PortArchetype::AfricanElmina.recipe());
+        // Elmina's monthly_outputs include ENSLAVED_PERSONS, so the
+        // stockpile is seeded at 6× monthly output.
+        assert!(elmina.stockpile.get(ids::ENSLAVED_PERSONS) > 0.0);
     }
 }

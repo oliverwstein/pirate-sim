@@ -39,8 +39,18 @@ const COND_IS_DOCKED: usize = 0;
 const COND_HAS_DESTINATION: usize = 1;
 const COND_IS_LOW_PROVISIONS: usize = 2;
 
-/// Below this many days of provisions, divert to nearest port.
-const LOW_PROVISIONS_DAYS: f32 = 10.0;
+/// Hard panic floor: if a sailing ship has fewer than this many days
+/// of provisions left and no destination set, divert to the nearest
+/// port. The reachability-based check below handles the normal case
+/// where a destination exists; this is the safety net for ships that
+/// somehow lost their plan or are choosing one.
+const HARD_PANIC_DAYS: f32 = 2.0;
+
+/// Extra days the AI insists on having beyond the estimated voyage
+/// time before deciding it can still reach its destination. Smaller
+/// than the trade-planner buffer because at this point the voyage is
+/// underway and most of the uncertainty is already known.
+const REACHABILITY_BUFFER_DAYS: f32 = 3.0;
 
 /// If a ship's waypoint queue is empty but it is still farther than this
 /// from its destination, request a fresh plan. Larger than `ARRIVAL_NM` so
@@ -75,10 +85,17 @@ fn build_ship_bt() -> Behavior {
             Behavior::Condition(COND_IS_DOCKED),
             dock_tree,
         ]),
-        // Priority 2: If low on provisions, divert to nearest port
+        // Priority 2: If low on provisions, divert to nearest port and
+        // continue steering toward it. The Sail action *must* run after
+        // DivertToPort: DivertToPort only updates `nav.destination` and
+        // re-plans, but doesn't compute_steering. Without Sail in the
+        // same sequence, a low-provisions ship keeps its old heading
+        // forever, which is how ships used to drift to a halt and "get
+        // stuck" mid-voyage when provisions ran out before arrival.
         Behavior::Sequence(vec![
             Behavior::Condition(COND_IS_LOW_PROVISIONS),
             Behavior::Action(ACT_DIVERT_TO_PORT),
+            Behavior::Action(ACT_SAIL),
         ]),
         // Priority 3: If has destination, sail
         Behavior::Sequence(vec![
@@ -293,6 +310,21 @@ impl<'a> BtContext for ShipBtContext<'a> {
                 if let Some(s) = self.nav.compute_steering(self.ship.position, self.stats, self.wind, land) {
                     self.ship.set_steering(s.heading, s.speed);
                     Status::Running
+                } else if self.nav.dest_port.is_some()
+                    && self.pathfind.is_some()
+                    && !self.in_destination_harbor()
+                {
+                    // We "arrived" at the path's last waypoint (the harbor
+                    // anchor) but the ship's actual position is just outside
+                    // the harbor cell set. Replan from here so the new path
+                    // ends with the ship inside the harbor zone, rather than
+                    // false-docking in open water (which is the canonical
+                    // way ships used to get stuck near small-harbor ports
+                    // like Amsterdam/Nantes).
+                    if let Some(idx) = self.nav.dest_port {
+                        self.replan_to_port(idx);
+                    }
+                    Status::Running
                 } else {
                     // Arrived at a free-form destination (no harbor zone).
                     self.ship.dock();
@@ -387,7 +419,19 @@ impl<'a> BtContext for ShipBtContext<'a> {
                 if idx >= markets.len() {
                     return Status::Success;
                 }
-                let plan = crate::trade::find_best_trade(idx, self.ports, markets, goods);
+                // Reachability budget: assume we leave with a full
+                // provisions hold. The trade planner uses this to
+                // skip destinations we can't physically reach.
+                let daily = self.stats.daily_provision_consumption().max(1e-6);
+                let provision_budget_days = self.stats.provision_capacity / daily;
+                let plan = crate::trade::find_best_trade(
+                    idx,
+                    self.ports,
+                    markets,
+                    goods,
+                    self.stats,
+                    provision_budget_days,
+                );
                 let plan = match plan {
                     Some(p) => p,
                     None => return Status::Success,
@@ -433,8 +477,25 @@ impl<'a> BtContext for ShipBtContext<'a> {
             COND_IS_DOCKED => self.ship.state == ShipState::Docked,
             COND_HAS_DESTINATION => self.nav.destination.is_some(),
             COND_IS_LOW_PROVISIONS => {
-                let days = self.ship.provisions_days_remaining(self.stats);
-                days < LOW_PROVISIONS_DAYS && self.ship.state == ShipState::Sailing
+                if self.ship.state != ShipState::Sailing {
+                    false
+                } else {
+                    let days_remaining = self.ship.provisions_days_remaining(self.stats);
+                    // If we have a planned destination, only flag low
+                    // provisions when we estimate we *cannot* reach it
+                    // with a small safety buffer. A ship within range
+                    // of its destination keeps pushing on even if the
+                    // hold is nearly empty — diverting at 80% of a
+                    // transatlantic voyage just wastes the trip.
+                    if let Some(dest) = self.nav.destination {
+                        let dist = self.ship.position.distance(dest);
+                        let voyage_days = self.stats.estimated_voyage_days(dist);
+                        days_remaining < voyage_days + REACHABILITY_BUFFER_DAYS
+                    } else {
+                        // No destination → use the hard panic floor.
+                        days_remaining < HARD_PANIC_DAYS
+                    }
+                }
             }
             _ => false,
         };

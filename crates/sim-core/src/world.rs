@@ -47,8 +47,8 @@ impl World {
         let markets: Vec<PortMarket> = ports
             .iter()
             .map(|p| {
-                let (archetype, is_gateway) = archetype_for(p.name);
-                PortMarket::with_recipe(&goods, archetype.recipe(), is_gateway)
+                let archetype = archetype_for(p.name);
+                PortMarket::with_recipe(&goods, archetype.recipe())
             })
             .collect();
 

@@ -62,7 +62,7 @@ fn tick_until(
 
 #[rstest]
 #[case::empty_provisions(0.5, 0.0, DockAction::Resupplying)]
-#[case::dirty_hull(3.0, 50.0, DockAction::Careening)]
+#[case::dirty_hull(6.0, 50.0, DockAction::Careening)]
 #[case::both_depleted(1.0, 40.0, DockAction::Resupplying)] // resupply first
 fn dock_sequence_starts_correct_action(
     #[case] provisions: f32,
@@ -105,7 +105,7 @@ fn dock_sequence_resupply_then_careen() {
 fn dock_sequence_careen_completes_to_zero() {
     let stats = ShipStats::sloop();
     let wind = calm_wind();
-    let mut ship = docked_ship(3.0, 30.0); // full provisions, dirty hull
+    let mut ship = docked_ship(6.0, 30.0); // full provisions, dirty hull
     let mut ai = ShipAI::new();
 
     // Tick until careening completes (action transitions away from Careening)
@@ -157,7 +157,7 @@ fn dock_sequence_chooses_destination_after_servicing() {
     let stats = ShipStats::sloop();
     let wind = calm_wind();
     let ports = test_ports();
-    let mut ship = docked_ship(3.0, 0.0); // fully supplied, clean hull
+    let mut ship = docked_ship(6.0, 0.0); // fully supplied, clean hull
     let mut ai = ShipAI::new(); // NO destination initially
 
     // With ports available, AI should: resupply(instant) → careen(instant) → undock(needs dest)
@@ -177,7 +177,7 @@ fn dock_sequence_chooses_destination_after_servicing() {
 fn dock_sequence_undocks_when_destination_set() {
     let stats = ShipStats::sloop();
     let wind = calm_wind();
-    let mut ship = docked_ship(3.0, 0.0); // fully supplied, clean
+    let mut ship = docked_ship(6.0, 0.0); // fully supplied, clean
     let mut ai = ShipAI::new();
 
     // Set a destination
@@ -356,9 +356,9 @@ fn low_provisions_diverts_to_nearest_port() {
         Port { name: "FarPort", position: Position { x: 500.0, y: 0.0 }, faction: sim_core::port::Faction::Spain, harbor_radius_nm: DEFAULT_HARBOR_RADIUS_NM },
     ];
 
-    // Ship at origin, heading to far port, but very low on provisions (< 10 days)
+    // Ship at origin, heading to far port, but very low on provisions (< 4 days)
     let mut ship = Ship::new(Position { x: 0.0, y: 0.0 }, ShipState::Sailing);
-    ship.provisions = 0.3; // ~6.7 days at 25 crew — below 10-day threshold
+    ship.provisions = 0.15; // ~3.3 days at 25 crew — below 4-day threshold
     let mut ai = ShipAI::with_destination(Position { x: 500.0, y: 0.0 });
 
     ai.tick(&mut ship, &stats, &wind, &ports, &empty_harbors(), None, None, None);
@@ -446,8 +446,8 @@ fn dock_cycle_sells_arriving_cargo_and_buys_outgoing() {
         Port { name: "Dest", position: Position { x: 30.0, y: 0.0 }, faction: sim_core::port::Faction::Spain, harbor_radius_nm: DEFAULT_HARBOR_RADIUS_NM },
     ];
     let mut markets = vec![
-        PortMarket::with_recipe(&goods, PortArchetype::SugarIsland.recipe(), false),
-        PortMarket::with_recipe(&goods, PortArchetype::NorthAmericanFarming.recipe(), false),
+        PortMarket::with_recipe(&goods, PortArchetype::SugarIsland.recipe()),
+        PortMarket::with_recipe(&goods, PortArchetype::NorthAmericanFarming.recipe()),
     ];
     // Bias: surplus of sugar at Home, drain Dest's sugar to zero.
     markets[0].stockpile.add(ids::SUGAR, 5_000.0);
@@ -499,8 +499,8 @@ fn ship_with_no_profitable_trade_still_undocks() {
         Port { name: "B", position: Position { x: 30.0, y: 0.0 }, faction: sim_core::port::Faction::England, harbor_radius_nm: DEFAULT_HARBOR_RADIUS_NM },
     ];
     let mut markets = vec![
-        PortMarket::with_recipe(&goods, PortArchetype::Minor.recipe(), false),
-        PortMarket::with_recipe(&goods, PortArchetype::Minor.recipe(), false),
+        PortMarket::with_recipe(&goods, PortArchetype::Minor.recipe()),
+        PortMarket::with_recipe(&goods, PortArchetype::Minor.recipe()),
     ];
 
     let mut ship = Ship::new(Position { x: 0.0, y: 0.0 }, ShipState::Docked);

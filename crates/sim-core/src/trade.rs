@@ -11,6 +11,7 @@
 use crate::goods::{GoodId, GoodsRegistry};
 use crate::market::PortMarket;
 use crate::port::Port;
+use crate::ship::ShipStats;
 
 /// Approximate per-ton-mile cost charged against arbitrage profits.
 /// Captures wages, victualling, hull wear, and convoy fees in a single
@@ -25,6 +26,12 @@ pub const TRADE_COST_PER_TON_NM: f32 = 0.001;
 /// and the ship sails ballast to the next port the AI picks.
 pub const MIN_PROFIT_THRESHOLD_PESOS_PER_TON: f32 = 0.5;
 
+/// Extra days of provisions the AI insists on having beyond the
+/// estimated voyage time before committing to a destination. Covers
+/// weather slow-downs, off-track detours, and resupply queue time
+/// at the destination port.
+pub const REACHABILITY_BUFFER_DAYS: f32 = 7.0;
+
 /// A planned trade leg: which good to buy, where to take it.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TradePlan {
@@ -37,11 +44,19 @@ pub struct TradePlan {
 /// the highest-margin option, or `None` if nothing clears the
 /// threshold. Distance cost is computed against the great-circle
 /// distance between port positions (good enough for ranking).
+///
+/// `provision_days_budget` is the number of days of provisions the
+/// ship will sail with after resupply (typically `provision_capacity /
+/// daily_consumption`). Destinations whose estimated voyage time plus
+/// `REACHABILITY_BUFFER_DAYS` exceeds the budget are skipped — the AI
+/// won't commit to a leg it can't physically reach.
 pub fn find_best_trade(
     origin_idx: usize,
     ports: &[Port],
     markets: &[PortMarket],
     goods: &GoodsRegistry,
+    stats: &ShipStats,
+    provision_days_budget: f32,
 ) -> Option<TradePlan> {
     if origin_idx >= ports.len() || origin_idx >= markets.len() {
         return None;
@@ -61,8 +76,16 @@ pub fn find_best_trade(
             if dest_idx == origin_idx {
                 continue;
             }
-            let sell_p = markets[dest_idx].sell_price(good.id, goods);
             let dist = origin.position.distance(dest.position);
+            // Reachability gate: skip any destination we can't make
+            // even after fully resupplying. The AI may still divert to
+            // unreachable ports as an emergency, but it won't *commit*
+            // to one as a profitable trade leg.
+            let voyage_days = stats.estimated_voyage_days(dist);
+            if voyage_days + REACHABILITY_BUFFER_DAYS > provision_days_budget {
+                continue;
+            }
+            let sell_p = markets[dest_idx].sell_price(good.id, goods);
             let cost = dist * TRADE_COST_PER_TON_NM;
             let profit = sell_p - buy_p - cost;
             if profit > MIN_PROFIT_THRESHOLD_PESOS_PER_TON
@@ -85,6 +108,7 @@ mod tests {
     use crate::goods::{GoodsRegistry, ids};
     use crate::market::{PortArchetype, PortMarket};
     use crate::port::Port;
+    use crate::ship::ShipStats;
     use crate::types::Position;
 
     fn synth_port(name: &'static str, x: f32, y: f32) -> Port {
@@ -96,30 +120,27 @@ mod tests {
         }
     }
 
+    fn full_budget(stats: &ShipStats) -> f32 {
+        stats.provision_capacity / stats.daily_provision_consumption()
+    }
+
     #[test]
     fn picks_arbitrage_with_largest_margin() {
         let goods = GoodsRegistry::starter();
+        let stats = ShipStats::sloop();
         let ports = vec![
             synth_port("A", 0.0, 0.0),
             synth_port("B", 100.0, 0.0),
         ];
 
-        let mut market_a = PortMarket::with_recipe(
-            &goods,
-            PortArchetype::SugarIsland.recipe(),
-            false,
-        );
-        let mut market_b = PortMarket::with_recipe(
-            &goods,
-            PortArchetype::NorthAmericanFarming.recipe(),
-            false,
-        );
+        let mut market_a = PortMarket::with_recipe(&goods, PortArchetype::SugarIsland.recipe());
+        let mut market_b = PortMarket::with_recipe(&goods, PortArchetype::NorthAmericanFarming.recipe());
         // Bias A's sugar price low (huge surplus) and B's high (drained).
         market_a.stockpile.add(ids::SUGAR, 10_000.0);
         market_b.stockpile.remove(ids::SUGAR, market_b.stockpile.get(ids::SUGAR));
 
         let markets = vec![market_a, market_b];
-        let plan = find_best_trade(0, &ports, &markets, &goods)
+        let plan = find_best_trade(0, &ports, &markets, &goods, &stats, full_budget(&stats))
             .expect("arbitrage should exist");
         assert_eq!(plan.dest_port, 1);
         assert_eq!(plan.good, ids::SUGAR);
@@ -129,6 +150,7 @@ mod tests {
     #[test]
     fn returns_none_when_no_profit() {
         let goods = GoodsRegistry::starter();
+        let stats = ShipStats::sloop();
         // Two identical "Minor" ports with the same recipe → every
         // good's price is identical at both ends, so the round trip
         // strictly loses (spread + distance cost).
@@ -137,36 +159,48 @@ mod tests {
             synth_port("B", 1000.0, 0.0),
         ];
         let markets = vec![
-            PortMarket::with_recipe(&goods, PortArchetype::Minor.recipe(), false),
-            PortMarket::with_recipe(&goods, PortArchetype::Minor.recipe(), false),
+            PortMarket::with_recipe(&goods, PortArchetype::Minor.recipe()),
+            PortMarket::with_recipe(&goods, PortArchetype::Minor.recipe()),
         ];
-        assert!(find_best_trade(0, &ports, &markets, &goods).is_none());
+        assert!(find_best_trade(0, &ports, &markets, &goods, &stats, full_budget(&stats)).is_none());
     }
 
     #[test]
     fn skips_goods_origin_lacks() {
         let goods = GoodsRegistry::starter();
+        let stats = ShipStats::sloop();
         let ports = vec![
             synth_port("A", 0.0, 0.0),
             synth_port("B", 100.0, 0.0),
         ];
-        let mut market_a = PortMarket::with_recipe(
-            &goods,
-            PortArchetype::SugarIsland.recipe(),
-            false,
-        );
+        let mut market_a = PortMarket::with_recipe(&goods, PortArchetype::SugarIsland.recipe());
         // Drain everything in A. Then nothing can be bought.
         let snapshot: Vec<_> = market_a.stockpile.iter()
             .map(|(id, t)| (id, t)).collect();
         for (id, t) in snapshot {
             market_a.stockpile.remove(id, t);
         }
-        let market_b = PortMarket::with_recipe(
-            &goods,
-            PortArchetype::NorthAmericanFarming.recipe(),
-            false,
-        );
+        let market_b = PortMarket::with_recipe(&goods, PortArchetype::NorthAmericanFarming.recipe());
         let markets = vec![market_a, market_b];
-        assert!(find_best_trade(0, &ports, &markets, &goods).is_none());
+        assert!(find_best_trade(0, &ports, &markets, &goods, &stats, full_budget(&stats)).is_none());
+    }
+
+    #[test]
+    fn skips_unreachable_destinations() {
+        let goods = GoodsRegistry::starter();
+        let stats = ShipStats::sloop();
+        // B is 50,000 NM away — far beyond what any provision budget
+        // could ever cover. Even with a profitable arbitrage we should
+        // refuse to commit.
+        let ports = vec![
+            synth_port("A", 0.0, 0.0),
+            synth_port("B", 50_000.0, 0.0),
+        ];
+        let mut market_a = PortMarket::with_recipe(&goods, PortArchetype::SugarIsland.recipe());
+        let mut market_b = PortMarket::with_recipe(&goods, PortArchetype::NorthAmericanFarming.recipe());
+        market_a.stockpile.add(ids::SUGAR, 10_000.0);
+        market_b.stockpile.remove(ids::SUGAR, market_b.stockpile.get(ids::SUGAR));
+        let markets = vec![market_a, market_b];
+        assert!(find_best_trade(0, &ports, &markets, &goods, &stats, full_budget(&stats)).is_none());
     }
 }

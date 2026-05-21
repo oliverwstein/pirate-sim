@@ -27,6 +27,11 @@ fn main() {
         ("Boston", 21),
         ("Charleston", 33),
         ("Cartagena", 41),
+        ("Havana", 53),
+        ("Fort-Royal", 67),
+        ("London", 79),
+        ("Amsterdam", 89),
+        ("Nantes", 97),
     ];
     let mut starting_silver = Vec::new();
     let mut origin_names = Vec::new();
