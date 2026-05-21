@@ -1,3 +1,4 @@
+use crate::cargo::Cargo;
 use crate::types::{Position, WindVector};
 
 /// Ship performance characteristics.
@@ -7,7 +8,8 @@ pub struct ShipStats {
     pub windward_ability: f32, // 0.0-1.0 (how well it sails upwind)
     pub no_go_half_angle: f32, // degrees from wind that ship cannot sail into
     pub crew: u32,             // crew complement (determines provision consumption)
-    pub provision_capacity: f32, // max tons of provisions
+    pub provision_capacity: f32, // max tons of provisions (separate from trade hold)
+    pub cargo_capacity_tons: f32, // max tons of trade cargo
 }
 
 impl ShipStats {
@@ -19,6 +21,7 @@ impl ShipStats {
             no_go_half_angle: 40.0,
             crew: 25,
             provision_capacity: 3.0, // ~40 days of food for 25 crew
+            cargo_capacity_tons: 60.0, // typical sloop trade hold (Phase 2 starter)
         }
     }
 
@@ -43,7 +46,8 @@ pub struct Ship {
     pub heading: f32,          // degrees (0=N, 90=E, clockwise)
     pub speed: f32,            // current speed in knots
     pub state: ShipState,
-    pub provisions: f32,       // tons of food remaining
+    pub provisions: f32,       // tons of food remaining (separate from trade hold)
+    pub cargo: Cargo,          // trade goods (subject to cargo_capacity_tons)
     pub hull_fouling: f32,     // 0 = clean, 100 = fully encrusted
 }
 
@@ -56,6 +60,7 @@ impl Ship {
             speed: 0.0,
             state,
             provisions: stats.provision_capacity,
+            cargo: Cargo::new(),
             hull_fouling: 0.0,
         }
     }
@@ -275,5 +280,23 @@ mod tests {
         let days = ship.provisions_days_remaining(&stats);
         // 3.0 tons / (25 * 0.0018 tons/day) = ~66.7 days
         assert!(days > 60.0 && days < 70.0, "Expected ~67 days, got {}", days);
+    }
+
+    #[test]
+    fn test_new_ship_has_empty_cargo() {
+        let ship = Ship::new(Position::ZERO, ShipState::Docked);
+        assert!(ship.cargo.is_empty());
+        assert_eq!(ship.cargo.total_tons(), 0.0);
+    }
+
+    #[test]
+    fn test_cargo_capacity_is_separate_from_provisions() {
+        let stats = ShipStats::sloop();
+        // Cargo hold and provisions hold are independent budgets — a fully
+        // provisioned ship has its entire trade hold still available.
+        assert!(stats.cargo_capacity_tons > 0.0);
+        assert!(stats.provision_capacity > 0.0);
+        assert!(stats.cargo_capacity_tons > stats.provision_capacity,
+            "Trade hold should dwarf the provisions hold for a merchant ship");
     }
 }
