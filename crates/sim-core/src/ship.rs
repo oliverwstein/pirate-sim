@@ -82,6 +82,12 @@ pub struct Ship {
     /// so newly-built ships can be reported accurately without the
     /// caller having to race against the build moment.
     pub starting_silver: f32,
+    /// Cumulative silver this ship has paid back to its owner port
+    /// across all completed voyages. Each time the ship docks at its
+    /// `owner_port`, any silver above the operating float is deposited
+    /// into the port treasury and added here. True lifetime P/L for a
+    /// home-ported ship is `(silver - starting_silver) + lifetime_dividends`.
+    pub lifetime_dividends: f32,
 }
 
 impl Ship {
@@ -99,6 +105,7 @@ impl Ship {
             owner_port: None,
             ship_type: crate::shiptype::ids::SLOOP,
             starting_silver: STARTING_SILVER_PESOS,
+            lifetime_dividends: 0.0,
         }
     }
 
@@ -125,6 +132,7 @@ impl Ship {
             owner_port: Some(owner_port),
             ship_type,
             starting_silver,
+            lifetime_dividends: 0.0,
         }
     }
 

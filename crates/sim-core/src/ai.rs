@@ -58,6 +58,23 @@ const REACHABILITY_BUFFER_DAYS: f32 = 3.0;
 /// that a ship drifting past its smoothed route promptly recovers.
 const REPLAN_DISTANCE_NM: f32 = 25.0;
 
+/// Operating float kept aboard after a home-port settlement: enough
+/// to top up provisions at any foreign port, plus a modest reserve
+/// for incidentals (pilotage fees, minor repairs). All silver above
+/// this is paid out to the owner port on docking.
+const HOME_PORT_FLOAT_SILVER: f32 = 500.0;
+
+/// On outfitting at home, the ship will try to top its strongbox up
+/// to this many times the estimated cost of one full outbound hold.
+/// Gives a cushion for partial-cargo top-ups at intermediate ports
+/// and small contingencies en route.
+const OUTFIT_DRAW_MULTIPLE: f32 = 2.0;
+
+/// No single outfit draw can take more than this fraction of the home
+/// port's silver. Prevents a busy yard's working capital from being
+/// drained by one ship's outbound cargo.
+const OUTFIT_PORT_FRACTION_CAP: f32 = 0.2;
+
 /// What the ship is doing while docked (for display purposes).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum DockAction {
@@ -288,6 +305,25 @@ impl<'a> BtContext for ShipBtContext<'a> {
                     self.nav.destination = None;
                     self.nav.dest_port = None;
                     self.nav.clear_path();
+                    // Home-port settlement: if this is the owner port,
+                    // the supercargo books proceeds with the owners.
+                    // Silver above the operating float is paid into
+                    // the port treasury (dividend to shareholders);
+                    // the ship keeps just enough to cover provisions
+                    // and incidentals at the next port of call.
+                    if let (Some(idx), Some(owner)) = (port_idx, self.ship.owner_port) {
+                        if idx == owner {
+                            if let Some(markets) = self.markets.as_deref_mut() {
+                                if idx < markets.len() {
+                                    let paid = markets[idx].deposit_owner_profit(
+                                        self.ship,
+                                        HOME_PORT_FLOAT_SILVER,
+                                    );
+                                    self.ship.lifetime_dividends += paid;
+                                }
+                            }
+                        }
+                    }
                     return Status::Success;
                 }
 
@@ -424,6 +460,23 @@ impl<'a> BtContext for ShipBtContext<'a> {
                 // skip destinations we can't physically reach.
                 let daily = self.stats.daily_provision_consumption().max(1e-6);
                 let provision_budget_days = self.stats.provision_capacity / daily;
+                // Home bias: as the ship's strongbox swells above the
+                // operating float, increase its pull toward home. This
+                // models the supercargo's fiduciary duty to settle
+                // proceeds with the owners — a ship sitting on a fat
+                // purse won't keep chasing marginal arbitrage forever.
+                let home_bias = self.ship.owner_port.map(|home_idx| {
+                    let surplus = (self.ship.silver - HOME_PORT_FLOAT_SILVER).max(0.0);
+                    // Roughly: a ship sitting on +5k surplus pulls
+                    // toward home with a 25 peso/ton bias, fully
+                    // dominating ordinary arbitrage. The cap of 200
+                    // ensures a flush ship will home-in even against
+                    // the fattest opportunistic margin.
+                    crate::trade::HomeBias {
+                        home_port: home_idx,
+                        bias_pesos_per_ton: (surplus / 200.0).min(200.0),
+                    }
+                });
                 let plan = crate::trade::find_best_trade(
                     idx,
                     self.ports,
@@ -431,6 +484,7 @@ impl<'a> BtContext for ShipBtContext<'a> {
                     goods,
                     self.stats,
                     provision_budget_days,
+                    home_bias,
                 );
                 let plan = match plan {
                     Some(p) => p,
@@ -443,6 +497,25 @@ impl<'a> BtContext for ShipBtContext<'a> {
                 let unit = market.buy_price(plan.good, goods).max(0.0001);
                 let cargo_room = self.stats.cargo_capacity_tons
                     - self.ship.cargo.total_tons();
+
+                // Outfitting draw: if this is the owner port, top the
+                // ship's strongbox up from the port treasury before
+                // computing what we can afford. Historically the
+                // outbound cargo was paid for with capital drawn from
+                // the home-port owners, not from cash earned on prior
+                // voyages — those proceeds were settled on arrival.
+                if let Some(owner) = self.ship.owner_port {
+                    if owner == idx {
+                        let want_tons = cargo_room.min(market.stockpile.get(plan.good));
+                        let target = unit * want_tons * OUTFIT_DRAW_MULTIPLE;
+                        market.draw_for_outfit(
+                            self.ship,
+                            target,
+                            OUTFIT_PORT_FRACTION_CAP,
+                        );
+                    }
+                }
+
                 let affordable = self.ship.silver / unit;
                 let in_stock = market.stockpile.get(plan.good);
                 let tons = cargo_room.min(affordable).min(in_stock).max(0.0);

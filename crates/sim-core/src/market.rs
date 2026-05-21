@@ -321,6 +321,62 @@ impl PortMarket {
         self.settle_debt();
         Ok(proceeds)
     }
+
+    /// Home-port settlement. Called when a ship docks at its owner
+    /// port: any silver above `float` is paid to the port treasury
+    /// (the "owners"), and the ship is left with exactly `float`
+    /// silver for incidental running costs.
+    ///
+    /// Returns the deposited amount (always ≥ 0). If the ship's
+    /// silver is already at or below `float`, this is a no-op.
+    ///
+    /// Models 17th-century practice: the supercargo books proceeds
+    /// with the owners on return; dividends go to the share-holding
+    /// merchants of the home port. The ship's "treasury" only fills
+    /// up again when capital is drawn for the next outbound cargo
+    /// via [`Self::draw_for_outfit`].
+    pub fn deposit_owner_profit(
+        &mut self,
+        ship: &mut crate::ship::Ship,
+        float: f32,
+    ) -> f32 {
+        let surplus = ship.silver - float;
+        if surplus <= 0.0 {
+            return 0.0;
+        }
+        ship.silver -= surplus;
+        self.silver += surplus;
+        surplus
+    }
+
+    /// Outbound-cargo capital draw. Called when a ship is at its
+    /// owner port and about to load cargo: tops up `ship.silver` to
+    /// `target` by withdrawing from the port treasury. The withdrawal
+    /// is capped at `port_fraction_cap × self.silver` so one ship
+    /// can't drain a port's working capital.
+    ///
+    /// Returns the actual amount drawn. If the port has insufficient
+    /// silver (or the cap binds), the ship sails with what it could
+    /// get; the buy logic will then load a partial cargo.
+    pub fn draw_for_outfit(
+        &mut self,
+        ship: &mut crate::ship::Ship,
+        target: f32,
+        port_fraction_cap: f32,
+    ) -> f32 {
+        let needed = target - ship.silver;
+        if needed <= 0.0 {
+            return 0.0;
+        }
+        let cap = (self.silver * port_fraction_cap).max(0.0);
+        let drawn = needed.min(cap).max(0.0);
+        if drawn <= 0.0 {
+            return 0.0;
+        }
+        self.silver -= drawn;
+        ship.silver += drawn;
+        drawn
+    }
 }
 
 /// Why a buy/sell transaction was rejected.

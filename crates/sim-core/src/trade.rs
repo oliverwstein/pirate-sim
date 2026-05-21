@@ -40,6 +40,18 @@ pub struct TradePlan {
     pub estimated_profit_per_ton: f32,
 }
 
+/// Optional bias toward the ship's home (owner) port. When `Some`,
+/// the planner adds `bias_pesos_per_ton` to the apparent profit of
+/// any candidate destination that *is* the home port — pulling
+/// cash-laden ships back to settle with their owners even when a
+/// marginally better foreign opportunity exists. With `bias = 0` or
+/// `home_port = None` the planner behaves as a pure profit-maximizer.
+#[derive(Debug, Clone, Copy)]
+pub struct HomeBias {
+    pub home_port: usize,
+    pub bias_pesos_per_ton: f32,
+}
+
 /// Search every (good, destination) pair from `origin_idx` and return
 /// the highest-margin option, or `None` if nothing clears the
 /// threshold. Distance cost is computed against the great-circle
@@ -50,6 +62,9 @@ pub struct TradePlan {
 /// daily_consumption`). Destinations whose estimated voyage time plus
 /// `REACHABILITY_BUFFER_DAYS` exceeds the budget are skipped — the AI
 /// won't commit to a leg it can't physically reach.
+///
+/// `home_bias` (optional) lets the AI bias the choice toward the
+/// ship's owner port; see [`HomeBias`].
 pub fn find_best_trade(
     origin_idx: usize,
     ports: &[Port],
@@ -57,6 +72,7 @@ pub fn find_best_trade(
     goods: &GoodsRegistry,
     stats: &ShipStats,
     provision_days_budget: f32,
+    home_bias: Option<HomeBias>,
 ) -> Option<TradePlan> {
     if origin_idx >= ports.len() || origin_idx >= markets.len() {
         return None;
@@ -64,7 +80,7 @@ pub fn find_best_trade(
     let origin = &ports[origin_idx];
     let origin_market = &markets[origin_idx];
 
-    let mut best: Option<TradePlan> = None;
+    let mut best: Option<(TradePlan, f32)> = None; // (plan, score)
     for good in goods.iter() {
         let buy_p = origin_market.buy_price(good.id, goods);
         // Refuse to even consider goods the origin is dry on — saves
@@ -77,10 +93,6 @@ pub fn find_best_trade(
                 continue;
             }
             let dist = origin.position.distance(dest.position);
-            // Reachability gate: skip any destination we can't make
-            // even after fully resupplying. The AI may still divert to
-            // unreachable ports as an emergency, but it won't *commit*
-            // to one as a profitable trade leg.
             let voyage_days = stats.estimated_voyage_days(dist);
             if voyage_days + REACHABILITY_BUFFER_DAYS > provision_days_budget {
                 continue;
@@ -88,18 +100,26 @@ pub fn find_best_trade(
             let sell_p = markets[dest_idx].sell_price(good.id, goods);
             let cost = dist * TRADE_COST_PER_TON_NM;
             let profit = sell_p - buy_p - cost;
+            // Apply home bias (if any) to the *ranking score*, not
+            // the reported profit — so analytics still see the
+            // unbiased margin.
+            let bonus = match home_bias {
+                Some(hb) if hb.home_port == dest_idx => hb.bias_pesos_per_ton,
+                _ => 0.0,
+            };
+            let score = profit + bonus;
             if profit > MIN_PROFIT_THRESHOLD_PESOS_PER_TON
-                && best.as_ref().map_or(true, |b| profit > b.estimated_profit_per_ton)
+                && best.as_ref().map_or(true, |(_, s)| score > *s)
             {
-                best = Some(TradePlan {
+                best = Some((TradePlan {
                     good: good.id,
                     dest_port: dest_idx,
                     estimated_profit_per_ton: profit,
-                });
+                }, score));
             }
         }
     }
-    best
+    best.map(|(p, _)| p)
 }
 
 #[cfg(test)]
@@ -141,7 +161,7 @@ mod tests {
         market_b.stockpile.remove(ids::SUGAR, market_b.stockpile.get(ids::SUGAR));
 
         let markets = vec![market_a, market_b];
-        let plan = find_best_trade(0, &ports, &markets, &goods, &stats, full_budget(&stats))
+        let plan = find_best_trade(0, &ports, &markets, &goods, &stats, full_budget(&stats), None)
             .expect("arbitrage should exist");
         assert_eq!(plan.dest_port, 1);
         assert_eq!(plan.good, ids::SUGAR);
@@ -163,7 +183,7 @@ mod tests {
             PortMarket::with_recipe(&goods, PortArchetype::Minor.recipe()),
             PortMarket::with_recipe(&goods, PortArchetype::Minor.recipe()),
         ];
-        assert!(find_best_trade(0, &ports, &markets, &goods, &stats, full_budget(&stats)).is_none());
+        assert!(find_best_trade(0, &ports, &markets, &goods, &stats, full_budget(&stats), None).is_none());
     }
 
     #[test]
@@ -183,7 +203,7 @@ mod tests {
         }
         let market_b = PortMarket::with_recipe(&goods, PortArchetype::NorthAmericanFarming.recipe());
         let markets = vec![market_a, market_b];
-        assert!(find_best_trade(0, &ports, &markets, &goods, &stats, full_budget(&stats)).is_none());
+        assert!(find_best_trade(0, &ports, &markets, &goods, &stats, full_budget(&stats), None).is_none());
     }
 
     #[test]
@@ -202,6 +222,6 @@ mod tests {
         market_a.stockpile.add(ids::SUGAR, 10_000.0);
         market_b.stockpile.remove(ids::SUGAR, market_b.stockpile.get(ids::SUGAR));
         let markets = vec![market_a, market_b];
-        assert!(find_best_trade(0, &ports, &markets, &goods, &stats, full_budget(&stats)).is_none());
+        assert!(find_best_trade(0, &ports, &markets, &goods, &stats, full_budget(&stats), None).is_none());
     }
 }
