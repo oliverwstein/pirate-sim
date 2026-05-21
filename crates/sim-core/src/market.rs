@@ -485,7 +485,7 @@ impl PortArchetype {
             // coin. Differentiated regionally: Ouidah took relatively
             // more rum, Elmina relatively more iron/manufactures.
             PortArchetype::AfricanElmina => (
-                &[(ENSLAVED_PERSONS, 8.0), (PROVISIONS, 8.0)],
+                &[(ENSLAVED_PERSONS, 30.0), (PROVISIONS, 8.0)],
                 &[
                     (MANUFACTURES, 12.0),
                     (RUM, 4.0),
@@ -493,7 +493,7 @@ impl PortArchetype {
                 ],
             ),
             PortArchetype::AfricanOuidah => (
-                &[(ENSLAVED_PERSONS, 10.0), (PROVISIONS, 10.0)],
+                &[(ENSLAVED_PERSONS, 40.0), (PROVISIONS, 10.0)],
                 &[
                     (MANUFACTURES, 8.0),
                     (RUM, 8.0),

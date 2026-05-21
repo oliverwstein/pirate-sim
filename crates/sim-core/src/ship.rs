@@ -2,6 +2,7 @@ use crate::cargo::Cargo;
 use crate::types::{Position, WindVector};
 
 /// Ship performance characteristics.
+#[derive(Clone, Debug)]
 pub struct ShipStats {
     pub speed_typical: f32,    // knots in moderate trade winds
     pub speed_max: f32,        // absolute maximum

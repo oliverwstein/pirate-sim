@@ -9,8 +9,12 @@
 //! Usage: `cargo run --release --example bench_trade`
 
 use sim_core::ai::ShipAI;
-use sim_core::goods::ids;
-use sim_core::ship::{Ship, ShipState};
+use sim_core::equilibrium::{
+    self, EquilibriumScenario, FreightCostModel, PortSpec,
+};
+use sim_core::goods::{ids, GoodId};
+use sim_core::market::archetype_for;
+use sim_core::ship::{Ship, ShipState, ShipStats};
 use sim_core::world::World;
 use std::path::Path;
 
@@ -124,6 +128,84 @@ fn main() {
     println!();
     println!("Fleet total P/L: {:+.0} pesos", total_pl);
     println!("Bankrupt ships:  {}/{}", bankrupt, n_ships);
+
+    // ── Equilibrium divergence diagnostic. Solve the Kantorovich LP
+    //    against the same world (linear and voyage-cost models). For
+    //    every (port, good) cell where the equilibrium has an opinion,
+    //    average the day-0 vs end-of-run simulation prices and compare
+    //    to the equilibrium "delivered" price. Big numbers = the
+    //    simulation is structurally far from where a frictionless
+    //    trade-allocator would push it.
+    let port_specs: Vec<PortSpec> = world.ports
+        .iter()
+        .map(|p| PortSpec::from_world(p, archetype_for(p.name).recipe()))
+        .collect();
+    let voyage_freight = FreightCostModel::ShipBased {
+        stats: ShipStats::sloop(),
+        day_rate_pesos: 8.0,
+        provisions_price_per_ton: 18.0,
+    };
+    let eq = equilibrium::solve(&EquilibriumScenario {
+        ports: port_specs.clone(),
+        goods: &world.goods,
+        freight: voyage_freight,
+    });
+
+    let mut diffs: Vec<(String, &str, f32, f32, f32)> = Vec::new();
+    for (port_idx, port) in world.ports.iter().enumerate() {
+        let spec = &port_specs[port_idx];
+        let mut seen = std::collections::HashSet::new();
+        for (good, _) in spec.recipe.monthly_outputs.iter()
+            .chain(spec.recipe.monthly_inputs.iter())
+        {
+            let good: GoodId = *good;
+            if !seen.insert(good) {
+                continue;
+            }
+            if let Some(p_eq) = eq.price_at(port_idx, good) {
+                let p_sim = world.markets[port_idx].buy_price(good, &world.goods);
+                let pct = if p_eq > 1.0 {
+                    ((p_sim - p_eq) / p_eq).abs()
+                } else {
+                    0.0
+                };
+                diffs.push((
+                    port.name.to_string(),
+                    world.goods.get(good).name,
+                    p_sim,
+                    p_eq,
+                    pct,
+                ));
+            }
+        }
+    }
+
+    println!();
+    println!("Equilibrium vs end-of-run simulation prices (voyage-cost LP):");
+    println!("  cells compared: {}", diffs.len());
+    if !diffs.is_empty() {
+        let mean = diffs.iter().map(|d| d.4).sum::<f32>() / diffs.len() as f32;
+        let max = diffs.iter().map(|d| d.4).fold(0.0_f32, f32::max);
+        println!("  mean abs % deviation: {:.0}%", mean * 100.0);
+        println!("  max  abs % deviation: {:.0}%", max * 100.0);
+
+        // Show the 10 worst-divergence cells — these are the leading
+        // candidates for "something's mispriced" investigation.
+        let mut sorted = diffs.clone();
+        sorted.sort_by(|a, b| b.4.partial_cmp(&a.4).unwrap());
+        println!();
+        println!("  Top 10 mispriced cells (|sim − eq| / eq):");
+        println!(
+            "    {:<24} {:<18} {:>10} {:>10} {:>8}",
+            "port", "good", "sim", "eq", "Δ%"
+        );
+        for d in sorted.iter().take(10) {
+            println!(
+                "    {:<24} {:<18} {:>10.1} {:>10.1} {:>7.0}%",
+                d.0, d.1, d.2, d.3, d.4 * 100.0
+            );
+        }
+    }
 
     // A coarse "calibration health" verdict. In absence of piracy and
     // shipwreck (Phase 3 work), every ship that follows the trader AI

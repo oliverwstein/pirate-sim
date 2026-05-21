@@ -15,3 +15,4 @@ pub mod cargo;
 pub mod market;
 pub mod trade;
 pub mod world;
+pub mod equilibrium;
