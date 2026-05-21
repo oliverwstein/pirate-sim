@@ -64,8 +64,9 @@ pub struct PortMarket {
 
 impl PortMarket {
     /// Construct a market with a uniform initial stockpile of every
-    /// good in the registry. Used during world load before per-port
-    /// recipes are dialed in.
+    /// good in the registry. Useful for tests; `World::load` instead
+    /// uses `with_recipe` to seed each port to its target stock so
+    /// prices start near base.
     pub fn with_initial_stockpile(registry: &GoodsRegistry) -> Self {
         let mut stockpile = Cargo::new();
         for good in registry.iter() {
@@ -76,6 +77,52 @@ impl PortMarket {
             silver: 0.0,
             recipe: ProductionRecipe::empty(),
             is_europe_gateway: false,
+        }
+    }
+
+    /// Construct a market initialized to the recipe's *target* stock
+    /// for every good it produces or consumes. This makes the opening
+    /// price for each recipe-good equal to `base_price`, so the
+    /// economy starts in equilibrium and drifts as production and
+    /// trade happen.
+    pub fn with_recipe(
+        _registry: &GoodsRegistry,
+        recipe: ProductionRecipe,
+        is_europe_gateway: bool,
+    ) -> Self {
+        let mut stockpile = Cargo::new();
+        for (id, tons) in &recipe.monthly_outputs {
+            stockpile.add(*id, *tons * 6.0);
+        }
+        for (id, tons) in &recipe.monthly_inputs {
+            // If a good is both produced and consumed (rare), the
+            // input pass would double-add — guard with current value.
+            let already = stockpile.get(*id);
+            if already <= 0.0 {
+                stockpile.add(*id, *tons * 6.0);
+            }
+        }
+        Self {
+            stockpile,
+            silver: 0.0,
+            recipe,
+            is_europe_gateway,
+        }
+    }
+
+    /// Apply one month of the recipe: outputs are produced and added
+    /// to stockpiles (scaled by `prosperity`); inputs are consumed
+    /// from stockpiles (clamped at zero — a port that lacks an input
+    /// simply loses the value and produces nothing extra). Step 4 v1
+    /// applies output and input independently; coupling production to
+    /// input availability is a refinement deferred to Phase 3.
+    pub fn tick_month(&mut self) {
+        let prosperity = self.recipe.prosperity.max(0.0);
+        for (id, tons) in self.recipe.monthly_outputs.clone() {
+            self.stockpile.add(id, tons * prosperity);
+        }
+        for (id, tons) in self.recipe.monthly_inputs.clone() {
+            self.stockpile.remove(id, tons * prosperity);
         }
     }
 
@@ -116,6 +163,111 @@ impl PortMarket {
             .find(|(g, _)| *g == id)
             .map(|(_, t)| *t * 6.0);
         from_outputs.or(from_inputs).unwrap_or(0.0)
+    }
+}
+
+/// Historical archetype for a port, used to assign a default recipe.
+#[derive(Clone, Copy, Debug)]
+pub enum PortArchetype {
+    /// Sugar/molasses/rum producer; imports provisions, manufactures,
+    /// enslaved labor (Bridgetown, Port Royal, Martinique, ...).
+    SugarIsland,
+    /// Tobacco / cacao producer; imports provisions and manufactures.
+    TobaccoColony,
+    /// North Atlantic provisioner; produces salt-meat / flour / naval
+    /// stores; imports sugar, rum, manufactures (Boston, Philadelphia).
+    NorthAmericanFarming,
+    /// Spanish silver/treasure port (Cartagena, Portobelo, Veracruz);
+    /// produces silver; imports manufactures, provisions, enslaved.
+    SpanishTreasure,
+    /// Spanish secondary entrepôt — modest sugar/tobacco, treasure
+    /// transshipment (Havana, Santo Domingo, San Juan).
+    SpanishEntrepot,
+    /// Pirate haven: consumes provisions/rum/manufactures, produces
+    /// nothing (the goods come in by other means).
+    PirateHaven,
+    /// Generic minor port: imports provisions and manufactures.
+    Minor,
+}
+
+impl PortArchetype {
+    /// Build a recipe for this archetype. Numbers are tons/month at
+    /// prosperity 1.0 — calibrated coarsely against `production-model.md`.
+    pub fn recipe(self) -> ProductionRecipe {
+        use crate::goods::ids::*;
+        let (outputs, inputs): (&[(GoodId, f32)], &[(GoodId, f32)]) = match self {
+            PortArchetype::SugarIsland => (
+                &[(SUGAR, 80.0), (MOLASSES, 30.0), (RUM, 15.0)],
+                &[(PROVISIONS, 12.0), (MANUFACTURES, 6.0), (ENSLAVED_PERSONS, 3.0), (NAVAL_STORES, 2.0)],
+            ),
+            PortArchetype::TobaccoColony => (
+                &[(TOBACCO, 60.0)],
+                &[(PROVISIONS, 6.0), (MANUFACTURES, 4.0), (ENSLAVED_PERSONS, 2.0)],
+            ),
+            PortArchetype::NorthAmericanFarming => (
+                &[(PROVISIONS, 60.0), (NAVAL_STORES, 30.0), (RUM, 10.0)],
+                &[(SUGAR, 15.0), (MOLASSES, 25.0), (MANUFACTURES, 10.0)],
+            ),
+            PortArchetype::SpanishTreasure => (
+                &[(SILVER, 5.0)],
+                &[(MANUFACTURES, 8.0), (PROVISIONS, 6.0), (ENSLAVED_PERSONS, 2.0)],
+            ),
+            PortArchetype::SpanishEntrepot => (
+                &[(SUGAR, 20.0), (TOBACCO, 15.0)],
+                &[(MANUFACTURES, 5.0), (PROVISIONS, 5.0)],
+            ),
+            PortArchetype::PirateHaven => (
+                &[],
+                &[(PROVISIONS, 4.0), (RUM, 3.0), (MANUFACTURES, 2.0)],
+            ),
+            PortArchetype::Minor => (
+                &[],
+                &[(PROVISIONS, 2.0), (MANUFACTURES, 1.0)],
+            ),
+        };
+        ProductionRecipe {
+            monthly_outputs: outputs.to_vec(),
+            monthly_inputs: inputs.to_vec(),
+            prosperity: 1.0,
+        }
+    }
+}
+
+/// Map a port name to its archetype + Europe-gateway flag. Atlantic
+/// gateway ports both have local recipes *and* expose the off-map
+/// world price (step 7).
+pub fn archetype_for(port_name: &str) -> (PortArchetype, bool) {
+    use PortArchetype::*;
+    match port_name {
+        // Sugar islands
+        "Bridgetown" => (SugarIsland, true),  // Barbados — England gateway
+        "Port Royal" | "Kingston" => (SugarIsland, false),
+        "Basseterre" | "English Harbour" => (SugarIsland, false),
+        "Fort-Royal" | "Basse-Terre" => (SugarIsland, false),
+        "Cap-Français" | "Petit-Goâve" => (SugarIsland, false),
+        "Paramaribo" | "Cayenne" => (SugarIsland, false),
+        "Willemstad" | "St. Eustatius" => (SugarIsland, false),
+
+        // Tobacco
+        "Charleston" => (TobaccoColony, true),
+
+        // North American farming
+        "Boston" | "Philadelphia" | "New York" => (NorthAmericanFarming, true),
+
+        // Spanish silver
+        "Cartagena" | "Portobelo" => (SpanishTreasure, false),
+
+        // Spanish entrepôt
+        "Havana" | "Santo Domingo" | "Santiago de Cuba" | "San Juan" => (SpanishEntrepot, false),
+
+        // Pirate
+        "Tortuga" | "Nassau" | "Tobago" => (PirateHaven, false),
+
+        // Bermuda — naval stores transshipment
+        "Bermuda" => (NorthAmericanFarming, false),
+
+        // Minor / other
+        _ => (Minor, false),
     }
 }
 
@@ -203,5 +355,72 @@ mod tests {
         let p = market.price(ids::SUGAR, &registry);
         assert!((p - base * 2.0).abs() < 1e-3);
         assert!(p <= base * PRICE_CEIL_FRAC + 1e-3);
+    }
+
+    #[test]
+    fn with_recipe_starts_at_target() {
+        let registry = GoodsRegistry::starter();
+        let recipe = PortArchetype::SugarIsland.recipe();
+        let market = PortMarket::with_recipe(&registry, recipe.clone(), true);
+        // Each output and input should sit at 6× monthly throughput.
+        for (id, tons) in &recipe.monthly_outputs {
+            assert_eq!(market.stockpile.get(*id), *tons * 6.0);
+        }
+        for (id, tons) in &recipe.monthly_inputs {
+            assert_eq!(market.stockpile.get(*id), *tons * 6.0);
+        }
+        // Prices should equal base because stockpile == target.
+        let base = registry.get(ids::SUGAR).base_price_pesos;
+        let p = market.price(ids::SUGAR, &registry);
+        assert!((p - base).abs() < 1e-3);
+    }
+
+    #[test]
+    fn tick_month_produces_outputs_and_consumes_inputs() {
+        let registry = GoodsRegistry::starter();
+        let recipe = PortArchetype::SugarIsland.recipe();
+        let mut market = PortMarket::with_recipe(&registry, recipe.clone(), false);
+        let sugar_before = market.stockpile.get(ids::SUGAR);
+        let provisions_before = market.stockpile.get(ids::PROVISIONS);
+
+        market.tick_month();
+
+        // Sugar (output) increased by its monthly figure.
+        let sugar_out = recipe.monthly_outputs.iter()
+            .find(|(g, _)| *g == ids::SUGAR).unwrap().1;
+        assert!((market.stockpile.get(ids::SUGAR) - (sugar_before + sugar_out)).abs() < 1e-3);
+        // Provisions (input) decreased by its monthly figure.
+        let prov_in = recipe.monthly_inputs.iter()
+            .find(|(g, _)| *g == ids::PROVISIONS).unwrap().1;
+        assert!((market.stockpile.get(ids::PROVISIONS) - (provisions_before - prov_in)).abs() < 1e-3);
+    }
+
+    #[test]
+    fn tick_month_clamps_inputs_at_zero() {
+        let registry = GoodsRegistry::starter();
+        let mut recipe = ProductionRecipe::empty();
+        recipe.monthly_inputs.push((ids::PROVISIONS, 1000.0));
+        let mut market = PortMarket::with_recipe(&registry, recipe, false);
+        // Stockpile = 6000 (target), tick_month consumes 1000 → 5000.
+        market.tick_month();
+        assert_eq!(market.stockpile.get(ids::PROVISIONS), 5000.0);
+        // Run more ticks than there is stockpile.
+        for _ in 0..10 {
+            market.tick_month();
+        }
+        // Should bottom out at zero, not go negative.
+        assert_eq!(market.stockpile.get(ids::PROVISIONS), 0.0);
+    }
+
+    #[test]
+    fn archetype_for_known_ports() {
+        let (a, gw) = archetype_for("Bridgetown");
+        assert!(matches!(a, PortArchetype::SugarIsland));
+        assert!(gw);
+        assert!(matches!(archetype_for("Boston").0, PortArchetype::NorthAmericanFarming));
+        assert!(matches!(archetype_for("Cartagena").0, PortArchetype::SpanishTreasure));
+        assert!(matches!(archetype_for("Tortuga").0, PortArchetype::PirateHaven));
+        // Unknown port falls back to Minor.
+        assert!(matches!(archetype_for("Atlantis").0, PortArchetype::Minor));
     }
 }

@@ -5,7 +5,7 @@ use crate::coastline::{CoastlineMap, LandMesh};
 use crate::goods::GoodsRegistry;
 use crate::harbor::HarborMap;
 use crate::map::MapSystem;
-use crate::market::PortMarket;
+use crate::market::{PortMarket, archetype_for};
 use crate::navmesh::Navmesh;
 use crate::pathfind::PathfindContext;
 use crate::port::{Port, all_ports};
@@ -27,6 +27,9 @@ pub struct World {
     pub ships: Vec<Ship>,
     pub ship_ais: Vec<ShipAI>,
     pub date: SimDate,
+    /// The month for which `markets` last received their monthly tick.
+    /// Used to fire production exactly once per month transition.
+    last_market_month: u8,
 }
 
 impl World {
@@ -43,8 +46,14 @@ impl World {
         let goods = GoodsRegistry::starter();
         let markets: Vec<PortMarket> = ports
             .iter()
-            .map(|_| PortMarket::with_initial_stockpile(&goods))
+            .map(|p| {
+                let (archetype, is_gateway) = archetype_for(p.name);
+                PortMarket::with_recipe(&goods, archetype.recipe(), is_gateway)
+            })
             .collect();
+
+        let date = SimDate::new(1680, 0, 1);
+        let last_market_month = date.month();
 
         Self {
             map,
@@ -58,7 +67,8 @@ impl World {
             markets,
             ships: Vec::new(),
             ship_ais: Vec::new(),
-            date: SimDate::new(1680, 0, 1),
+            date,
+            last_market_month,
         }
     }
 
@@ -72,6 +82,16 @@ impl World {
     pub fn tick(&mut self) {
         let stats = ShipStats::sloop();
         let month = self.date.month();
+
+        // Monthly economic tick: produce outputs, consume inputs at every
+        // port. Fired exactly once per month transition.
+        if month != self.last_market_month {
+            for market in &mut self.markets {
+                market.tick_month();
+            }
+            self.last_market_month = month;
+        }
+
         let pathfind = PathfindContext::new(
             &self.map.land,
             &self.weather.wind,
