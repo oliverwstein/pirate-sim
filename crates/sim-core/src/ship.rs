@@ -129,6 +129,13 @@ pub struct Ship {
     /// port's market silver on each dock visit. See
     /// `planning/crewing-plan.md §6`.
     pub wages_owed_pesos: f32,
+    /// Crew morale in `[0.0, 1.0]`. 1.0 = content, 0.0 = mutinous.
+    /// Ticks hourly per `planning/crewing-plan.md §8`: drops with
+    /// low provisions, unpaid wages, damage (Step 7), and rises
+    /// with rest in port and prize money (Step 8). Effect bands
+    /// throttle recruitment (0.4–0.7) and speed (0.25–0.4); deeper
+    /// bands trigger mutiny / desertion in Step 9.
+    pub morale: f32,
 }
 
 impl Ship {
@@ -152,6 +159,7 @@ impl Ship {
             // loop is for shipyard-built hulls only.
             crew_alive: stats.crew_typical(),
             wages_owed_pesos: 0.0,
+            morale: 1.0,
         }
     }
 
@@ -184,6 +192,7 @@ impl Ship {
             debt: 0.0,
             crew_alive: 0,
             wages_owed_pesos: 0.0,
+            morale: 1.0,
         }
     }
 
@@ -222,7 +231,11 @@ impl Ship {
     pub fn effective_speed(&self, stats: &ShipStats, _wind: &WindVector) -> f32 {
         let fouling_penalty = 1.0 - self.hull_fouling * 0.003;
         let crew_mult = self.crew_speed_multiplier(stats);
-        self.speed * fouling_penalty * crew_mult
+        // Morale band 0.25–0.4: sullen crew, -20% speed (crewing-plan §8.2).
+        // Above 0.4 = no effect; below 0.25 the ship is heading for
+        // mutiny (Step 9) but for now still moves at the sullen rate.
+        let morale_mult = if self.morale >= 0.4 { 1.0 } else { 0.8 };
+        self.speed * fouling_penalty * crew_mult * morale_mult
     }
 
     /// Advance position by one time step. Returns new position (doesn't apply it).
@@ -275,6 +288,41 @@ impl Ship {
             let t = (ratio - 0.6) / 0.4;
             0.84 + 0.16 * t
         }
+    }
+
+    /// Tick morale by one hour per `planning/crewing-plan.md §8.1`.
+    /// Modifiers wired now: low/critical provisions, overdue wages,
+    /// rested-in-port recovery. Instant deltas from prize money
+    /// (Step 8) and damage events (Step 7) are stubbed.
+    ///
+    /// Note: `_stats` is accepted for API consistency; current
+    /// modifiers read only from `self`.
+    pub fn tick_morale(&mut self, _stats: &ShipStats) {
+        let days_left = self.daily_provision_burn().recip() * self.provisions;
+        let mut delta = 0.0_f32;
+
+        // Provisions effects (critical replaces low — not additive).
+        if days_left < MORALE_PROVISIONS_CRITICAL_DAYS {
+            delta -= MORALE_LOSS_PROVISIONS_CRITICAL;
+        } else if days_left < MORALE_PROVISIONS_LOW_DAYS {
+            delta -= MORALE_LOSS_PROVISIONS_LOW;
+        }
+
+        // Wages overdue: > 2x current monthly wage bill.
+        let monthly_bill = self.crew_alive as f32 * WAGE_PESOS_PER_MAN_MONTH;
+        if monthly_bill > 0.0 && self.wages_owed_pesos > 2.0 * monthly_bill {
+            delta -= MORALE_LOSS_WAGES_OVERDUE;
+        }
+
+        // Rested in port: docked, full belly, no wage debt.
+        if self.state == ShipState::Docked
+            && days_left >= MORALE_PROVISIONS_LOW_DAYS
+            && self.wages_owed_pesos <= 0.0
+        {
+            delta += MORALE_GAIN_RESTED_IN_PORT;
+        }
+
+        self.morale = (self.morale + delta).clamp(0.0, 1.0);
     }
 
     /// Consume provisions and accumulate fouling for one hour.
@@ -408,6 +456,25 @@ pub const WAGE_PESOS_PER_MAN_MONTH: f32 = 4.0;
 /// up front to seal the enlistment.
 pub const SIGN_ON_BOUNTY_PESOS: f32 = WAGE_PESOS_PER_MAN_MONTH;
 
+// --- Morale (crewing-plan §8) -------------------------------------------------
+
+/// Provisions days remaining below which morale starts to drop at
+/// the low rate (§8.1).
+pub const MORALE_PROVISIONS_LOW_DAYS: f32 = 14.0;
+/// Provisions days remaining below which morale drops at the high rate.
+pub const MORALE_PROVISIONS_CRITICAL_DAYS: f32 = 7.0;
+/// Hourly morale loss when provisions are merely low (< 14 days).
+pub const MORALE_LOSS_PROVISIONS_LOW: f32 = 0.001;
+/// Hourly morale loss when provisions are critical (< 7 days). Replaces
+/// (does not stack with) the low-provisions rate.
+pub const MORALE_LOSS_PROVISIONS_CRITICAL: f32 = 0.005;
+/// Hourly morale loss when wages owed exceed 2× the ship's current
+/// monthly wage bill.
+pub const MORALE_LOSS_WAGES_OVERDUE: f32 = 0.001;
+/// Hourly morale gain while docked with provisions fully topped up
+/// and no outstanding wage debt (the "rested in port" recovery).
+pub const MORALE_GAIN_RESTED_IN_PORT: f32 = 0.001;
+
 /// Maximum outstanding chandler/factor debt a single ship can
 /// accumulate before further credit is refused. Sized to cover a
 /// few hold-fillings of cheap cargo plus a season's provisions.
@@ -524,6 +591,73 @@ mod tests {
             "Expected ~{:.4} tons consumed in a day, got {:.4}",
             expected_daily,
             consumed
+        );
+    }
+
+    #[test]
+    fn fresh_ship_has_full_morale() {
+        let ship = Ship::new(Position::ZERO, ShipState::Sailing);
+        assert_eq!(ship.morale, 1.0);
+        let stats = ShipStats::sloop();
+        let built = Ship::freshly_built(
+            Position::ZERO,
+            0,
+            1000.0,
+            crate::shiptype::ids::SLOOP,
+            &stats,
+        );
+        assert_eq!(built.morale, 1.0);
+    }
+
+    #[test]
+    fn morale_drops_on_critical_provisions() {
+        let stats = ShipStats::sloop();
+        let mut ship = Ship::new(Position::ZERO, ShipState::Sailing);
+        // Force critical: < 7 days at current burn.
+        ship.provisions = ship.daily_provision_burn() * 5.0;
+        let before = ship.morale;
+        ship.tick_morale(&stats);
+        assert!((before - ship.morale - MORALE_LOSS_PROVISIONS_CRITICAL).abs() < 1e-5);
+    }
+
+    #[test]
+    fn morale_drops_on_overdue_wages() {
+        let stats = ShipStats::sloop();
+        let mut ship = Ship::new(Position::ZERO, ShipState::Sailing);
+        // Plenty of provisions so only the wages branch fires.
+        ship.provisions = stats.provision_capacity;
+        let monthly = ship.crew_alive as f32 * WAGE_PESOS_PER_MAN_MONTH;
+        ship.wages_owed_pesos = 3.0 * monthly;
+        let before = ship.morale;
+        ship.tick_morale(&stats);
+        assert!((before - ship.morale - MORALE_LOSS_WAGES_OVERDUE).abs() < 1e-5);
+    }
+
+    #[test]
+    fn morale_recovers_in_port_when_fed_and_paid() {
+        let stats = ShipStats::sloop();
+        let mut ship = Ship::new(Position::ZERO, ShipState::Docked);
+        ship.provisions = stats.provision_capacity;
+        ship.wages_owed_pesos = 0.0;
+        ship.morale = 0.5;
+        ship.tick_morale(&stats);
+        assert!((ship.morale - (0.5 + MORALE_GAIN_RESTED_IN_PORT)).abs() < 1e-5);
+    }
+
+    #[test]
+    fn morale_band_throttles_speed() {
+        let stats = ShipStats::sloop();
+        let wind = WindVector { u: 0.0, v: 15.0 };
+        let mut ship = Ship::new(Position::ZERO, ShipState::Sailing);
+        ship.speed = 10.0;
+
+        ship.morale = 0.8;
+        let happy = ship.effective_speed(&stats, &wind);
+        ship.morale = 0.3;
+        let sullen = ship.effective_speed(&stats, &wind);
+        assert!(
+            (sullen - happy * 0.8).abs() < 1e-3,
+            "happy={happy} sullen={sullen}"
         );
     }
 

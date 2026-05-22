@@ -283,3 +283,41 @@ Phases 1 & 2 were implemented prior to the creation of this log; you can now exp
 - `bench_trade`: 2 bankrupt (Phase-3 baseline preserved). Equilibrium deltas unchanged in shape. Wage flows are real but small relative to cargo silver: ~25 crew × 4.0 peso × 2 months ≈ 200 pesos/ship transferred to port markets over the 60-day run. Sustainability check: wages remain ~20–30% of typical voyage revenue, leaving healthy margin.
 
 **Next action:** 3.c.3 — morale field + hourly modifiers per §8. Morale will read provisions_days_remaining, wages_owed, and gates on damage events (the damage hooks are stubs until Step 7). Most effects are inert until Step 9 mutiny; this step lays the channel.
+
+---
+
+## 2026-05-24 — Step 3.c.3: morale field + hourly modifiers + soft effects
+
+**Goal:** Lay the morale channel that Step 9 will use to flip bankrupt-and-hungry merchants into pirates. Wire all §8 modifiers that depend only on systems we have today; stub instant deltas from prize / damage events that need Steps 7–8.
+
+**Implementation:**
+- `Ship.morale: f32`, initialized 1.0 in both constructors.
+- Constants in `ship.rs` (named, so calibration can tune without code dive):
+  - `MORALE_PROVISIONS_LOW_DAYS = 14.0`, `MORALE_PROVISIONS_CRITICAL_DAYS = 7.0`
+  - `MORALE_LOSS_PROVISIONS_LOW = 0.001`/h, `MORALE_LOSS_PROVISIONS_CRITICAL = 0.005`/h
+  - `MORALE_LOSS_WAGES_OVERDUE = 0.001`/h
+  - `MORALE_GAIN_RESTED_IN_PORT = 0.001`/h
+- `Ship::tick_morale(&stats)`: computes hourly delta from provisions-days-remaining, wages_owed vs current monthly bill, and rested-in-port (Docked + full belly + zero wages owed). Clamps to `[0.0, 1.0]`. Called from `tick_hourly_ai_and_physics` right after `tick_resources`.
+- **Speed effect (band 0.25–0.4)**: `effective_speed` multiplies by 0.8 when `morale < 0.4`. Above 0.4 = no effect; below 0.25 the ship is heading for Step 9 mutiny but for now still moves at the sullen rate.
+- **Recruitment penalty (band 0.4–0.7)**: `tick_daily_hiring` reduces the per-day hire cap by 10% when morale is in the band (`0.4..0.7` exclusive on upper). Word gets around about the captain.
+- 5 new tests: morale init, critical-provisions drop, wages-overdue drop, port-recovery, speed-band throttle.
+
+**Design decisions:**
+- **Provisions modifiers are mutually exclusive, not additive.** §8.1 implies critical replaces low ("provisions days remaining < 14 / < 7" are bands, not stacked thresholds). At 5 days remaining we apply -0.005, not -0.001 + -0.005.
+- **Rested-in-port requires both fed AND paid.** A docked but unpaid ship doesn't rest up — that matches the historical pattern of disputes over arrears keeping a crew restless even in port.
+- **Speed-band: `< 0.4`, not `0.25..0.4`.** Below 0.25 still gets the 20% penalty (and eventually mutiny in Step 9). Adding a discontinuous "no further speed penalty below 0.25" would be unphysical; the deeper bands compound through Step 9's mutiny rather than escalating speed loss.
+- **Recruitment band: `0.4..0.7` exclusive upper.** Faithful to the §8.2 wording ("0.4 – 0.7"). Below 0.4, hiring still works at the same reduced rate (no escalation here — deeper morale instead triggers desertion in Step 9).
+- **Deferred §8.1 modifiers:** "+0.20 prize" (Step 8 — needs prize taking), "-0.10 damage" (Step 7 — needs damage events). These are instant deltas applied externally when the relevant systems fire, not part of `tick_morale`'s hourly accrual; no stub needed in the morale code itself.
+- **Deferred §8.2 effects:** mutiny (< 0.25 + at sea + debt high) and wholesale desertion (< 0.10 in port). Both belong to Step 9 — the desertion effect specifically needs the bidirectional pool mutation (crew → unseasoned pool) tied to morale state machine.
+
+**Considered alternatives:**
+- Store morale modifiers per-source (so a UI could show "morale tank: -0.005 from provisions, -0.001 from wages"): rejected as scope creep. Diagnostics can recompute the breakdown from ship state.
+- Apply the recruitment penalty as a continuous function of morale rather than a step at 0.4: rejected — the spec was explicit about bands, and a step at 0.4 is calibration-friendly (one threshold to tune).
+- Faster recovery rate in port: kept at +0.001/h (≈ 1 morale point in 1000h = 42 days), which gives morale meaningful inertia. Calibration in 3.d may revisit.
+
+**Verification:**
+- `cargo test --workspace`: **110 passed** (+5 morale tests).
+- `cargo clippy --workspace --all-targets -- -D warnings`: clean.
+- `bench_trade`: 2 bankrupt (Phase-3 baseline preserved). Morale starts at 1.0; the bench's well-supplied seeded merchants don't dip into any effect band over 60 days. The recruitment penalty only fires on demoralized captains, none of which exist yet.
+
+**Next action:** Step 3.c is complete except for the calibration sweep (3.d). Options for the next slice: (a) the 3.d 1-year headless calibration run — confirm pools/morale are stable; (b) skip ahead to Step 4 (factions + spatial hash) since the crewing surface is wired and 3.d is a tuning exercise. User to decide.

@@ -262,7 +262,16 @@ impl World {
                 _ => continue,
             };
             let stats = &self.ship_types.get(ship_type).stats;
-            let cap = want.min(HIRE_PER_DAY);
+            // Morale 0.4–0.7 band: -10% recruitment rate (word gets
+            // around about the captain). Crewing-plan §8.2.
+            let morale = self.ships.get(id).map(|s| s.morale).unwrap_or(1.0);
+            let rate_mult = if (0.4..0.7).contains(&morale) {
+                0.9
+            } else {
+                1.0
+            };
+            let per_day_cap = ((HIRE_PER_DAY as f32) * rate_mult).floor() as u16;
+            let cap = want.min(per_day_cap.max(1));
             // Sign-on bounty cap: each sailor costs SIGN_ON_BOUNTY_PESOS,
             // debited from ship.silver (crewing-plan §6.2). If the ship
             // can't afford the full draw, hire fewer this day.
@@ -348,6 +357,8 @@ impl World {
 
             // Resource consumption
             ship.tick_resources(&ship_stats);
+            // Morale tick (after resources so days_left reflects this hour's burn).
+            ship.tick_morale(&ship_stats);
 
             // Wages: accrue while at sea, pay out into the port's
             // market silver while docked. See crewing-plan §6 / §3.3.
