@@ -48,11 +48,16 @@ In Phase 2, a ship's "neighborhood" was its own status (provisions, fouling). In
 
 The system is sound if all of these hold in a 90-day demo:
 
-1. **Human Capital Constraint:** A ship needs a crew. Just as the ship's hull gets foul, a ship's crew must eat, attrition, and act. They may eat and drink more or less, with effects on ship performance and attrition. In ports, ships can add new sailors.
+1. **Human Capital Constraint:** A ship needs a crew. Crew is a first-class
+   property of the ship (`Ship.crew_alive: u16`), like the hull — *not* a
+   cargo good, not consumed at the shipyard. Crews are hired from a port's
+   sailor pool on launch and discharged back into it on docking. Crew size
+   drives provisions burn rate and `effective_speed` (under- and over-crew
+   curves). In ports, ships can hire to replace casualties.
 2. **Organic Chase:** A pirate sloop spots a merchant. Both BTs emit steering commands reacting to each other. The faster ship dictates the range, affected continuously by wind and fouling.
 3. **Multi-tick Engagement:** Ships in range emit `FireBroadside` commands. These resolve into `DamageEvent`s applied between ticks. Rigging damage slows the victim; hull damage sinks them. This means ships must have cannons and we must track their supplies of powder and shot.
 4. **Prize Crews:** A pirate capturing a ship must split its own crew to sail the prize to a haven. If it lacks the manpower, it must burn the prize instead.
-5. **Recruitment:** Bankrupt merchants with plummeting morale strike their colors and turn pirate. 
+5. **Recruitment & Mutiny:** Bankrupt merchants with plummeting morale strike their colors and turn pirate — `ShipPolicy::Pirate` is a state of mind, not a faction. A privateer with a Letter of Marque against Spain is a different state again. 
 
 ---
 
@@ -69,10 +74,34 @@ Currently, `world.ships` is a `Vec<Ship>`. Sinking a ship at index `i` invalidat
 Hardcoded `starter()` lists will become unmaintainable as we add combat stats and faction rules.
 - **Action:** Move `GoodsRegistry`, `ShipTypeRegistry`, and `Ports` to `data/*.ron` files using `serde` and `ron`.
 
-### 3. Port Demographics
-Ports need populations to crew ships.
-- **Action:** Add `PortDemographics` alongside `PortMarket`. Introduce `PopPool` tracking `Sailors`. There may be other kinds of pops later in a port, but for now, sailors will do, along with prosperity. 
-- **Action:** Update `shipyard::try_build` to require `stats.crew` number of `Sailors`.
+### 3. Port Demographics (two-tier sailor pool)
+Ports need populations to crew ships. Calibrated against
+`planning/research/sailor-recruitment.md`.
+
+- **Action:** Add `PortDemographics` alongside `PortMarket`:
+  ```rust
+  struct PortDemographics {
+      seasoned: u32,            // low mortality, full performance
+      unseasoned: u32,          // high mortality, maturing into seasoned
+      port_category: PortCategory,  // EuropeanHub | CaribbeanEntrepot | SmallColonial | PirateHaven
+      // monthly_growth_rate, mortality_rate derived from port_category
+  }
+  ```
+- **Two tiers, not one.** Unseasoned sailors die at 1–2%/month from
+  "seasoning" disease; a small fraction (~3%/month) matures to seasoned.
+  Seasoned sailors die at ~0.5%/month. This naturally caps pool sizes.
+- **Tiered organic monthly growth** (from research §7.1):
+  - European hub: ~50–170/month
+  - Caribbean entrepot: ~2–5/month
+  - Small colonial: ~0.5–1.5/month
+  - Pirate haven: ~0 (negative without ship arrivals)
+- **Transient supply:** each ship arrival adds 1–8 sailors to the
+  unseasoned pool, scaled by ship size.
+- **Hiring:** ship launch / refill draws from seasoned first, then
+  unseasoned. Faction-specific fill rates (research §7.3) — English
+  fastest, Spanish slowest. `shipyard::try_build` requires
+  `stats.crew_min` available sailors at the launching port.
+- **Post-war demobilization shocks:** deferred to Phase 4 (no wars yet).
 
 ---
 
@@ -87,10 +116,21 @@ To allow ships to fight without fighting the Rust borrow checker, we decouple th
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
 pub struct FactionId(pub u8);
 
-// A flattened 1D array for O(1) cache-friendly lookups
+// Five factions for v1: Spain, England, France, Netherlands, Free.
+// "Pirate" is NOT a faction — it's a per-ship policy (see ShipPolicy).
 pub struct FactionRegistry {
     factions: Vec<FactionData>,
-    relations: Vec<Stance>, // Size: NUM_FACTIONS * NUM_FACTIONS
+    relations: Vec<Stance>, // Size: 5 * 5 = 25
+}
+
+// Per-ship policy / "state of mind". Layered on top of faction.
+// A French-flagged ship with ShipPolicy::Privateer{against:[Spain]} is
+// hostile to Spain but treated as a friendly French merchant by England.
+pub enum ShipPolicy {
+    Merchant,
+    Privateer { against: FactionSet },  // bitfield over 5 factions
+    Pirate,                              // hostile to all flagged factions
+    Navy,                                // hostile per FactionRegistry relations
 }
 ```
 
@@ -220,15 +260,30 @@ data/
 
 ## Implementation Sequence (Each step ships green)
 
-1. **Phase 2.5: Generational Indices & RON.** Swap `Vec<Ship>` for `SlotMap`. Extract `GoodsRegistry` and `ShipTypeRegistry` into RON files. *Bench unchanged.*
-2. **Phase 2.5: Populations.** Add `PortDemographics`. Shipyards now subtract `Sailor` pops when launching ships.
-3. **Factions & Spatial Hash.** Implement `FactionRegistry` and the Dynamic Spatial Hash. Viz draws faint lines between ships of different factions in visual range.
-4. **The Pipeline Refactor (Double Buffering).** Rewrite `World::tick` into the `AI Phase -> Resolution -> Mutation` pipeline. Introduce `ShipCommand::Steer`. *Behavior is identical, but architecture is now CA-ready.*
-5. **The Chase (Maneuver AI).** Add `Pursue` and `Flee` BT nodes. Spawn a pirate. Watch it chase merchants based on wind speed until it catches them or they reach port.
-6. **Gunnery & Damage Events.** Add `FireBroadside` commands. Implement hull/rigging damage. Rigging damage lowers `effective_speed`. Ships can now be battered to a halt.
-7. **Boarding & Sinking.** Add `AttemptBoard`. Introduce `Captured` and `Sinking` states. Dead ships are safely removed from the `SlotMap`. Captured ships drain the pirate's crew to create a prize crew.
-8. **Bankruptcy to Piracy.** Wire `ship.debt` and `ship.morale` to a mutiny trigger. The pirate fleet is now organically sustained by the economic pressures of Phase 2.
-9. **Calibration Pass.** Run a 1-year simulation. Tune gunnery lethality, base population growth, and morale thresholds until the Caribbean maintains a stable equilibrium of merchants, pirates, and sunken wrecks.
+> **Sequencing philosophy:** plumbing-first. Steps 1–5 are mostly invisible
+> refactors that get the architecture right; the chase becomes visible at
+> Step 6. The combat tick is hourly throughout (no sub-tick). See
+> `planning/development-log.md` 2026-05-22 for the decision record.
+
+1. **Generational Indices (SlotMap).** Swap `Vec<Ship>` and `Vec<ShipAI>` for `SlotMap<ShipId, _>`. Update internal indexers, viz selection, bench_trade. *Bench + tests unchanged.*
+2. **RON extraction.** Move `GoodsRegistry`, `ShipTypeRegistry`, and the port list into `data/*.ron` via `serde + ron`. Reserve a slot for `factions.ron`. *Bench + tests unchanged.*
+3. **Port demographics + crew on ships.** Add the two-tier `PortDemographics` per the section above. Add `Ship.crew_alive: u16`, hired at launch, discharged at dock, lost to attrition at sea. Monthly tick: pool growth + mortality + maturation. Provisions burn rate scales with `crew_alive`; `effective_speed` gets an under/over-crew curve. `shipyard::try_build` requires `stats.crew_min` sailors. `bench_trade` prints crew + pool columns.
+4. **Factions & Dynamic Spatial Hash.** Five factions (Spain, England, France, Netherlands, Free); Relations Matrix; faction colors. `Ship.faction: FactionId`; `Port.faction: FactionId`. Dynamic spatial hash (10 NM cells). Viz draws ships in faction colors and faint sight-lines between ships of differing factions within visual range.
+5. **The Pipeline Refactor (Double Buffering).** Rewrite `World::tick` into the `AI Phase → Resolution → Mutation → Cleanup` pipeline. Introduce `ShipCommand::Steer(Steering)` as the only command initially. `ShipBtContext` becomes strictly read-only re ships. *Behavior identical; bench + tests unchanged.*
+6. **The Chase (Maneuver AI).** Add `Ship.policy: ShipPolicy`. Add `Pursue` and `Flee` BT nodes. `SeePrey` condition consults spatial hash + relations + policy. Hardcoded scenario: spawn a pirate sloop near Tortuga. First visible Phase 3 behavior.
+7. **Gunnery & Damage Events.** Add `FireBroadside { attacker, target }` commands when within cannon range (~0.25 NM = 500 yd). Resolution emits `DamageEvent { hull, rigging, crew_killed }`. Hull and rigging integrity on `Ship`; rigging damage cuts `effective_speed`. Powder and shot are new Goods consumed per broadside. Ships can now be battered to a halt.
+8. **Boarding & Sinking.** Add `AttemptBoard { attacker, target }` when within ~0.05 NM and victim's rigging is sufficiently damaged. Deterministic single-tick resolution: `crew_alive * (1 + morale_bonus)` per side; larger force wins; proportional losses. Winner takes the prize (drains their crew into a prize crew) or burns it if below threshold. Sunk ships are reaped in Cleanup.
+9. **Bankruptcy → Piracy.** Add `Ship.morale: f32`. Drops with debt, low wages, damage; rises with prize money. Mutiny trigger: `debt > MAX_SHIP_DEBT * 1.5 && morale < 0.25 && at_sea` → ship.policy becomes `Pirate`. Closes the Phase 2 economic loop into Phase 3 violence.
+10. **Calibration Pass.** Run a 1-year headless simulation. Tune gunnery lethality, sailor-pool growth/mortality (calibrated against research §7.1, §7.5), mutiny threshold, and pirate spawn rates until the Caribbean maintains a stable equilibrium of merchants, pirates, prizes, and wrecks. `bench_trade` reports active pirates, sunken ships, captured prizes, and per-port sailor pool totals.
+
+## Explicitly OUT of Phase 3 (deferred to Phase 4+)
+
+- **Rhai trade-law / Navigation Acts hook** — comes once factions matter for trade flow.
+- **Multi-tick boarding with morale rolls** — deterministic single-tick is v1.
+- **Sub-tick (15-min) combat resolution** — hourly is v1.
+- **Post-war demobilization shocks** to the sailor pool — no wars yet.
+- **Officer / specialist crew roles** (master, gunner, surgeon) — single `crew_alive` count for v1.
+- **Letters of Marque as data structures** with expiry and issuance rules — `ShipPolicy::Privateer{against}` is just an enum for now.
 
 ## Risks and Mitigations
 
