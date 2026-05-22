@@ -239,7 +239,7 @@ fn main() {
             .map(|(id, t)| format!("{}:{:.1}", world.goods.get(id).name, t))
             .collect();
         let built_tag = if i >= n_ships { " (built)" } else { "" };
-        let type_name = world.ship_types.get(ship.ship_type).name;
+        let type_name = &world.ship_types.get(ship.ship_type).name;
         println!(
             "{:<3}  {:<14}  {:<10}  {:>10.0}  {:>10.0}  {:>10.0}  {:>8.0}  {:>+10.0}  {:<10}  {:<24}{}",
             i, origin_names[i], type_name, ship.starting_silver, ship.silver,
@@ -261,11 +261,11 @@ fn main() {
     // fleet (those are the shipyard's actual output, not what we
     // seeded for the demo).
     if world.ships.len() > n_ships {
-        let mut counts: std::collections::BTreeMap<&'static str, u32> =
+        let mut counts: std::collections::BTreeMap<&str, u32> =
             std::collections::BTreeMap::new();
         for &id in ship_ids.iter().skip(n_ships) {
             let ship = &world.ships[id];
-            let name = world.ship_types.get(ship.ship_type).name;
+            let name = world.ship_types.get(ship.ship_type).name.as_str();
             *counts.entry(name).or_insert(0) += 1;
         }
         let parts: Vec<String> = counts.iter().map(|(n, c)| format!("{} {}", c, n)).collect();
@@ -343,7 +343,7 @@ fn main() {
     };
     for gid_raw in all_goods {
         let gid = GoodId(gid_raw);
-        let name = world.goods.get(gid).name;
+        let name = &world.goods.get(gid).name;
         println!(
             "  {:<18} {:<7} {}",
             name,
@@ -390,7 +390,7 @@ fn main() {
         .collect::<std::collections::BTreeSet<_>>()
     {
         let gid = GoodId(gid_raw);
-        let name = world.goods.get(gid).name;
+        let name = &world.goods.get(gid).name;
         let p = lookup(&production_per_month[0], gid) * 12.0;
         let c = lookup(&consumption_per_month[0], gid) * 12.0;
         println!("  {:<18} {:>10.0} {:>10.0} {:>+10.0}", name, p, c, p - c);
@@ -419,7 +419,7 @@ fn main() {
         freight: voyage_freight,
     });
 
-    let mut diffs: Vec<(String, &str, f32, f32, f32)> = Vec::new();
+    let mut diffs: Vec<(String, String, f32, f32, f32)> = Vec::new();
     for (port_idx, port) in world.ports.iter().enumerate() {
         let spec = &port_specs[port_idx];
         let mut seen = std::collections::HashSet::new();
@@ -442,7 +442,7 @@ fn main() {
                 };
                 diffs.push((
                     port.name.to_string(),
-                    world.goods.get(good).name,
+                    world.goods.get(good).name.clone(),
                     p_sim,
                     p_eq,
                     pct,

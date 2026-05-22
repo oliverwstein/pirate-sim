@@ -2,6 +2,10 @@
 //! expected lifetime. A `Ship` carries a `ShipTypeId` and the world
 //! looks up the matching `ShipType` for per-tick stats access.
 //!
+//! The catalog is loaded from `data/registries/ship_types.ron`. Position
+//! in that file determines the `ShipTypeId` — the `ids_match_indices`
+//! test will catch any re-ordering.
+//!
 //! v1 catalog (merchant rigs relevant to the 1680s economy):
 //!
 //!   SLOOP        small, fast, fore-and-aft — Bermuda / Jamaica
@@ -17,6 +21,7 @@
 //! out of scope for v1 — they'll arrive with combat/piracy systems.
 
 use crate::ship::ShipStats;
+use serde::Deserialize;
 
 /// Stable opaque identifier for a ship type. Stored on every `Ship`.
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
@@ -32,11 +37,24 @@ pub mod ids {
     pub const SHIP: ShipTypeId = ShipTypeId(4);
 }
 
+/// On-disk shape of one ship type. The runtime `ShipType` is built from
+/// this by stamping in the index-derived `ShipTypeId`.
+#[derive(Clone, Debug, Deserialize)]
+struct ShipTypeRecord {
+    name: String,
+    stats: ShipStats,
+    build_silver: f32,
+    build_naval_stores: f32,
+    build_manufactures: f32,
+    build_provisions: f32,
+    expected_lifetime_months: f32,
+}
+
 /// Per-type design data.
 #[derive(Clone, Debug)]
 pub struct ShipType {
     pub id: ShipTypeId,
-    pub name: &'static str,
+    pub name: String,
     pub stats: ShipStats,
     /// Silver portion of the build cost (pesos).
     pub build_silver: f32,
@@ -56,103 +74,35 @@ pub struct ShipTypeRegistry {
     types: Vec<ShipType>,
 }
 
+/// The bundled RON catalog, compiled into the binary.
+const SHIP_TYPES_RON: &str = include_str!("../../../data/registries/ship_types.ron");
+
 impl ShipTypeRegistry {
-    /// Construct the v1 hardcoded catalog. The order matches the
-    /// `ids::*` constants — never reorder without updating them.
+    /// Construct the v1 catalog by parsing the bundled `ship_types.ron`.
+    /// Panics if the file fails to parse — that would be a build-time bug.
     pub fn starter() -> Self {
-        let types = vec![
-            ShipType {
-                id: ids::SLOOP,
-                name: "sloop",
-                stats: ShipStats {
-                    speed_typical: 9.0,
-                    speed_max: 12.0,
-                    windward_ability: 0.8,
-                    no_go_half_angle: 40.0,
-                    crew: 25,
-                    provision_capacity: 6.0,
-                    cargo_capacity_tons: 60.0,
-                },
-                build_silver: 4_000.0,
-                build_naval_stores: 8.0,
-                build_manufactures: 5.0,
-                build_provisions: 6.0,
-                expected_lifetime_months: 84.0, // 7 yr median (Caribbean tropical service)
-            },
-            ShipType {
-                id: ids::BRIGANTINE,
-                name: "brigantine",
-                stats: ShipStats {
-                    speed_typical: 8.0,
-                    speed_max: 11.0,
-                    windward_ability: 0.7,
-                    no_go_half_angle: 45.0,
-                    crew: 40,
-                    provision_capacity: 10.0,
-                    cargo_capacity_tons: 100.0,
-                },
-                build_silver: 7_000.0,
-                build_naval_stores: 14.0,
-                build_manufactures: 9.0,
-                build_provisions: 10.0,
-                expected_lifetime_months: 144.0, // 12 yr
-            },
-            ShipType {
-                id: ids::BARK,
-                name: "bark",
-                stats: ShipStats {
-                    speed_typical: 6.0,
-                    speed_max: 9.0,
-                    windward_ability: 0.5,
-                    no_go_half_angle: 55.0,
-                    crew: 35,
-                    provision_capacity: 12.0,
-                    cargo_capacity_tons: 160.0,
-                },
-                build_silver: 10_000.0,
-                build_naval_stores: 20.0,
-                build_manufactures: 14.0,
-                build_provisions: 14.0,
-                expected_lifetime_months: 180.0, // 15 yr
-            },
-            ShipType {
-                id: ids::FLUYT,
-                name: "fluyt",
-                stats: ShipStats {
-                    speed_typical: 5.0,
-                    speed_max: 8.0,
-                    windward_ability: 0.4,
-                    no_go_half_angle: 60.0,
-                    crew: 25, // characteristic small crew
-                    provision_capacity: 16.0,
-                    cargo_capacity_tons: 250.0,
-                },
-                build_silver: 9_000.0, // cheaper than Ship despite larger hold
-                build_naval_stores: 24.0,
-                build_manufactures: 14.0,
-                build_provisions: 16.0,
-                expected_lifetime_months: 200.0, // ~17 yr (good Dutch maintenance)
-            },
-            ShipType {
-                id: ids::SHIP,
-                name: "ship",
-                stats: ShipStats {
-                    speed_typical: 6.0,
-                    speed_max: 10.0,
-                    windward_ability: 0.4,
-                    no_go_half_angle: 60.0,
-                    crew: 60,
-                    provision_capacity: 20.0,
-                    cargo_capacity_tons: 300.0,
-                },
-                build_silver: 18_000.0,
-                build_naval_stores: 32.0,
-                build_manufactures: 22.0,
-                build_provisions: 22.0,
-                expected_lifetime_months: 240.0, // 20 yr (well-maintained)
-            },
-        ];
-        Self { types }
+        Self::from_ron_str(SHIP_TYPES_RON).expect("bundled ship_types.ron must parse")
+    }
+
+    /// Parse a ship-type catalog from a RON string. Records are tagged
+    /// with `ShipTypeId` equal to their position in the list.
+    pub fn from_ron_str(s: &str) -> Result<Self, ron::error::SpannedError> {
+        let records: Vec<ShipTypeRecord> = ron::from_str(s)?;
+        let types = records
+            .into_iter()
+            .enumerate()
+            .map(|(i, r)| ShipType {
+                id: ShipTypeId(i as u8),
+                name: r.name,
+                stats: r.stats,
+                build_silver: r.build_silver,
+                build_naval_stores: r.build_naval_stores,
+                build_manufactures: r.build_manufactures,
+                build_provisions: r.build_provisions,
+                expected_lifetime_months: r.expected_lifetime_months,
+            })
+            .collect();
+        Ok(Self { types })
     }
 
     pub fn get(&self, id: ShipTypeId) -> &ShipType {

@@ -8,6 +8,8 @@ glam = "0.29"
 bytemuck = { version = "1", features = ["derive"] }
 microlp = "0.4"
 slotmap = "1"
+serde = { version = "1", features = ["derive"] }
+ron = "0.8"
 
 [dev-dependencies]
 rstest = "0.23"

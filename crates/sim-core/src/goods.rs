@@ -5,14 +5,16 @@
 //! a category, a reference Caribbean price, an optional Europe price
 //! (for goods that flow off-map), and perishability metadata.
 //!
-//! Phase 2 starts with 9 hardcoded goods (see `GoodsRegistry::starter`).
-//! A RON loader will replace the hardcoded list in a follow-up step;
-//! the public API stays the same.
+//! The catalog is loaded from `data/registries/goods.ron`. Position in
+//! that file determines the `GoodId` — re-ordering breaks the `ids::*`
+//! constants and the `ids_resolve_to_expected_goods` test will catch it.
+
+use serde::Deserialize;
 
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
 pub struct GoodId(pub u8);
 
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Deserialize)]
 pub enum GoodCategory {
     /// Bulk agricultural commodity (sugar, tobacco, molasses).
     Staple,
@@ -31,7 +33,7 @@ pub enum GoodCategory {
     Person,
 }
 
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Deserialize)]
 pub enum Perishability {
     /// Effectively unlimited shelf life (rum, silver, manufactures).
     Indefinite,
@@ -42,10 +44,22 @@ pub enum Perishability {
     Days(u16),
 }
 
+/// On-disk shape of one good. The runtime `Good` is built from this by
+/// stamping in the index-derived `GoodId`.
+#[derive(Clone, Debug, Deserialize)]
+struct GoodRecord {
+    name: String,
+    category: GoodCategory,
+    tons_per_unit: f32,
+    base_price_pesos: f32,
+    europe_price_pesos: f32,
+    perishability: Perishability,
+}
+
 #[derive(Clone, Debug)]
 pub struct Good {
     pub id: GoodId,
-    pub name: &'static str,
+    pub name: String,
     pub category: GoodCategory,
     /// Tons per nominal trade unit (hogshead, barrel, etc.). Tons are
     /// the canonical accounting unit on ships and in port stockpiles.
@@ -63,37 +77,35 @@ pub struct GoodsRegistry {
     goods: Vec<Good>,
 }
 
+/// The bundled RON catalog, compiled into the binary. Editing this file
+/// requires a rebuild for now; a runtime path-loader can be added later.
+const GOODS_RON: &str = include_str!("../../../data/registries/goods.ron");
+
 impl GoodsRegistry {
-    /// The 9 starter goods for Phase 2. Order is stable: each
-    /// good's `GoodId` equals its index in this list.
+    /// The starter goods, loaded from the bundled `goods.ron`. Panics
+    /// if the file fails to parse — that would be a build-time bug.
     pub fn starter() -> Self {
-        use GoodCategory::*;
-        use Perishability::*;
-        let entries = [
-            ("Provisions", Provision, 1.0, 18.0, 0.0, Days(180)),
-            ("Muscovado Sugar", Staple, 1.0, 70.0, 130.0, Months(12)),
-            ("Molasses", Staple, 1.0, 25.0, 35.0, Indefinite),
-            ("Rum", Cash, 1.0, 200.0, 280.0, Indefinite),
-            ("Tobacco", Staple, 1.0, 40.0, 90.0, Months(24)),
-            ("Manufactures", Manufactured, 1.0, 250.0, 200.0, Indefinite),
-            ("Naval Stores", Naval, 1.0, 80.0, 110.0, Months(24)),
-            ("Spanish Silver", Currency, 0.5, 1000.0, 1000.0, Indefinite),
-            ("Enslaved Persons", Person, 0.5, 600.0, 0.0, Days(60)),
-        ];
-        let goods = entries
+        Self::from_ron_str(GOODS_RON).expect("bundled goods.ron must parse")
+    }
+
+    /// Parse a goods catalog from a RON string. Records are tagged with
+    /// `GoodId` equal to their position in the list.
+    pub fn from_ron_str(s: &str) -> Result<Self, ron::error::SpannedError> {
+        let records: Vec<GoodRecord> = ron::from_str(s)?;
+        let goods = records
             .into_iter()
             .enumerate()
-            .map(|(i, (name, category, tpu, base, eur, perish))| Good {
+            .map(|(i, r)| Good {
                 id: GoodId(i as u8),
-                name,
-                category,
-                tons_per_unit: tpu,
-                base_price_pesos: base,
-                europe_price_pesos: eur,
-                perishability: perish,
+                name: r.name,
+                category: r.category,
+                tons_per_unit: r.tons_per_unit,
+                base_price_pesos: r.base_price_pesos,
+                europe_price_pesos: r.europe_price_pesos,
+                perishability: r.perishability,
             })
             .collect();
-        Self { goods }
+        Ok(Self { goods })
     }
 
     pub fn len(&self) -> usize {

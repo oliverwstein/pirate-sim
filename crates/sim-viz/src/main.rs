@@ -478,7 +478,7 @@ fn draw_ship_panel(world: &World, ship_id: ShipId) {
         if tons <= 0.0 {
             continue;
         }
-        let name = world.goods.get(gid).name;
+        let name = &world.goods.get(gid).name;
         let line = format!("  {:<16} {:>5.1} t", name, tons);
         draw_text(
             &line,
