@@ -253,6 +253,7 @@ mod tests {
             faction: Faction::England,
             harbor_radius_nm: 20.0,
             shipyard: Some(allowed.to_vec()),
+            category: crate::pop::PortCategory::SmallColonial,
         }
     }
 
@@ -263,6 +264,7 @@ mod tests {
             faction: Faction::England,
             harbor_radius_nm: 8.0,
             shipyard: None,
+            category: crate::pop::PortCategory::SmallColonial,
         }
     }
 

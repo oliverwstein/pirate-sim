@@ -1,3 +1,4 @@
+use crate::pop::PortCategory;
 use crate::shiptype::{ShipTypeId, ShipTypeRegistry};
 use crate::types::Position;
 use serde::Deserialize;
@@ -41,6 +42,9 @@ pub struct Port {
     /// specialized: Bermuda's cedar suited only sloops; Amsterdam
     /// pioneered the fluyt; Cadiz's royal yards built large ships.
     pub shipyard: Option<Vec<ShipTypeId>>,
+    /// Demographic category — drives sailor pool growth/mortality.
+    /// See `pop::PortCategory` and `planning/crewing-plan.md`.
+    pub category: PortCategory,
 }
 
 /// Default harbor radius (NM) used when a port doesn't specify one.
@@ -55,6 +59,7 @@ struct PortRecord {
     faction: Faction,
     harbor_radius_nm: f32,
     shipyard: Option<Vec<String>>,
+    category: PortCategory,
 }
 
 /// The bundled RON catalog of ports, compiled into the binary.
@@ -100,6 +105,7 @@ pub fn from_ron_str(
             faction: r.faction,
             harbor_radius_nm: r.harbor_radius_nm,
             shipyard,
+            category: r.category,
         });
     }
     Ok(ports)

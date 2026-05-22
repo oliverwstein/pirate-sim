@@ -10,6 +10,7 @@ use crate::map::MapSystem;
 use crate::market::{archetype_for, PortMarket};
 use crate::navmesh::Navmesh;
 use crate::pathfind::PathfindContext;
+use crate::pop::{self, PortDemographics};
 use crate::port::{all_ports, Port};
 use crate::ship::{Ship, ShipState, ShipStats};
 use crate::shiptype::{self, ShipTypeRegistry};
@@ -32,6 +33,10 @@ pub struct World {
     pub ship_types: ShipTypeRegistry,
     /// Per-port economic state, parallel to `ports` (index = port index).
     pub markets: Vec<PortMarket>,
+    /// Per-port sailor population, parallel to `ports`. Evolves on the
+    /// monthly tick: organic growth + maturation + mortality.
+    /// See `planning/crewing-plan.md`.
+    pub demographics: Vec<PortDemographics>,
     /// All live ships, keyed by generational `ShipId`. Sunken ships are
     /// removed from the map; their ids become permanently invalid,
     /// preventing aliasing.
@@ -77,6 +82,10 @@ impl World {
                 PortMarket::with_recipe(&goods, archetype.recipe())
             })
             .collect();
+        let demographics: Vec<PortDemographics> = ports
+            .iter()
+            .map(|p| PortDemographics::seed(p.category, p.faction))
+            .collect();
 
         let date = SimDate::new(1680, 0, 1);
         let last_market_month = date.month();
@@ -92,6 +101,7 @@ impl World {
             goods,
             ship_types,
             markets,
+            demographics,
             ships: SlotMap::with_key(),
             ship_ais: SecondaryMap::new(),
             date,
@@ -130,6 +140,11 @@ impl World {
         if month != self.last_market_month {
             for market in &mut self.markets {
                 market.tick_month();
+            }
+            // Monthly sailor-pool tick: growth, maturation, mortality.
+            // Parallel index with `ports` and `markets`.
+            for (i, d) in self.demographics.iter_mut().enumerate() {
+                pop::tick_monthly(d, self.ports[i].faction);
             }
 
             // Average per-ship silver delta over the just-completed month.

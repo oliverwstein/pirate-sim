@@ -123,3 +123,37 @@ Phases 1 & 2 were implemented prior to the creation of this log; you can now exp
 - `bench_trade` identical calibration verdict ("5 bankrupt ships" baseline preserved).
 
 **Next action:** User confirmation, then commit as "Step 2b: extract ports into RON". After that, Step 3 — port demographics + crew on ships (the first behavior change).
+
+---
+
+## 2026-05-23 — Step 3.a: port demographics genesis
+
+**Goal:** Stand up the per-port sailor pool data and its monthly dynamics (growth, maturation, mortality) without touching ships yet. The pool evolves in the background; bench_trade reports it so we can calibrate before any ship draws from it.
+
+**Implementation:**
+- New `crates/sim-core/src/pop.rs`: `PortCategory` (EuropeanHub / CaribbeanEntrepot / SmallColonial / PirateHaven), `PortDemographics { seasoned, unseasoned, category }`, `tick_monthly()`. Faction-based seed and growth multipliers per crewing-plan §4.5.
+- `Port` extended with `category: PortCategory` (mandatory RON field). `PortRecord` likewise. All 36 ports categorized in `ports.ron`.
+- `World` gains `demographics: Vec<PortDemographics>` parallel to `markets`/`ports`. Monthly tick (gated on month transition) updates every port.
+- `bench_trade` prints a sailor-pool summary block grouped by category.
+
+**Design decisions:**
+- **Deterministic rounded expectations**, not stochastic sampling, for v1. A given seed reproduces identical pool evolution — invaluable for calibration. Cost: small pools (e.g. pirate havens, ~30 sailors) see step-function behavior when `rate × N < 0.5` rounds to zero. Documented as expected; stochastic mode is a Phase-4 refinement when relevant.
+- **Spain seed multiplier of 0.5** is what makes the Casa de Contratación bottleneck visible in the seed data (Spanish ports start with half the sailors of equivalent English ports). Cross-check: Cartagena's 7-port CaribbeanEntrepot total of 1882 is right for a mixed-faction sample.
+- **`PortCategory` lives in `pop.rs`**, not `port.rs`. Keeps the demographics concern isolated; `Port` simply references it as data. If we later add other category-driven systems (defense, taxation), they each get their own module owning their own enum.
+- **Pirate haven faction `Faction::Pirate` mult is 0.3**, but seeds (15, 25) before mult give (5, 8). The test `monthly_tick_pirate_haven_does_not_grow` is the honest claim — decay needs stochastic sampling that we're not adding yet.
+
+**Considered alternatives:**
+- `f32` pools displayed as integers: rejected — exposing fractional sailors in diagnostics is confusing, and the visible step-function behavior is a fair signal that v1 deterministic mode has limits.
+- Per-port RNG seeded from port index: rejected — adds reproducibility complexity (cross-process determinism) without much modeling value at v1 pool sizes.
+- Embed `PortDemographics` directly in `Port`: rejected — `Port` is read-mostly static data; demographics mutates every month. Same pattern as `PortMarket` already established.
+
+**Verification:**
+- `cargo test --workspace`: **101 passed** (was 94; +6 new pop tests, +1 existing relaxed).
+- `cargo clippy --workspace --all-targets -- -D warnings`: clean.
+- `bench_trade`: identical Phase-2 calibration verdict ("⚠ 5 bankrupt ship(s)"). New sailor-pool block reports:
+  - EuropeanHub: 4 ports, 22,066 total sailors
+  - CaribbeanEntrepot: 7 ports, 1,882 total
+  - SmallColonial: 23 ports, 1,346 total
+  - PirateHaven: 4 ports, 74 total
+
+**Next action:** Step 3.b — `Ship.crew_alive`, `ShipState::Hiring`, and the daily recruitment loop drawing from these pools.

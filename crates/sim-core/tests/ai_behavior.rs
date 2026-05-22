@@ -21,6 +21,7 @@ fn test_ports() -> Vec<Port> {
             faction: sim_core::port::Faction::England,
             harbor_radius_nm: DEFAULT_HARBOR_RADIUS_NM,
             shipyard: None,
+            category: sim_core::pop::PortCategory::SmallColonial,
         },
         Port {
             name: "PortB".to_string(),
@@ -28,6 +29,7 @@ fn test_ports() -> Vec<Port> {
             faction: sim_core::port::Faction::Spain,
             harbor_radius_nm: DEFAULT_HARBOR_RADIUS_NM,
             shipyard: None,
+            category: sim_core::pop::PortCategory::SmallColonial,
         },
         Port {
             name: "PortC".to_string(),
@@ -35,6 +37,7 @@ fn test_ports() -> Vec<Port> {
             faction: sim_core::port::Faction::France,
             harbor_radius_nm: DEFAULT_HARBOR_RADIUS_NM,
             shipyard: None,
+            category: sim_core::pop::PortCategory::SmallColonial,
         },
     ]
 }
@@ -476,6 +479,7 @@ fn trace_sailing_to_port_royal() {
             faction: sim_core::port::Faction::England,
             harbor_radius_nm: DEFAULT_HARBOR_RADIUS_NM,
             shipyard: None,
+            category: sim_core::pop::PortCategory::SmallColonial,
         },
         Port {
             name: "Bridgetown".to_string(),
@@ -483,6 +487,7 @@ fn trace_sailing_to_port_royal() {
             faction: sim_core::port::Faction::England,
             harbor_radius_nm: DEFAULT_HARBOR_RADIUS_NM,
             shipyard: None,
+            category: sim_core::pop::PortCategory::SmallColonial,
         },
     ];
 
@@ -550,6 +555,7 @@ fn low_provisions_diverts_to_nearest_port() {
             faction: sim_core::port::Faction::England,
             harbor_radius_nm: DEFAULT_HARBOR_RADIUS_NM,
             shipyard: None,
+            category: sim_core::pop::PortCategory::SmallColonial,
         },
         Port {
             name: "FarPort".to_string(),
@@ -557,6 +563,7 @@ fn low_provisions_diverts_to_nearest_port() {
             faction: sim_core::port::Faction::Spain,
             harbor_radius_nm: DEFAULT_HARBOR_RADIUS_NM,
             shipyard: None,
+            category: sim_core::pop::PortCategory::SmallColonial,
         },
     ];
 
@@ -629,6 +636,7 @@ fn continuous_sailing_with_port_visits() {
             faction: sim_core::port::Faction::England,
             harbor_radius_nm: DEFAULT_HARBOR_RADIUS_NM,
             shipyard: None,
+            category: sim_core::pop::PortCategory::SmallColonial,
         },
         Port {
             name: "Dest".to_string(),
@@ -636,6 +644,7 @@ fn continuous_sailing_with_port_visits() {
             faction: sim_core::port::Faction::Spain,
             harbor_radius_nm: DEFAULT_HARBOR_RADIUS_NM,
             shipyard: None,
+            category: sim_core::pop::PortCategory::SmallColonial,
         },
     ];
 
@@ -702,6 +711,7 @@ fn dock_cycle_sells_arriving_cargo_and_buys_outgoing() {
             faction: sim_core::port::Faction::England,
             harbor_radius_nm: DEFAULT_HARBOR_RADIUS_NM,
             shipyard: None,
+            category: sim_core::pop::PortCategory::SmallColonial,
         },
         Port {
             name: "Dest".to_string(),
@@ -709,6 +719,7 @@ fn dock_cycle_sells_arriving_cargo_and_buys_outgoing() {
             faction: sim_core::port::Faction::Spain,
             harbor_radius_nm: DEFAULT_HARBOR_RADIUS_NM,
             shipyard: None,
+            category: sim_core::pop::PortCategory::SmallColonial,
         },
     ];
     let mut markets = vec![
@@ -770,6 +781,7 @@ fn ship_with_no_profitable_trade_still_undocks() {
             faction: sim_core::port::Faction::England,
             harbor_radius_nm: DEFAULT_HARBOR_RADIUS_NM,
             shipyard: None,
+            category: sim_core::pop::PortCategory::SmallColonial,
         },
         Port {
             name: "B".to_string(),
@@ -777,6 +789,7 @@ fn ship_with_no_profitable_trade_still_undocks() {
             faction: sim_core::port::Faction::England,
             harbor_radius_nm: DEFAULT_HARBOR_RADIUS_NM,
             shipyard: None,
+            category: sim_core::pop::PortCategory::SmallColonial,
         },
     ];
     let mut markets = vec![

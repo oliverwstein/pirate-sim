@@ -257,6 +257,44 @@ fn main() {
         world.ships_built, world.last_month_avg_profit
     );
 
+    // Sailor pool snapshot (Step 3.a diagnostic). Categories the
+    // calibration sweep will watch for collapse/explosion.
+    {
+        use sim_core::pop::PortCategory;
+        let mut sums: std::collections::BTreeMap<&str, (u32, u32, u32)> =
+            std::collections::BTreeMap::new();
+        for (port, d) in world.ports.iter().zip(world.demographics.iter()) {
+            let key = match d.category {
+                PortCategory::EuropeanHub => "EuropeanHub",
+                PortCategory::CaribbeanEntrepot => "CaribbeanEntrepot",
+                PortCategory::SmallColonial => "SmallColonial",
+                PortCategory::PirateHaven => "PirateHaven",
+            };
+            let e = sums.entry(key).or_insert((0, 0, 0));
+            e.0 += 1;
+            e.1 += d.seasoned;
+            e.2 += d.unseasoned;
+            // Silence unused warning if Display ever drops port.
+            let _ = port;
+        }
+        println!();
+        println!("Sailor pools by port category (Step 3.a):");
+        println!(
+            "  {:<20} {:>7} {:>12} {:>12} {:>12}",
+            "category", "ports", "seasoned", "unseasoned", "total"
+        );
+        for (cat, (n, s, u)) in &sums {
+            println!(
+                "  {:<20} {:>7} {:>12} {:>12} {:>12}",
+                cat,
+                n,
+                s,
+                u,
+                s + u
+            );
+        }
+    }
+
     // Builds-by-type summary: only count ships beyond the starter
     // fleet (those are the shipyard's actual output, not what we
     // seeded for the demo).

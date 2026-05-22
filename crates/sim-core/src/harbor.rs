@@ -211,6 +211,7 @@ mod tests {
             faction: Faction::Pirate,
             harbor_radius_nm: 5.0,
             shipyard: None,
+            category: crate::pop::PortCategory::SmallColonial,
         };
         let map = HarborMap::build(&land, std::slice::from_ref(&port));
         assert_eq!(map.harbors.len(), 1);
@@ -243,6 +244,7 @@ mod tests {
             faction: Faction::Pirate,
             harbor_radius_nm: 8.0, // would cross wall if straight-line
             shipyard: None,
+            category: crate::pop::PortCategory::SmallColonial,
         };
         let map = HarborMap::build(&land, std::slice::from_ref(&port));
         let h0 = &map.harbors[0];

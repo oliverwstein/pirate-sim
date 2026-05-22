@@ -141,6 +141,7 @@ mod tests {
             faction: crate::port::Faction::England,
             harbor_radius_nm: 5.0,
             shipyard: None,
+            category: crate::pop::PortCategory::SmallColonial,
         }
     }
 
