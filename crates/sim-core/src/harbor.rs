@@ -206,7 +206,7 @@ mod tests {
     fn harbor_zone_is_disk_in_open_sea() {
         let land = open_sea_land(40, 40, 1.0);
         let port = Port {
-            name: "Test",
+            name: "Test".to_string(),
             position: Position::new(20.0, 20.0),
             faction: Faction::Pirate,
             harbor_radius_nm: 5.0,
@@ -238,7 +238,7 @@ mod tests {
         }
         let land = LandMap::from_raw(data, w, h, Position::new(0.0, h as f32), 1.0);
         let port = Port {
-            name: "WestSide",
+            name: "WestSide".to_string(),
             position: Position::new(8.0, 10.0), // west of wall
             faction: Faction::Pirate,
             harbor_radius_nm: 8.0, // would cross wall if straight-line

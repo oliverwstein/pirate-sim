@@ -134,9 +134,9 @@ mod tests {
     use crate::ship::ShipStats;
     use crate::types::Position;
 
-    fn synth_port(name: &'static str, x: f32, y: f32) -> Port {
+    fn synth_port(name: &str, x: f32, y: f32) -> Port {
         Port {
-            name,
+            name: name.to_string(),
             position: Position::new(x, y),
             faction: crate::port::Faction::England,
             harbor_radius_nm: 5.0,

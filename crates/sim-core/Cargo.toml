@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-glam = "0.29"
+glam = { version = "0.29", features = ["serde"] }
 bytemuck = { version = "1", features = ["derive"] }
 microlp = "0.4"
 slotmap = "1"

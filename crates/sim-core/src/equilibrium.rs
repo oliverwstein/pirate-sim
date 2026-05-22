@@ -102,7 +102,7 @@ pub struct PortSpec<'a> {
 impl<'a> PortSpec<'a> {
     pub fn from_world(port: &'a Port, recipe: ProductionRecipe) -> Self {
         Self {
-            name: port.name,
+            name: &port.name,
             position: port.position,
             recipe,
         }

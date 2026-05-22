@@ -86,7 +86,7 @@ fn main() {
         ("Amsterdam", 89),
         ("Nantes", 97),
     ];
-    let mut origin_names: Vec<&str> = Vec::new();
+    let mut origin_names: Vec<String> = Vec::new();
     let mut ship_ids: Vec<ShipId> = Vec::new();
     for (name, seed) in starts {
         let Some(idx) = world.ports.iter().position(|p| p.name == *name) else {
@@ -98,7 +98,7 @@ fn main() {
         let mut ai = ShipAI::with_seed(*seed);
         ai.nav.docked_at_port = Some(idx);
         let id = world.add_ship(ship, ai);
-        origin_names.push(*name);
+        origin_names.push((*name).to_string());
         ship_ids.push(id);
     }
 
@@ -165,8 +165,8 @@ fn main() {
                 if !known.contains(&id) {
                     let owner_name = ship
                         .owner_port
-                        .and_then(|idx| world.ports.get(idx).map(|p| p.name))
-                        .unwrap_or("?");
+                        .and_then(|idx| world.ports.get(idx).map(|p| p.name.clone()))
+                        .unwrap_or_else(|| "?".to_string());
                     origin_names.push(owner_name);
                     ship_ids.push(id);
                 }
@@ -406,7 +406,7 @@ fn main() {
     let port_specs: Vec<PortSpec> = world
         .ports
         .iter()
-        .map(|p| PortSpec::from_world(p, archetype_for(p.name).recipe()))
+        .map(|p| PortSpec::from_world(p, archetype_for(&p.name).recipe()))
         .collect();
     let voyage_freight = FreightCostModel::ShipBased {
         stats: ShipStats::sloop(),

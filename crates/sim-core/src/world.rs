@@ -62,7 +62,8 @@ impl World {
     pub fn load(data_dir: &Path) -> Self {
         let map = MapSystem::load(data_dir);
         let weather = WeatherSystem::load(data_dir);
-        let ports = all_ports();
+        let ship_types = ShipTypeRegistry::starter();
+        let ports = all_ports(&ship_types);
         let harbors = HarborMap::build(&map.land, &ports);
         let navmesh = Navmesh::build(&map.land);
         let coastline =
@@ -72,7 +73,7 @@ impl World {
         let markets: Vec<PortMarket> = ports
             .iter()
             .map(|p| {
-                let archetype = archetype_for(p.name);
+                let archetype = archetype_for(&p.name);
                 PortMarket::with_recipe(&goods, archetype.recipe())
             })
             .collect();
@@ -89,7 +90,7 @@ impl World {
             coastline,
             land_mesh,
             goods,
-            ship_types: ShipTypeRegistry::starter(),
+            ship_types,
             markets,
             ships: SlotMap::with_key(),
             ship_ais: SecondaryMap::new(),

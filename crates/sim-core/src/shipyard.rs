@@ -149,7 +149,7 @@ pub fn try_build(
     types: &ShipTypeRegistry,
     avg_monthly_profit: f32,
 ) -> (BuildOutcome, Option<Ship>) {
-    let allowed = match port.shipyard {
+    let allowed = match &port.shipyard {
         Some(list) if !list.is_empty() => list,
         _ => return (BuildOutcome::NotAShipyard, None),
     };
@@ -246,19 +246,19 @@ mod tests {
     use crate::shiptype::{ids as st_ids, ShipTypeRegistry};
     use crate::types::Position;
 
-    fn yard_port(name: &'static str, allowed: &'static [ShipTypeId]) -> Port {
+    fn yard_port(name: &str, allowed: &[ShipTypeId]) -> Port {
         Port {
-            name,
+            name: name.to_string(),
             position: Position::new(0.0, 0.0),
             faction: Faction::England,
             harbor_radius_nm: 20.0,
-            shipyard: Some(allowed),
+            shipyard: Some(allowed.to_vec()),
         }
     }
 
     fn nonyard() -> Port {
         Port {
-            name: "Bridgetown",
+            name: "Bridgetown".to_string(),
             position: Position::new(0.0, 0.0),
             faction: Faction::England,
             harbor_radius_nm: 8.0,

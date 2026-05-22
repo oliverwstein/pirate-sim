@@ -255,7 +255,7 @@ fn draw_ports(world: &World, camera: &Camera) {
 
         // Draw name if zoomed in enough
         if camera.zoom() > 0.15 {
-            draw_text(port.name, sp.x + 6.0, sp.y - 4.0, 14.0, color);
+            draw_text(&port.name, sp.x + 6.0, sp.y - 4.0, 14.0, color);
         }
     }
 }
@@ -393,7 +393,7 @@ fn draw_ship_panel(world: &World, ship_id: ShipId) {
                 .nav
                 .dest_port
                 .and_then(|p| world.ports.get(p))
-                .map(|p| p.name)
+                .map(|p| p.name.as_str())
                 .unwrap_or("(open sea)");
             let dist_nm = ai
                 .nav
@@ -412,7 +412,7 @@ fn draw_ship_panel(world: &World, ship_id: ShipId) {
                 .nav
                 .docked_at_port
                 .and_then(|p| world.ports.get(p))
-                .map(|p| p.name)
+                .map(|p| p.name.as_str())
                 .unwrap_or("?");
             let act = match ai.dock_action {
                 sim_core::ai::DockAction::Idle => "idle",
@@ -511,7 +511,7 @@ fn draw_market_panel(world: &World, port_idx: usize) {
     draw_rectangle(x, y, panel_w, panel_h, Color::new(0.0, 0.0, 0.0, 0.7));
     draw_rectangle_lines(x, y, panel_w, panel_h, 2.0, WHITE);
 
-    draw_text(port.name, x + 10.0, y + 22.0, 20.0, YELLOW);
+    draw_text(&port.name, x + 10.0, y + 22.0, 20.0, YELLOW);
     draw_text(
         &format!("Treasury: ${:.0}", market.silver),
         x + 10.0,

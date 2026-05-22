@@ -16,21 +16,21 @@ fn calm_wind() -> WindVector {
 fn test_ports() -> Vec<Port> {
     vec![
         Port {
-            name: "PortA",
+            name: "PortA".to_string(),
             position: Position { x: 100.0, y: 0.0 },
             faction: sim_core::port::Faction::England,
             harbor_radius_nm: DEFAULT_HARBOR_RADIUS_NM,
             shipyard: None,
         },
         Port {
-            name: "PortB",
+            name: "PortB".to_string(),
             position: Position { x: -100.0, y: 0.0 },
             faction: sim_core::port::Faction::Spain,
             harbor_radius_nm: DEFAULT_HARBOR_RADIUS_NM,
             shipyard: None,
         },
         Port {
-            name: "PortC",
+            name: "PortC".to_string(),
             position: Position { x: 0.0, y: 100.0 },
             faction: sim_core::port::Faction::France,
             harbor_radius_nm: DEFAULT_HARBOR_RADIUS_NM,
@@ -471,14 +471,14 @@ fn trace_sailing_to_port_royal() {
     // Include Port Royal in the port list so diversion works sensibly
     let ports = vec![
         Port {
-            name: "Port Royal",
+            name: "Port Royal".to_string(),
             position: port_royal,
             faction: sim_core::port::Faction::England,
             harbor_radius_nm: DEFAULT_HARBOR_RADIUS_NM,
             shipyard: None,
         },
         Port {
-            name: "Bridgetown",
+            name: "Bridgetown".to_string(),
             position: barbados,
             faction: sim_core::port::Faction::England,
             harbor_radius_nm: DEFAULT_HARBOR_RADIUS_NM,
@@ -545,14 +545,14 @@ fn low_provisions_diverts_to_nearest_port() {
     let wind = calm_wind();
     let ports = vec![
         Port {
-            name: "NearPort",
+            name: "NearPort".to_string(),
             position: Position { x: 50.0, y: 0.0 },
             faction: sim_core::port::Faction::England,
             harbor_radius_nm: DEFAULT_HARBOR_RADIUS_NM,
             shipyard: None,
         },
         Port {
-            name: "FarPort",
+            name: "FarPort".to_string(),
             position: Position { x: 500.0, y: 0.0 },
             faction: sim_core::port::Faction::Spain,
             harbor_radius_nm: DEFAULT_HARBOR_RADIUS_NM,
@@ -624,14 +624,14 @@ fn continuous_sailing_with_port_visits() {
     let wind = calm_wind();
     let ports = vec![
         Port {
-            name: "Home",
+            name: "Home".to_string(),
             position: Position { x: 0.0, y: 0.0 },
             faction: sim_core::port::Faction::England,
             harbor_radius_nm: DEFAULT_HARBOR_RADIUS_NM,
             shipyard: None,
         },
         Port {
-            name: "Dest",
+            name: "Dest".to_string(),
             position: Position { x: 30.0, y: 0.0 },
             faction: sim_core::port::Faction::Spain,
             harbor_radius_nm: DEFAULT_HARBOR_RADIUS_NM,
@@ -697,14 +697,14 @@ fn dock_cycle_sells_arriving_cargo_and_buys_outgoing() {
     // cost: a sugar surplus at Home, a sugar deficit at Dest.
     let ports = vec![
         Port {
-            name: "Home",
+            name: "Home".to_string(),
             position: Position { x: 0.0, y: 0.0 },
             faction: sim_core::port::Faction::England,
             harbor_radius_nm: DEFAULT_HARBOR_RADIUS_NM,
             shipyard: None,
         },
         Port {
-            name: "Dest",
+            name: "Dest".to_string(),
             position: Position { x: 30.0, y: 0.0 },
             faction: sim_core::port::Faction::Spain,
             harbor_radius_nm: DEFAULT_HARBOR_RADIUS_NM,
@@ -765,14 +765,14 @@ fn ship_with_no_profitable_trade_still_undocks() {
     // Two identical Minor ports — find_best_trade returns None.
     let ports = vec![
         Port {
-            name: "A",
+            name: "A".to_string(),
             position: Position { x: 0.0, y: 0.0 },
             faction: sim_core::port::Faction::England,
             harbor_radius_nm: DEFAULT_HARBOR_RADIUS_NM,
             shipyard: None,
         },
         Port {
-            name: "B",
+            name: "B".to_string(),
             position: Position { x: 30.0, y: 0.0 },
             faction: sim_core::port::Faction::England,
             harbor_radius_nm: DEFAULT_HARBOR_RADIUS_NM,
