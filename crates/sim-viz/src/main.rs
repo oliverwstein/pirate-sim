@@ -269,10 +269,10 @@ fn draw_ports(world: &World, camera: &Camera) {
 fn draw_ships(world: &World, camera: &Camera, selected_ship: Option<ShipId>) {
     // Planned paths first, so ship triangles draw on top.
     for (id, ship) in &world.ships {
-        let nav = match world.ship_ais.get(id) {
-            Some(ai) => &ai.nav,
-            None => continue,
-        };
+        let nav = &ship.nav;
+        if world.ship_ais.get(id).is_none() {
+            continue;
+        }
         if nav.waypoints.is_empty() {
             continue;
         }
@@ -430,13 +430,13 @@ fn draw_ship_panel(world: &World, ship_id: ShipId) {
     let state_line = match ship.state {
         ShipState::Sailing => {
             let dest = ai
-                .nav
+                .goal
                 .dest_port
                 .and_then(|p| world.ports.get(p))
                 .map(|p| p.name.as_str())
                 .unwrap_or("(open sea)");
             let dist_nm = ai
-                .nav
+                .goal
                 .destination
                 .map(|d| ship.position.distance(d))
                 .unwrap_or(0.0);
@@ -448,16 +448,16 @@ fn draw_ship_panel(world: &World, ship_id: ShipId) {
             format!("SAILING → {}  ({:.0} NM, ETA {:.0}h)", dest, dist_nm, eta_h)
         }
         ShipState::Docked => {
-            let port = ai
+            let port = ship
                 .nav
                 .docked_at_port
                 .and_then(|p| world.ports.get(p))
                 .map(|p| p.name.as_str())
                 .unwrap_or("?");
-            let act = match ai.dock_action {
-                sim_core::ai::DockAction::Idle => "idle",
-                sim_core::ai::DockAction::Resupplying => "resupplying",
-                sim_core::ai::DockAction::Careening => "careening",
+            let act = match ship.dock_action {
+                sim_core::ship::DockAction::Idle => "idle",
+                sim_core::ship::DockAction::Resupplying => "resupplying",
+                sim_core::ship::DockAction::Careening => "careening",
             };
             format!("DOCKED at {} ({})", port, act)
         }
@@ -712,9 +712,9 @@ fn spawn_demo_ships(world: &mut World) {
     for (port_name, seed) in starts {
         if let Some(idx) = world.ports.iter().position(|p| p.name == *port_name) {
             let port_pos = world.ports[idx].position;
-            let ship = Ship::new(port_pos, ShipState::Docked);
-            let mut ai = ShipAI::with_seed(*seed);
-            ai.nav.docked_at_port = Some(idx);
+            let mut ship = Ship::new(port_pos, ShipState::Docked);
+            let ai = ShipAI::with_seed(*seed);
+            ship.nav.docked_at_port = Some(idx);
             world.add_ship(ship, ai);
         }
     }

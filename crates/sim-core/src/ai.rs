@@ -18,10 +18,10 @@ use crate::bt::{self, Behavior, BtContext, BtState, Status};
 use crate::goods::GoodsRegistry;
 use crate::harbor::HarborMap;
 use crate::market::PortMarket;
-use crate::nav::NavState;
+use crate::nav::NavGoal;
 use crate::pathfind::{self, PathfindContext};
 use crate::port::Port;
-use crate::ship::{Ship, ShipState, ShipStats};
+use crate::ship::{DockAction, Ship, ShipState, ShipStats};
 use crate::types::{Position, WindVector};
 
 // --- Action IDs ---
@@ -82,14 +82,6 @@ const OUTFIT_PORT_FRACTION_CAP: f32 = 0.2;
 /// docking from sale proceeds.
 const TRAMP_PORT_FRACTION_CAP: f32 = 0.10;
 
-/// What the ship is doing while docked (for display purposes).
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum DockAction {
-    Idle,
-    Resupplying,
-    Careening,
-}
-
 /// Build the ship AI behavior tree.
 fn build_ship_bt() -> Behavior {
     // Dock cycle: sell whatever we arrived with, top up provisions,
@@ -128,10 +120,12 @@ fn build_ship_bt() -> Behavior {
     ])
 }
 
-/// AI state for a single ship.
+/// AI state for a single ship (the captain). Owns the high-level goal
+/// (where the ship is trying to go) and the BT execution state; the ship
+/// itself owns the in-flight nav tracking (waypoints, dock) and dock
+/// action.
 pub struct ShipAI {
-    pub nav: NavState,
-    pub dock_action: DockAction,
+    pub goal: NavGoal,
     tree: Behavior,
     state: BtState,
     /// Simple RNG state (xorshift) for destination selection.
@@ -147,8 +141,7 @@ impl Default for ShipAI {
 impl ShipAI {
     pub fn new() -> Self {
         Self {
-            nav: NavState::new(),
-            dock_action: DockAction::Idle,
+            goal: NavGoal::new(),
             tree: build_ship_bt(),
             state: BtState::new(),
             rng_state: 12345,
@@ -157,8 +150,7 @@ impl ShipAI {
 
     pub fn with_destination(dest: Position) -> Self {
         Self {
-            nav: NavState::with_destination(dest),
-            dock_action: DockAction::Idle,
+            goal: NavGoal::with_destination(dest),
             tree: build_ship_bt(),
             state: BtState::new(),
             rng_state: 12345,
@@ -168,8 +160,7 @@ impl ShipAI {
     /// Create AI with a specific RNG seed (for variety among multiple ships).
     pub fn with_seed(seed: u64) -> Self {
         Self {
-            nav: NavState::new(),
-            dock_action: DockAction::Idle,
+            goal: NavGoal::new(),
             tree: build_ship_bt(),
             state: BtState::new(),
             rng_state: seed,
@@ -178,27 +169,11 @@ impl ShipAI {
 
     /// Called each tick: run the behavior tree.
     ///
-    /// `pathfind` is optional — when `Some`, the AI will plan obstacle-aware
-    /// waypoint routes whenever it picks a new destination. When `None` it
-    /// falls back to straight-line navigation (useful for unit tests with
-    /// synthetic toy ports).
-    ///
-    /// `markets` and `goods`, when both `Some`, route resupply through the
-    /// docked port's market (consuming silver and stockpile). When either
-    /// is `None`, resupply is free — used by toy/demo tests that don't
-    /// model an economy.
-    #[allow(clippy::too_many_arguments)]
-    pub fn tick(
-        &mut self,
-        ship: &mut Ship,
-        stats: &ShipStats,
-        wind: &WindVector,
-        ports: &[Port],
-        harbors: &HarborMap,
-        pathfind: Option<&PathfindContext<'_>>,
-        markets: Option<&mut [PortMarket]>,
-        goods: Option<&GoodsRegistry>,
-    ) {
+    /// `inputs` carries the per-tick external state the BT leaves need to
+    /// read/mutate (ship, wind, ports, markets, etc.). The AI merges those
+    /// inputs with its own internal state (`goal`, `rng_state`, BT cursor)
+    /// to form the BT context.
+    pub fn tick(&mut self, inputs: &mut ShipTickInputs<'_>) {
         // Reactivity guard: the root Selector resumes from its last
         // Running child every tick, so higher-priority branches are
         // skipped while a lower-priority branch is still ticking. If
@@ -209,22 +184,21 @@ impl ShipAI {
         // the top of the Selector. Without this, built ships sit at
         // dock running ACT_SAIL forever and never enter the dock
         // tree's SELL/RESUPPLY/BUY/UNDOCK cycle.
-        if ship.state == ShipState::Docked && !self.state.running_child.is_empty() {
+        if inputs.ship.state == ShipState::Docked && !self.state.running_child.is_empty() {
             self.state.reset();
         }
 
         let mut ctx = ShipBtContext {
-            ship,
-            stats,
-            wind,
-            nav: &mut self.nav,
-            dock_action: &mut self.dock_action,
-            ports,
-            harbors,
+            ship: inputs.ship,
+            stats: inputs.stats,
+            wind: inputs.wind,
+            goal: &mut self.goal,
+            ports: inputs.ports,
+            harbors: inputs.harbors,
             rng_state: &mut self.rng_state,
-            pathfind,
-            markets,
-            goods,
+            pathfind: inputs.pathfind,
+            markets: inputs.markets,
+            goods: inputs.goods,
         };
 
         let status = bt::tick(&self.tree, &mut self.state, &mut ctx, 0);
@@ -235,12 +209,26 @@ impl ShipAI {
         }
     }
 
-    /// Give the AI a new destination.
-    pub fn set_destination(&mut self, dest: Position) {
-        self.nav.destination = Some(dest);
-        self.nav.dest_port = None;
-        self.nav.clear_path();
+    /// Give the AI a new destination. Clears any in-flight path on the ship
+    /// (the old path was planned to the previous destination and is stale).
+    pub fn set_destination(&mut self, dest: Position, ship: &mut Ship) {
+        self.goal.destination = Some(dest);
+        self.goal.dest_port = None;
+        ship.nav.clear_path();
     }
+}
+
+/// Per-tick external inputs to the ship AI. The AI merges these with its
+/// own internal state (`goal`, `rng_state`, BT cursor) inside `tick`.
+pub struct ShipTickInputs<'a> {
+    pub ship: &'a mut Ship,
+    pub stats: &'a ShipStats,
+    pub wind: &'a WindVector,
+    pub ports: &'a [Port],
+    pub harbors: &'a HarborMap,
+    pub pathfind: Option<&'a PathfindContext<'a>>,
+    pub markets: &'a mut [PortMarket],
+    pub goods: &'a GoodsRegistry,
 }
 
 /// Simple xorshift64 RNG — deterministic and fast.
@@ -254,18 +242,19 @@ fn xorshift64(state: &mut u64) -> u64 {
 }
 
 /// Context struct that connects BT leaf nodes to actual ship logic.
-struct ShipBtContext<'a> {
+/// Borrows the per-tick `ship` (which owns `nav` and `dock_action`) plus
+/// AI-side `goal` and `rng_state`, plus all the read-only world state.
+pub struct ShipBtContext<'a> {
     ship: &'a mut Ship,
     stats: &'a ShipStats,
     wind: &'a WindVector,
-    nav: &'a mut NavState,
-    dock_action: &'a mut DockAction,
+    goal: &'a mut NavGoal,
     ports: &'a [Port],
     harbors: &'a HarborMap,
     rng_state: &'a mut u64,
     pathfind: Option<&'a PathfindContext<'a>>,
-    markets: Option<&'a mut [PortMarket]>,
-    goods: Option<&'a GoodsRegistry>,
+    markets: &'a mut [PortMarket],
+    goods: &'a GoodsRegistry,
 }
 
 impl<'a> ShipBtContext<'a> {
@@ -274,13 +263,20 @@ impl<'a> ShipBtContext<'a> {
     /// then falls back to straight-line nav with reactive deflection.
     fn assign_destination_port(&mut self, port_index: usize) {
         let port = &self.ports[port_index];
-        self.nav.destination = Some(port.position);
-        self.nav.dest_port = Some(port_index);
-        self.nav.clear_path();
+        self.goal.destination = Some(port.position);
+        self.goal.dest_port = Some(port_index);
+        self.ship.nav.clear_path();
 
         if let (Some(pf), Some(harbor)) = (self.pathfind, self.harbors.for_port(port_index)) {
             if let Some(path) = pathfind::find_path_to_harbor(pf, self.ship.position, harbor) {
-                self.nav.set_path(path);
+                // Track the path's terminal waypoint as the geometric
+                // arrival target — typically the harbor anchor, which may
+                // differ slightly from the port's literal coordinate when
+                // the port sits inside a polygonal harbor zone.
+                if let Some(last) = path.last().copied() {
+                    self.goal.destination = Some(last);
+                }
+                self.ship.nav.set_path(path);
             }
         }
     }
@@ -291,14 +287,17 @@ impl<'a> ShipBtContext<'a> {
     fn replan_to_port(&mut self, port_index: usize) {
         if let (Some(pf), Some(harbor)) = (self.pathfind, self.harbors.for_port(port_index)) {
             if let Some(path) = pathfind::find_path_to_harbor(pf, self.ship.position, harbor) {
-                self.nav.set_path(path);
+                if let Some(last) = path.last().copied() {
+                    self.goal.destination = Some(last);
+                }
+                self.ship.nav.set_path(path);
             }
         }
     }
 
     /// True if the ship is in its destination port's harbor zone.
     fn in_destination_harbor(&self) -> bool {
-        let port_idx = match self.nav.dest_port {
+        let port_idx = match self.goal.dest_port {
             Some(i) => i,
             None => return false,
         };
@@ -328,21 +327,21 @@ impl<'a> ShipBtContext<'a> {
         // port coordinate may still be far away (e.g., Philadelphia
         // up the Delaware) — that's fine.
         if self.in_destination_harbor() {
-            let port_idx = self.nav.dest_port;
+            let port_idx = self.goal.dest_port;
             self.ship.dock();
-            *self.dock_action = DockAction::Idle;
-            self.nav.docked_at_port = port_idx;
-            self.nav.destination = None;
-            self.nav.dest_port = None;
-            self.nav.clear_path();
+            self.ship.dock_action = DockAction::Idle;
+            self.ship.nav.docked_at_port = port_idx;
+            self.goal.destination = None;
+            self.goal.dest_port = None;
+            self.ship.nav.clear_path();
             // Settle any outstanding chandler/freight debt at
             // this port first — creditors come before owners.
             // Fungible: it doesn't matter which port originally
             // advanced the credit; the merchant network settles
             // it via bills of exchange between correspondents.
-            if let (Some(idx), Some(markets)) = (port_idx, self.markets.as_deref_mut()) {
-                if idx < markets.len() {
-                    markets[idx].collect_debt(self.ship, HOME_PORT_FLOAT_SILVER);
+            if let Some(idx) = port_idx {
+                if idx < self.markets.len() {
+                    self.markets[idx].collect_debt(self.ship, HOME_PORT_FLOAT_SILVER);
                 }
             }
             // Home-port settlement: if this is the owner port,
@@ -352,14 +351,10 @@ impl<'a> ShipBtContext<'a> {
             // the ship keeps just enough to cover provisions
             // and incidentals at the next port of call.
             if let (Some(idx), Some(owner)) = (port_idx, self.ship.owner_port) {
-                if idx == owner {
-                    if let Some(markets) = self.markets.as_deref_mut() {
-                        if idx < markets.len() {
-                            let paid = markets[idx]
-                                .deposit_owner_profit(self.ship, HOME_PORT_FLOAT_SILVER);
-                            self.ship.lifetime_dividends += paid;
-                        }
-                    }
+                if idx == owner && idx < self.markets.len() {
+                    let paid =
+                        self.markets[idx].deposit_owner_profit(self.ship, HOME_PORT_FLOAT_SILVER);
+                    self.ship.lifetime_dividends += paid;
                 }
             }
             return Status::Success;
@@ -370,10 +365,10 @@ impl<'a> ShipBtContext<'a> {
         // that drifts/tacks past its last waypoint will dead-reckon
         // straight toward the destination — through land, if any —
         // and pin against the coast.
-        if self.nav.waypoints.is_empty() && self.nav.dest_port.is_some() {
-            if let Some(dest) = self.nav.destination {
+        if self.ship.nav.waypoints.is_empty() && self.goal.dest_port.is_some() {
+            if let Some(dest) = self.goal.destination {
                 if self.ship.position.distance(dest) > REPLAN_DISTANCE_NM {
-                    if let Some(idx) = self.nav.dest_port {
+                    if let Some(idx) = self.goal.dest_port {
                         self.replan_to_port(idx);
                     }
                 }
@@ -381,13 +376,15 @@ impl<'a> ShipBtContext<'a> {
         }
 
         let land = self.pathfind.map(|c| c.land);
-        if let Some(s) = self
+        let pos = self.ship.position;
+        let steering = self
+            .ship
             .nav
-            .compute_steering(self.ship.position, self.stats, self.wind, land)
-        {
+            .compute_steering(self.goal, pos, self.stats, self.wind, land);
+        if let Some(s) = steering {
             self.ship.set_steering(s.heading, s.speed);
             Status::Running
-        } else if self.nav.dest_port.is_some()
+        } else if self.goal.dest_port.is_some()
             && self.pathfind.is_some()
             && !self.in_destination_harbor()
         {
@@ -398,34 +395,30 @@ impl<'a> ShipBtContext<'a> {
             // false-docking in open water (which is the canonical
             // way ships used to get stuck near small-harbor ports
             // like Amsterdam/Nantes).
-            if let Some(idx) = self.nav.dest_port {
+            if let Some(idx) = self.goal.dest_port {
                 self.replan_to_port(idx);
             }
             Status::Running
         } else {
             // Arrived at a free-form destination (no harbor zone).
             self.ship.dock();
-            *self.dock_action = DockAction::Idle;
+            self.ship.dock_action = DockAction::Idle;
             Status::Success
         }
     }
 
     fn act_resupply(&mut self) -> Status {
-        *self.dock_action = DockAction::Resupplying;
-        let done = match (
-            self.nav.docked_at_port,
-            self.markets.as_deref_mut(),
-            self.goods,
-        ) {
-            (Some(idx), Some(markets), Some(goods)) if idx < markets.len() => self
-                .ship
-                .tick_resupply_at_market(self.stats, &mut markets[idx], goods),
-            // No market wired (test scenario, or unknown port) —
-            // fall back to free resupply so legacy tests pass.
+        self.ship.dock_action = DockAction::Resupplying;
+        let done = match self.ship.nav.docked_at_port {
+            Some(idx) if idx < self.markets.len() => {
+                self.ship
+                    .tick_resupply_at_market(self.stats, &mut self.markets[idx], self.goods)
+            }
+            // Unknown / out-of-range port — fall back to free resupply.
             _ => self.ship.tick_resupply(self.stats),
         };
         if done {
-            *self.dock_action = DockAction::Idle;
+            self.ship.dock_action = DockAction::Idle;
             Status::Success
         } else {
             Status::Running
@@ -433,9 +426,9 @@ impl<'a> ShipBtContext<'a> {
     }
 
     fn act_careen(&mut self) -> Status {
-        *self.dock_action = DockAction::Careening;
+        self.ship.dock_action = DockAction::Careening;
         if self.ship.tick_careen() {
-            *self.dock_action = DockAction::Idle;
+            self.ship.dock_action = DockAction::Idle;
             Status::Success
         } else {
             Status::Running
@@ -443,13 +436,13 @@ impl<'a> ShipBtContext<'a> {
     }
 
     fn act_undock(&mut self) -> Status {
-        if self.nav.destination.is_some() {
+        if self.goal.destination.is_some() {
             self.ship.undock();
-            self.nav.docked_at_port = None;
-            *self.dock_action = DockAction::Idle;
+            self.ship.nav.docked_at_port = None;
+            self.ship.dock_action = DockAction::Idle;
             Status::Success
         } else {
-            *self.dock_action = DockAction::Idle;
+            self.ship.dock_action = DockAction::Idle;
             Status::Failure
         }
     }
@@ -467,20 +460,16 @@ impl<'a> ShipBtContext<'a> {
     }
 
     fn act_sell_all(&mut self) -> Status {
-        // Sell every ton of cargo we arrived with at the
-        // docked port's market. If markets/goods aren't wired
-        // (toy tests), this is a no-op success.
-        let (Some(idx), Some(markets), Some(goods)) = (
-            self.nav.docked_at_port,
-            self.markets.as_deref_mut(),
-            self.goods,
-        ) else {
+        // Sell every ton of cargo we arrived with at the docked port's
+        // market. Silent no-op when docked_at_port isn't set or is out of
+        // range (test ports beyond the markets slice).
+        let Some(idx) = self.ship.nav.docked_at_port else {
             return Status::Success;
         };
-        if idx >= markets.len() {
+        if idx >= self.markets.len() {
             return Status::Success;
         }
-        let market = &mut markets[idx];
+        let market = &mut self.markets[idx];
         let entries: Vec<(crate::goods::GoodId, f32)> = self.ship.cargo.iter().collect();
         for (gid, tons) in entries {
             if tons > 0.0 {
@@ -489,7 +478,7 @@ impl<'a> ShipBtContext<'a> {
                 // v1 we just attempt the full amount; if the
                 // port can't pay, the cargo stays aboard and
                 // we'll try again on the next leg.
-                let _ = market.sell(self.ship, gid, tons, goods);
+                let _ = market.sell(self.ship, gid, tons, self.goods);
             }
         }
         Status::Success
@@ -499,14 +488,10 @@ impl<'a> ShipBtContext<'a> {
         // Pick the best (good, dest) and load up. Sets the
         // ship's destination as a side effect so ACT_UNDOCK
         // has somewhere to go.
-        let (Some(idx), Some(markets), Some(goods)) = (
-            self.nav.docked_at_port,
-            self.markets.as_deref_mut(),
-            self.goods,
-        ) else {
+        let Some(idx) = self.ship.nav.docked_at_port else {
             return Status::Success;
         };
-        if idx >= markets.len() {
+        if idx >= self.markets.len() {
             return Status::Success;
         }
         // Reachability budget: assume we leave with a full
@@ -534,8 +519,8 @@ impl<'a> ShipBtContext<'a> {
         let plan = crate::trade::find_best_trade(
             idx,
             self.ports,
-            markets,
-            goods,
+            self.markets,
+            self.goods,
             self.stats,
             provision_budget_days,
             home_bias,
@@ -547,8 +532,8 @@ impl<'a> ShipBtContext<'a> {
 
         // Buy as many tons as we can afford, that fit in the
         // hold, and that the port can supply.
-        let market = &mut markets[idx];
-        let unit = market.buy_price(plan.good, goods).max(0.0001);
+        let market = &mut self.markets[idx];
+        let unit = market.buy_price(plan.good, self.goods).max(0.0001);
         let cargo_room = self.stats.cargo_capacity_tons - self.ship.cargo.total_tons();
 
         // Outfitting draw: if this is the owner port, top the
@@ -589,7 +574,7 @@ impl<'a> ShipBtContext<'a> {
         let in_stock = market.stockpile.get(plan.good);
         let tons = cargo_room.min(affordable).min(in_stock).max(0.0);
         if tons > 0.0 {
-            let _ = market.buy(self.ship, self.stats, plan.good, tons, goods);
+            let _ = market.buy(self.ship, self.stats, plan.good, tons, self.goods);
         }
 
         // Always set the destination — even when the buy fell
@@ -629,7 +614,7 @@ impl<'a> BtContext for ShipBtContext<'a> {
     fn check_condition(&mut self, id: usize) -> Status {
         let result = match id {
             COND_IS_DOCKED => self.ship.state == ShipState::Docked,
-            COND_HAS_DESTINATION => self.nav.destination.is_some(),
+            COND_HAS_DESTINATION => self.goal.destination.is_some(),
             COND_IS_LOW_PROVISIONS => {
                 if self.ship.state != ShipState::Sailing {
                     false
@@ -641,7 +626,7 @@ impl<'a> BtContext for ShipBtContext<'a> {
                     // of its destination keeps pushing on even if the
                     // hold is nearly empty — diverting at 80% of a
                     // transatlantic voyage just wastes the trip.
-                    if let Some(dest) = self.nav.destination {
+                    if let Some(dest) = self.goal.destination {
                         let dist = self.ship.position.distance(dest);
                         let voyage_days = self.stats.estimated_voyage_days(dist);
                         days_remaining < voyage_days + REACHABILITY_BUFFER_DAYS

@@ -211,15 +211,15 @@ impl World {
                 &self.ship_types,
                 self.last_month_avg_profit,
             );
-            if let (BuildOutcome::Built { .. }, Some(ship)) = (outcome, ship) {
+            if let (BuildOutcome::Built { .. }, Some(mut ship)) = (outcome, ship) {
                 // New ship docks at home port immediately; the AI's
                 // BUY_BEST tree will pick its first destination on
                 // the first dock-cycle tick. We seed
-                // `nav.docked_at_port = idx` so the dock tree knows
-                // which market to trade with.
-                let mut ai =
+                // `ship.nav.docked_at_port = idx` so the dock tree
+                // knows which market to trade with.
+                let ai =
                     ShipAI::with_seed(0xA15E_C0FF_u64 ^ (idx as u64) ^ (self.ships_built as u64));
-                ai.nav.docked_at_port = Some(idx);
+                ship.nav.docked_at_port = Some(idx);
                 newly_built.push((ship, ai));
             }
         }
@@ -281,7 +281,7 @@ impl World {
                     if s.crew_alive >= typical {
                         continue;
                     }
-                    let port = match self.ship_ais.get(id).and_then(|a| a.nav.docked_at_port) {
+                    let port = match s.nav.docked_at_port {
                         Some(p) => p,
                         None => continue,
                     };
@@ -380,16 +380,19 @@ impl World {
                 Some(s) => s,
                 None => continue,
             };
-            ai.tick(
-                ship,
-                &ship_stats,
-                &wind,
-                &self.ports,
-                &self.harbors,
-                Some(&pathfind),
-                Some(&mut self.markets),
-                Some(&self.goods),
-            );
+            {
+                let mut inputs = crate::ai::ShipTickInputs {
+                    ship,
+                    stats: &ship_stats,
+                    wind: &wind,
+                    ports: &self.ports,
+                    harbors: &self.harbors,
+                    pathfind: Some(&pathfind),
+                    markets: &mut self.markets,
+                    goods: &self.goods,
+                };
+                ai.tick(&mut inputs);
+            }
 
             // Resource consumption
             ship.tick_resources(&ship_stats);
@@ -409,7 +412,7 @@ impl World {
                 }
                 ShipState::Docked => {
                     if ship.wages_owed_pesos > 0.0 {
-                        if let Some(port_idx) = ai.nav.docked_at_port {
+                        if let Some(port_idx) = ship.nav.docked_at_port {
                             let pay = ship.wages_owed_pesos.min(ship.silver.max(0.0));
                             if pay > 0.0 {
                                 ship.silver -= pay;

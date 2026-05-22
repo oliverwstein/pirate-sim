@@ -1,4 +1,5 @@
 use crate::cargo::Cargo;
+use crate::nav::NavTrack;
 use crate::port::Faction;
 use crate::types::{Position, WindVector};
 use serde::Deserialize;
@@ -143,6 +144,26 @@ pub struct Ship {
     /// capturer's faction). Test/scaffolding ships built via
     /// `Ship::new` default to `Faction::Free`.
     pub faction: Faction,
+    /// In-flight navigation tracking — which port the ship is currently
+    /// moored at (if any) and the waypoint queue it's following.
+    /// Distinct from the captain's `NavGoal` (which lives on `ShipAI`):
+    /// these are the ship's commitments to the world that persist across
+    /// captain swaps. See `planning/development-log.md` Step 5.b.
+    pub nav: NavTrack,
+    /// What the ship is doing while docked (Resupplying, Careening, or
+    /// Idle). Drives display + dock-tree action selection. Moved off
+    /// `ShipAI` in Step 5.b because a careen in progress is a property
+    /// of the hull (paint scraped, ship beached), not the captain.
+    pub dock_action: DockAction,
+}
+
+/// What the ship is doing while docked. Used by the docking sequence in
+/// the AI's BT, and by the viz to show port activity.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DockAction {
+    Idle,
+    Resupplying,
+    Careening,
 }
 
 impl Ship {
@@ -168,6 +189,8 @@ impl Ship {
             wages_owed_pesos: 0.0,
             morale: 1.0,
             faction: Faction::Free,
+            nav: NavTrack::new(),
+            dock_action: DockAction::Idle,
         }
     }
 
@@ -216,6 +239,8 @@ impl Ship {
             wages_owed_pesos: 0.0,
             morale: 1.0,
             faction,
+            nav: NavTrack::new(),
+            dock_action: DockAction::Idle,
         }
     }
 

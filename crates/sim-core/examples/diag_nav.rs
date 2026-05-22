@@ -108,7 +108,8 @@ fn main() {
             consecutive_stuck = 0;
         }
         if t % 24 == 0 || consecutive_stuck == 6 {
-            let nav = &world.ship_ais[id].nav;
+            let goal = &world.ship_ais[id].goal;
+            let nav = &s.nav;
             println!(
                 "h{:4} state={:?} pos=({:6.1},{:6.1}) hd={:5.1} sp={:4.1} dest={:?} wps={}",
                 t,
@@ -117,7 +118,7 @@ fn main() {
                 s.position.y,
                 s.heading,
                 s.speed,
-                nav.destination.map(|p| (p.x as i32, p.y as i32)),
+                goal.destination.map(|p| (p.x as i32, p.y as i32)),
                 nav.waypoints.len()
             );
         }

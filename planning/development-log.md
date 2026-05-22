@@ -495,3 +495,45 @@ Seeded ships are now first-class home-ported ships, consistent with shipyard-bui
 **Atlantic-fleet calibration research** (background agent completed during 5.a): preserved in `~/.copilot/session-state/<id>/files/atlantic-fleet-numbers-1650-1720.md`. **Key takeaway for Step 10 calibration: target ~500 ships baseline for Caribbean basin ~1680, scaling to 800–1000 by 1720.** Current bench runs ~25 ships at 365 days — order-of-magnitude undershoot to be addressed in Step 10.
 
 **Next:** 5.b — promote `ShipBtContext` to a per-tick type owned by `World::tick_hourly_ai_and_physics`; reduce `ShipAI::tick` 8-arg signature to `pub fn tick(&mut self, ctx: &mut ShipBtContext<'_>)`. Drops the two `Option<&mut …>` legacy slots; test scaffolding migrates to real empty markets/goods.
+
+---
+
+## Step 5.b — Split NavState; collapse `ShipAI::tick` signature (2026-05-22)
+
+**Scope:** Audit §3 — but with a richer split than the audit proposed. Per discussion, the *captain's intent* belongs to the AI while the *ship's commitments to the world* belong to the Ship. This survives a future captain swap (player/scripted captains in Phase 4) without losing in-flight nav state.
+
+**Key restructuring:**
+- `NavState` split into two `pub` structs:
+  - `NavGoal { destination, dest_port }` — lives on `ShipAI.goal` (the captain's "where I want to go").
+  - `NavTrack { waypoints, docked_at_port }` — lives on `Ship.nav` (path being followed, current mooring).
+- `compute_steering` is now `NavTrack::compute_steering(&mut self, &mut NavGoal, pos, stats, wind, land)` — final-arrival clearing mutates both.
+- `set_path` no longer auto-syncs `goal.destination` (it lived on a different struct). Callers (`assign_destination_port`, `replan_to_port`) explicitly update `goal.destination` to the path's terminal waypoint — preserves the prior semantic that arrival is judged against the harbor anchor, not the port's literal coordinate. (First bench run without this resync regressed P/L from +846,992 → +824,704; restoring it returned exact parity.)
+- `DockAction` enum **moved** from `ai.rs` to `ship.rs` and renamed in spirit (it describes what the ship is *doing* at dock, not AI cognition). `Ship.dock_action: DockAction` is now a ship field. Imports must use `sim_core::ship::DockAction`.
+
+**`ShipAI::tick` signature change:**
+- Old: `pub fn tick(&mut self, ship, stats, wind, ports, harbors, pathfind: Option<&PathfindContext>, markets: Option<&mut [PortMarket]>, goods: Option<&GoodsRegistry>)` — 8 args, two `Option<>` legacy slots for market-less tests.
+- New: `pub fn tick(&mut self, inputs: &mut ShipTickInputs<'_>)` where `ShipTickInputs { ship, stats, wind, ports, harbors, pathfind: Option<&PathfindContext>, markets: &mut [PortMarket], goods: &GoodsRegistry }`.
+- `ShipBtContext` is now `pub` but still constructed inside `tick` from `ShipTickInputs` + `&mut self.{goal, rng_state}`. This is the "hybrid" shape — slightly short of the audit's "World owns and constructs the ctx" ideal, but `goal` and `rng_state` are genuinely AI state and don't want to live elsewhere. The practical pain (the two `Option<>` slots) is gone.
+- Markets/goods are non-Option everywhere; the fallback paths inside `act_resupply`/`act_sell_all`/`act_buy_best` for "no market wired" become harmless `idx >= markets.len()` early-returns. Test scaffolding uses real empty `Vec<PortMarket>` + `GoodsRegistry::starter()` via new helpers `tick_ai` and `tick_ai_with_markets`.
+
+**Caller migrations:**
+- `World::tick_hourly_ai_and_physics`: builds one `ShipTickInputs` per ship per tick in a local block (still slot-by-slot — full ship-list double-buffering arrives in 5.c).
+- World hiring/wage paths now read `ship.nav.docked_at_port` (not `ai.nav.docked_at_port`).
+- `bench_trade.rs` + `viz/main.rs` seeded-fleet inits write `ship.nav.docked_at_port = Some(idx)` and use the new `sim_core::ship::DockAction` path.
+- `diag_nav.rs` reads `world.ship_ais[id].goal` + `s.nav`.
+
+**Test migrations:**
+- 17 `ai.tick(…, None, None, None)` callsites bulk-converted to `tick_ai(&mut ai, &mut ship, &stats, &wind, &ports)`.
+- `ai.dock_action` → `ship.dock_action`; `ai.nav.{destination,dest_port}` → `ai.goal.{destination,dest_port}`; `ai.nav.docked_at_port` → `ship.nav.docked_at_port`.
+- Two `tick_until` predicate closures changed from `|_, a| ship.dock_action != X` (captures outer `ship`, conflicts with `tick_until`'s `&mut ship` borrow) to `|s, _| s.dock_action != X` (uses helper's `&Ship` parameter).
+
+**Verification:**
+- `cargo build --workspace --tests --examples` clean.
+- `cargo test --workspace`: **116 passing**.
+- `cargo clippy --workspace --all-targets -- -D warnings`: clean.
+- `bench_trade -- 365`: **+846,992 pesos** — bit-identical to 5.a baseline.
+- `bench_trade -- 730`: **+2,869,818 pesos** — bit-identical.
+
+**Deferred:** Pulling `goal`/`rng_state` off `ShipAI` so `World` can fully own/construct `ShipBtContext` (audit's ideal). Sub-helper extractions inside `act_sail` / `act_buy_best` from audit §2. Neither blocks 5.c.
+
+**Next:** 5.c — introduce `ShipCommand::Steer { heading, commanded_speed }`. `act_sail` pushes a Steer command instead of calling `ship.set_steering`; a new Resolution Phase between AI and physics drains the queue. All other ship/market mutations stay in-place per `phase-3-plan.md` ("Steer as the only command initially").

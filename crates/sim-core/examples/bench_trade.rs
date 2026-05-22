@@ -108,9 +108,9 @@ fn main() {
         };
         let port_pos = world.ports[idx].position;
         let faction = world.ports[idx].faction;
-        let ship = Ship::seeded_at_port(port_pos, idx, faction);
-        let mut ai = ShipAI::with_seed(*seed);
-        ai.nav.docked_at_port = Some(idx);
+        let mut ship = Ship::seeded_at_port(port_pos, idx, faction);
+        let ai = ShipAI::with_seed(*seed);
+        ship.nav.docked_at_port = Some(idx);
         let id = world.add_ship(ship, ai);
         origin_names.push((*name).to_string());
         ship_ids.push(id);

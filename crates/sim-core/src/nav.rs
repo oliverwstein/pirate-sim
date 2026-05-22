@@ -39,70 +39,81 @@ const DEFLECT_LOOKAHEAD_NM: f32 = 14.0;
 /// long voyages from grinding to literal zero in light winds.
 const MIN_UPWIND_VMG: f32 = 0.5;
 
-/// Navigation state for a ship (owned by AI, not by Ship itself).
-pub struct NavState {
+/// The captain's long-term intent. Owned by `ShipAI` (the captain) — when
+/// the captain is replaced, the goal is replaced too. Phase-3 split: this
+/// is the "where I want to go" half of the legacy `NavState`.
+#[derive(Debug, Clone, Default)]
+pub struct NavGoal {
     /// Final goal — once cleared, the ship has arrived.
     pub destination: Option<Position>,
     /// Index of the destination port, when the destination is one. Enables
     /// harbor-zone arrival in the AI layer; geometric arrival is still used
     /// for free-form destinations (None).
     pub dest_port: Option<usize>,
-    /// Index of the port the ship is currently docked at, if any. Set when
-    /// `ACT_SAIL` transitions into Docked, cleared on undock. Lets dock-time
-    /// behaviors (resupply, careen, trade) find the right port market.
-    pub docked_at_port: Option<usize>,
-    /// Ordered intermediate waypoints (front = next target). The final
-    /// element should equal `destination` when a path was planned.
-    pub waypoints: VecDeque<Position>,
 }
 
-impl Default for NavState {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl NavState {
+impl NavGoal {
     pub fn new() -> Self {
-        Self {
-            destination: None,
-            dest_port: None,
-            docked_at_port: None,
-            waypoints: VecDeque::new(),
-        }
+        Self::default()
     }
 
     pub fn with_destination(dest: Position) -> Self {
         Self {
             destination: Some(dest),
             dest_port: None,
-            docked_at_port: None,
-            waypoints: VecDeque::new(),
         }
     }
 
-    /// Replace the current waypoint queue with a planned path. The final
-    /// waypoint is taken to be the destination.
+    pub fn clear(&mut self) {
+        self.destination = None;
+        self.dest_port = None;
+    }
+}
+
+/// The ship's in-flight navigation tracking — what waypoints it's currently
+/// following and what port (if any) it's moored at. Owned by `Ship` because
+/// it's a property of the hull's commitments to the world, not the captain.
+/// If the captain is swapped (Phase 4 player/scripted/scripted captains),
+/// the ship still has the same waypoints queued and the same mooring.
+#[derive(Debug, Clone, Default)]
+pub struct NavTrack {
+    /// Index of the port the ship is currently docked at, if any. Set when
+    /// `ACT_SAIL` transitions into Docked, cleared on undock. Lets dock-time
+    /// behaviors (resupply, careen, trade) find the right port market.
+    pub docked_at_port: Option<usize>,
+    /// Ordered intermediate waypoints (front = next target). The final
+    /// element should equal the captain's `NavGoal.destination` when a path
+    /// was planned.
+    pub waypoints: VecDeque<Position>,
+}
+
+impl NavTrack {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Replace the current waypoint queue with a planned path. Caller is
+    /// responsible for keeping the captain's `NavGoal.destination` in sync
+    /// with the path's final waypoint (typically they already match because
+    /// the path was planned *to* the destination).
     pub fn set_path(&mut self, waypoints: Vec<Position>) {
-        if let Some(last) = waypoints.last().copied() {
-            self.destination = Some(last);
-        }
         self.waypoints = waypoints.into();
     }
 
-    /// Clear any planned path (keeps `destination` in place).
+    /// Clear any planned path (keeps `goal.destination` in place).
     pub fn clear_path(&mut self) {
         self.waypoints.clear();
     }
 
-    /// The current heading target: front waypoint if any, else destination.
-    fn current_target(&self) -> Option<Position> {
-        self.waypoints.front().copied().or(self.destination)
+    /// The current heading target: front waypoint if any, else goal destination.
+    fn current_target(&self, goal: &NavGoal) -> Option<Position> {
+        self.waypoints.front().copied().or(goal.destination)
     }
 
     /// Compute steering (heading + commanded speed) given current position,
     /// wind, and destination. Returns None if no destination is set or the
-    /// ship has arrived.
+    /// ship has arrived. Mutates self (waypoint advancement) and goal
+    /// (destination cleared on final arrival).
     ///
     /// The returned heading is always direct toward the next waypoint /
     /// destination. When that bearing lies inside the no-go zone, the
@@ -114,6 +125,7 @@ impl NavState {
     /// the ship close to land between planner waypoints).
     pub fn compute_steering(
         &mut self,
+        goal: &mut NavGoal,
         pos: Position,
         stats: &ShipStats,
         wind: &WindVector,
@@ -128,15 +140,15 @@ impl NavState {
             }
         }
 
-        let dest = self.destination?;
+        let dest = goal.destination?;
 
         // Final arrival check (only when no intermediate waypoints remain).
         if self.waypoints.is_empty() && pos.distance(dest) < ARRIVAL_NM {
-            self.destination = None;
+            goal.destination = None;
             return None;
         }
 
-        let target = self.current_target()?;
+        let target = self.current_target(goal)?;
 
         let delta = target - pos;
         let bearing_to_target = normalize_angle(delta.x.atan2(delta.y).to_degrees());
@@ -233,11 +245,12 @@ mod tests {
 
     #[test]
     fn test_direct_heading() {
-        let mut nav = NavState::with_destination(Position::new(100.0, 0.0));
+        let mut goal = NavGoal::with_destination(Position::new(100.0, 0.0));
+        let mut nav = NavTrack::new();
         let stats = ShipStats::sloop();
         let wind = WindVector { u: 0.0, v: 15.0 }; // from south
         let s = nav
-            .compute_steering(Position::ZERO, &stats, &wind, None)
+            .compute_steering(&mut goal, Position::ZERO, &stats, &wind, None)
             .unwrap();
         assert!((s.heading - 90.0).abs() < 1.0);
         assert!(s.speed > 5.0, "beam reach should be fast");
@@ -247,11 +260,12 @@ mod tests {
     fn test_upwind_uses_vmg_speed() {
         // Heading is direct toward target even when in the no-go zone, but
         // commanded speed is the VMG of an optimal tack.
-        let mut nav = NavState::with_destination(Position::new(0.0, 100.0));
+        let mut goal = NavGoal::with_destination(Position::new(0.0, 100.0));
+        let mut nav = NavTrack::new();
         let stats = ShipStats::sloop();
         let wind = WindVector { u: 0.0, v: -15.0 }; // from north
         let s = nav
-            .compute_steering(Position::ZERO, &stats, &wind, None)
+            .compute_steering(&mut goal, Position::ZERO, &stats, &wind, None)
             .unwrap();
         // Heading is direct (north).
         assert!(angle_diff(s.heading, 0.0).abs() < 1.0);
@@ -265,12 +279,13 @@ mod tests {
 
     #[test]
     fn test_arrival_clears_destination() {
-        let mut nav = NavState::with_destination(Position::new(3.0, 0.0));
+        let mut goal = NavGoal::with_destination(Position::new(3.0, 0.0));
+        let mut nav = NavTrack::new();
         let stats = ShipStats::sloop();
         let wind = WindVector { u: 0.0, v: 15.0 };
-        let result = nav.compute_steering(Position::ZERO, &stats, &wind, None);
+        let result = nav.compute_steering(&mut goal, Position::ZERO, &stats, &wind, None);
         assert!(result.is_none()); // within ARRIVAL_NM
-        assert!(nav.destination.is_none());
+        assert!(goal.destination.is_none());
     }
 
     #[test]
