@@ -112,6 +112,8 @@ pub struct Ship {
     /// into the port treasury and added here. True lifetime P/L for a
     /// home-ported ship is `(silver - starting_silver) + lifetime_dividends`.
     pub lifetime_dividends: f32,
+    /// Total dock events across the ship's life (instrumentation).
+    pub lifetime_dock_count: u32,
     /// Outstanding credit drawn from port chandlers/factors —
     /// either provisions taken on tick when broke, or freight cargo
     /// (tramping) advanced against the next sale. Repaid out of any
@@ -182,6 +184,7 @@ impl Ship {
             ship_type: crate::shiptype::ids::SLOOP,
             starting_silver: STARTING_SILVER_PESOS,
             lifetime_dividends: 0.0,
+            lifetime_dock_count: 0,
             debt: 0.0,
             // Test / seed-fleet ships start fully crewed; the Hiring
             // loop is for shipyard-built hulls only.
@@ -234,6 +237,7 @@ impl Ship {
             ship_type,
             starting_silver,
             lifetime_dividends: 0.0,
+            lifetime_dock_count: 0,
             debt: 0.0,
             crew_alive: 0,
             wages_owed_pesos: 0.0,
@@ -262,6 +266,7 @@ impl Ship {
     pub fn dock(&mut self) {
         self.state = ShipState::Docked;
         self.speed = 0.0;
+        self.lifetime_dock_count = self.lifetime_dock_count.saturating_add(1);
     }
 
     /// Anchor at current position.

@@ -211,7 +211,7 @@ fn main() {
     println!();
     println!("Per-ship P/L after {} days:", sim_days);
     println!(
-        "{:<3}  {:<14}  {:<10}  {:>10}  {:>10}  {:>10}  {:>8}  {:>10}  {:<10}  {:<24}",
+        "{:<3}  {:<14}  {:<10}  {:>10}  {:>10}  {:>10}  {:>8}  {:>10}  {:>5}  {:<10}  {:<24}",
         "#",
         "from",
         "type",
@@ -220,6 +220,7 @@ fn main() {
         "dividends",
         "debt",
         "P/L",
+        "docks",
         "state",
         "cargo"
     );
@@ -253,9 +254,9 @@ fn main() {
         let built_tag = if i >= n_ships { " (built)" } else { "" };
         let type_name = &world.ship_types.get(ship.ship_type).name;
         println!(
-            "{:<3}  {:<14}  {:<10}  {:>10.0}  {:>10.0}  {:>10.0}  {:>8.0}  {:>+10.0}  {:<10}  {:<24}{}",
+            "{:<3}  {:<14}  {:<10}  {:>10.0}  {:>10.0}  {:>10.0}  {:>8.0}  {:>+10.0}  {:>5}  {:<10}  {:<24}{}",
             i, origin_names[i], type_name, ship.starting_silver, ship.silver,
-            ship.lifetime_dividends, ship.debt, pl, state, cargo.join(","), built_tag
+            ship.lifetime_dividends, ship.debt, pl, ship.lifetime_dock_count, state, cargo.join(","), built_tag
         );
     }
     println!();

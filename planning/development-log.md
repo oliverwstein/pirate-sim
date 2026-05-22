@@ -574,3 +574,95 @@ Seeded ships are now first-class home-ported ships, consistent with shipyard-bui
 - `bench_trade -- 730`: **+2,869,818 pesos** — bit-identical.
 
 **Next:** Step 6 — `Ship.policy: ShipPolicy`; `Pursue` / `Flee` BT nodes; `SeePrey` condition consults spatial hash + faction relations + policy; hardcoded pirate-sloop spawn near Tortuga. First visible Phase 3 behavior.
+
+---
+
+## 2026-05-22 (cont) — Nav-1+2+3: estimated_position + DR error + noon-sight/landmark fixes
+
+**Plan reference:** `planning/navigation-plan.md` items Nav-1 (estimated_position), Nav-2 (DR error), Nav-3 (noon sight + landmark fix). Storms, latitude-sailing, replan triggers, and heave-to are deferred to Phase 4.
+
+**Why now:** the 5.b NavGoal/NavTrack split made the captain's belief-state a natural place to hang a separate position estimate. Adding it now (before Phase 3 combat) means the chase BT in Step 6 sees prey through the navigator's eyes, not via omniscient truth.
+
+**Changes:**
+- `nav.rs`:
+  - `NavGoal { estimated_position: Option<Position>, last_noon_sight_day: u16 }`.
+  - Constants: `DR_ERROR_LAT_NM_PER_HOUR=0.05`, `DR_ERROR_LON_NM_PER_HOUR=0.15`, `LANDMARK_SIGHT_NM=20.0`, `NOON_SIGHT_NOISE_NM=0.5`, `LANDMARK_FIX_NOISE_NM=1.0`.
+  - Helpers: `xorshift64`, `uniform01`, `gaussian` (Box-Muller), `apply_dr_error`, `try_noon_sight`, `try_landmark_fix`.
+  - `compute_steering` now takes both `pos_estimate` and `pos_truth`:
+    - Waypoint advance uses **estimate** (captain crosses off waypoints as he believes he passes them).
+    - Final arrival check uses **truth** (a ship has arrived when its hull is at the harbor — prevents premature "arrival" when estimate drifts to the dest while truth is still mid-voyage).
+    - Reactive `deflect_for_land` uses **truth** (lookouts see real breakers, not the captain's mental coastline) — this is the explicit "no accidental grounding" fix.
+- `ai.rs`:
+  - `ShipAI { prev_truth: Option<Position>, nav_rng_state: u64 }`. The nav RNG is independent of the destination-choice RNG so noise rolls don't perturb economic decisions.
+  - Navigator pass at top of `tick`: lazy-init estimate from truth → advance by `truth - prev_truth` (DR plot) → add DR noise scaled by speed → noon sight (lat only, once/day) → landmark fix (only while `speed > 0.1`, so docked ships don't accumulate fix noise around a known dock).
+  - `ShipBtContext::estimated_position()` helper; 9 BT/action call-sites replaced `self.ship.position` → `self.estimated_position()` (planning, conditions, destination choice).
+- `world.rs`: passes `day_of_year` through `ShipTickInputs`.
+- `tests/ai_behavior.rs`: helpers pass `day_of_year: 0` (disables noon sight in unit tests).
+
+**Design notes:**
+- **Why separate `nav_rng_state`:** without this, `gaussian()` calls advance the shared `rng_state`, shifting the sequence consumed by `act_choose_destination`. With even zero noise this caused destination divergence (verified: zero-noise nav with separated RNG is bit-identical +846,992 to baseline). The separation makes "tune the noise rates" a pure perturbation problem.
+- **Why DR = motion-delta + noise:** the first iteration treated DR as pure noise; the captain's estimate didn't track the ship at all (estimate stayed near origin while truth sailed away). Real-world DR plot advances with each leg sailed; cumulative *errors* are the noise.
+- **Why arrival uses truth:** premature arrival → BT clears the goal → picks new destination → ship never actually docks → bankruptcy. The truth check is the single line that keeps the economy from collapsing.
+- **Why landmark fix gated on speed > 0.1:** at a dock, truth doesn't move but fix noise would jitter the estimate ±1 NM every tick (24/day) around a position the captain already knows perfectly. This was responsible for ~750k of the P/L regression in the un-gated version.
+
+**Verification:**
+- `cargo build --workspace --tests --examples`: clean.
+- `cargo fmt`, `cargo clippy --workspace --all-targets -- -D warnings`: clean.
+- `cargo test --workspace`: **116 pass** (97 + 19).
+- `bench_trade -- 365`: **+1,451,474 pesos** (vs +846,992 baseline, +71%), 9 bankrupt (vs 11 baseline).
+- `bench_trade -- 730`: **+4,552,932 pesos** (vs +2,869,818 baseline, +59%), 10 bankrupt. 730/365 ratio 3.13x, matches baseline 3.39x — confirms no compounding regression.
+
+**Why P/L improves under uncertainty (diagnosed):**
+
+The investigation took several iterations and the answer turned out to be two effects, one of them not really about nav.
+
+**1. Real nav bug (fixed):** the first cut had P/L explode to +25.6M at 730d. Root cause was `in_destination_harbor` using the captain's *estimate*. DR drift could put the estimate inside the harbor polygon before the real hull was — triggering instant docking, profit settlement, and a new outbound voyage while the actual hull was still mid-ocean. Effectively a teleport-into-port loop. Fixed: harbor-zone check now uses truth (same principle as the final arrival check; the pilot/lookout recognizes the actual harbor on physical entry, not the captain's mental coastline).
+
+**2. Residual +59% lift is the pre-existing home-bias feedback loop, exposed by nav perturbation.** Per-ship breakdown:
+
+| Ship | Home | Baseline div. | Current div. |
+|---|---|---|---|
+| 0 | Bridgetown sloop | 1,236,403 | 2,654,275 |
+| 5 | Havana sloop | 41,809 | 326,079 |
+| 3 | Charleston sloop | 467,774 | 38,956 |
+| (most others) | — | similar | similar |
+
+Even at baseline (no nav changes at all), ship #0 alone earned 43% of total fleet dividends. The home-bias formula in `act_buy_best` (`bias = surplus_silver/200`, capped 200 pesos/ton) creates positive feedback: once a ship accumulates silver above the operating float, the bias dominates trade selection (a 200 peso/ton bonus is more than most genuine arbitrage margins), locking the ship into short home-and-back loops with the most-profitable nearby partner. Those loops compound the dividends rapidly.
+
+Nav noise doesn't *break* anything — it simply perturbs which ships escape their early-trip inefficiencies and enter the lock-in. Different ships flip into runaway mode; some that were stuck in baseline now thrive, and one (#3) that was thriving in baseline now stalls. The fleet total grows because, on net, more ships make it into the bias-locked state.
+
+**This is an economic-model issue, not a navigation issue.** It would surface under any sufficiently-large perturbation (different seed, different RNG ordering, etc.). Documented here so we know to address it during Step 10 calibration — likely candidates are (a) soft-cap the home bias, (b) make the bias kick in only above a much higher silver threshold, (c) decay surplus silver into the port treasury more aggressively, or (d) make the trade planner consider multi-hop routes.
+
+
+
+**Dock-count diagnostic confirms.** Added `Ship.lifetime_dock_count` (incremented in `ship.dock()`) and a new `docks` column in the bench. Top earners:
+
+| Ship | Docks (730d) | Cycle | Per-dock profit |
+|---|---|---|---|
+| #0 Bridgetown sloop | 309 | ~56 hr (~336 NM rt) | 8,600 |
+| #1 Port Royal sloop | 579 | ~30 hr (~180 NM rt) | 660 |
+| #6 Fort-Royal sloop | 126 | ~140 hr | 3,200 |
+| #8 Amsterdam sloop | 316 | ~55 hr | 257 |
+
+These are physically realistic trip rates (sloop ~6 kt, ~144 NM/day). Ships are NOT teleporting or re-docking artificially — they are doing many real round-trips on routes with large persistent price gaps. The bench's own "Top 10 mispriced cells" output corroborates: e.g. San Juan provisions priced 4.7 vs equilibrium 1.3 (253% over), Cayenne provisions 37.8 vs 14.4 (162% over). A sloop running provisions on a 180 NM hop at those margins genuinely earns ~660 pesos per cycle.
+
+**Two distinct asks for Step 10 (filed):**
+1. *Home-bias formula* (`act_buy_best`): the `surplus/200` cap-200 bias dominates real arbitrage once a ship clears its float, creating a winner-take-all dynamic where one ship per port locks into the most-profitable short loop. Consider raising the threshold or making the bias decay.
+2. *Market equilibration*: prices in the calibration data sit 150–250% above LP equilibrium on multiple goods/ports, and persist under heavy trading because prod/cons restock between trades. Either tighten the restock rate, slow the price clamp, or strengthen the carrying-trade markup.
+
+Neither belongs in Nav-1+2+3.
+
+**Verified no auto-dock-on-zone-entry.** `in_destination_harbor` matches only the BT-chosen destination port, not any harbor in range. A ship sailing to Charleston that wind-drifts through Bridgetown'''s zone does NOT re-dock at Bridgetown. Docking requires BT intent (which set the destination via `assign_destination_port`) AND physical entry of that specific port'''s harbor zone.
+
+**Truth-based waypoint advance considered and rejected.** Tried it as an alternative to estimate-based; caused a +109M runaway at 730d. Almost certainly ships orbiting a waypoint their estimate-biased heading prevents them reaching (truth waypoint check never fires → ship keeps sailing toward a moving target that never advances). Reverted. The design intent ("captain crosses off waypoints as he believes he passes them") stands and is documented inline.
+
+**Decisions ratified in this slice:**
+- Steering bearing: estimate (captain steers from where he thinks he is).
+- Waypoint advance: estimate (he crosses off waypoints from his DR plot).
+- Final arrival clear: truth (a ship has arrived when its hull is at the harbor).
+- Harbor zone entry: truth (the pilot/lookout recognizes the actual harbor).
+- Reactive land deflection: truth (lookouts see real breakers).
+- Landmark fix: gated on `speed > 0.1` (no fix-noise jitter at the dock).
+- nav_rng_state separate from rng_state (zero-noise nav is bit-identical to baseline).
+
+**Next:** Step 6 — `Ship.policy: ShipPolicy`; `Pursue` / `Flee` BT nodes; `SeePrey` condition consults spatial hash + faction relations + policy; hardcoded pirate-sloop spawn near Tortuga. The chase BT will read `estimated_position()` for prey detection range, completing the loop.

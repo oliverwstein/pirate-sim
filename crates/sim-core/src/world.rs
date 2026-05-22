@@ -409,6 +409,7 @@ impl World {
                     markets: &mut self.markets,
                     goods: &self.goods,
                     commands: &mut self.commands,
+                    day_of_year: self.date.day_of_year,
                 };
                 ai.tick(&mut inputs);
             }

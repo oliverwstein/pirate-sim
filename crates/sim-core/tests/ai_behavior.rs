@@ -60,6 +60,7 @@ fn tick_ai(ai: &mut ShipAI, ship: &mut Ship, stats: &ShipStats, wind: &WindVecto
             markets: &mut markets,
             goods: &goods,
             commands: &mut commands,
+            day_of_year: 0,
         };
         ai.tick(&mut inputs);
     }
@@ -93,6 +94,7 @@ fn tick_ai_with_markets(
             markets,
             goods,
             commands: &mut commands,
+            day_of_year: 0,
         };
         ai.tick(&mut inputs);
     }

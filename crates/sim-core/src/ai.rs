@@ -19,7 +19,7 @@ use crate::command::ShipCommand;
 use crate::goods::GoodsRegistry;
 use crate::harbor::HarborMap;
 use crate::market::PortMarket;
-use crate::nav::NavGoal;
+use crate::nav::{self, NavGoal};
 use crate::pathfind::{self, PathfindContext};
 use crate::port::Port;
 use crate::ship::{DockAction, Ship, ShipState, ShipStats};
@@ -131,6 +131,16 @@ pub struct ShipAI {
     state: BtState,
     /// Simple RNG state (xorshift) for destination selection.
     rng_state: u64,
+    /// Independent RNG state for the navigator (DR noise, fix noise).
+    /// Kept separate so per-ship navigation jitter doesn't perturb the
+    /// destination-choice RNG sequence — important for reproducible
+    /// bench economics across noise tuning passes.
+    nav_rng_state: u64,
+    /// Previous tick's true ship position. Used by the navigator pass
+    /// to advance the captain's dead-reckoning estimate by the ship's
+    /// actual displacement (plus accumulating DR noise). `None` on the
+    /// first tick — initialized on next iteration.
+    prev_truth: Option<Position>,
 }
 
 impl Default for ShipAI {
@@ -146,6 +156,8 @@ impl ShipAI {
             tree: build_ship_bt(),
             state: BtState::new(),
             rng_state: 12345,
+            nav_rng_state: 0x9E3779B97F4A7C15,
+            prev_truth: None,
         }
     }
 
@@ -155,16 +167,23 @@ impl ShipAI {
             tree: build_ship_bt(),
             state: BtState::new(),
             rng_state: 12345,
+            nav_rng_state: 0x9E3779B97F4A7C15,
+            prev_truth: None,
         }
     }
 
     /// Create AI with a specific RNG seed (for variety among multiple ships).
     pub fn with_seed(seed: u64) -> Self {
+        // The nav RNG is derived from the AI seed (xor with the golden-
+        // ratio constant) so different ships diverge in their navigation
+        // jitter without colliding with the destination-choice sequence.
         Self {
             goal: NavGoal::new(),
             tree: build_ship_bt(),
             state: BtState::new(),
             rng_state: seed,
+            nav_rng_state: seed ^ 0x9E3779B97F4A7C15,
+            prev_truth: None,
         }
     }
 
@@ -188,6 +207,47 @@ impl ShipAI {
         if inputs.ship.state == ShipState::Docked && !self.state.running_child.is_empty() {
             self.state.reset();
         }
+
+        // Navigator pass (Nav-1/2/3): maintain the captain's belief
+        // about where the ship is. Runs BEFORE the BT so all
+        // planning, arrival checks, and BT conditions see the
+        // refreshed estimate. Order matters:
+        //   1. Lazy-init the estimate at launch (perfect fix).
+        //   2. Advance the estimate by the ship's true displacement
+        //      since the previous tick — this is the dead-reckoning
+        //      plot (the captain knows roughly how far he sailed on
+        //      what heading) — then accumulate small per-hour noise.
+        //   3. Try a noon sight (latitude only, once per day).
+        //   4. Try a landmark fix (both axes, snaps to truth).
+        let truth = inputs.ship.position;
+        if self.goal.estimated_position.is_none() {
+            self.goal.estimated_position = Some(truth);
+        }
+        {
+            let estimate = self.goal.estimated_position.as_mut().unwrap();
+            if let Some(prev) = self.prev_truth {
+                estimate.x += truth.x - prev.x;
+                estimate.y += truth.y - prev.y;
+            }
+            // DR error scales with the previous tick's speed (no
+            // drift at anchor / dock).
+            nav::apply_dr_error(estimate, inputs.ship.speed, 1.0, &mut self.nav_rng_state);
+            nav::try_noon_sight(
+                estimate,
+                truth,
+                inputs.day_of_year,
+                &mut self.goal.last_noon_sight_day,
+                &mut self.nav_rng_state,
+            );
+            // Landmark fix only while underway. A docked captain knows
+            // where the dock is — re-snapping to truth+N(0,1) every
+            // hour would just add noise to a known position and
+            // perturb departure headings.
+            if inputs.ship.speed > 0.1 {
+                nav::try_landmark_fix(estimate, truth, inputs.ports, &mut self.nav_rng_state);
+            }
+        }
+        self.prev_truth = Some(truth);
 
         let mut ctx = ShipBtContext {
             me: inputs.me,
@@ -239,6 +299,9 @@ pub struct ShipTickInputs<'a> {
     /// Output buffer for `ShipCommand`s emitted this tick. Owned by the
     /// world and drained by the Resolution Phase.
     pub commands: &'a mut Vec<(ShipId, ShipCommand)>,
+    /// Current `SimDate::day_of_year` (1-365). Drives the noon-sight
+    /// cadence in the captain's navigator pass.
+    pub day_of_year: u16,
 }
 
 /// Simple xorshift64 RNG — deterministic and fast.
@@ -270,6 +333,17 @@ pub struct ShipBtContext<'a> {
 }
 
 impl<'a> ShipBtContext<'a> {
+    /// The captain's belief about where the ship is. Decisions inside
+    /// the BT — pathfinding origin, arrival checks, nearest-port lookups,
+    /// distance-to-destination tests — must use this rather than
+    /// `self.ship.position` (truth). The gap between estimate and truth
+    /// is what creates the period-realistic getting-lost behaviour. The
+    /// navigator pass at the top of `ShipAI::tick` guarantees the
+    /// estimate is `Some` by the time any BT code runs.
+    fn estimated_position(&self) -> Position {
+        self.goal.estimated_position.unwrap_or(self.ship.position)
+    }
+
     /// Set a destination *port* (by index) and plan a path to its harbor
     /// zone. The destination is recorded even if planning fails — the ship
     /// then falls back to straight-line nav with reactive deflection.
@@ -280,7 +354,8 @@ impl<'a> ShipBtContext<'a> {
         self.ship.nav.clear_path();
 
         if let (Some(pf), Some(harbor)) = (self.pathfind, self.harbors.for_port(port_index)) {
-            if let Some(path) = pathfind::find_path_to_harbor(pf, self.ship.position, harbor) {
+            if let Some(path) = pathfind::find_path_to_harbor(pf, self.estimated_position(), harbor)
+            {
                 // Track the path's terminal waypoint as the geometric
                 // arrival target — typically the harbor anchor, which may
                 // differ slightly from the port's literal coordinate when
@@ -298,7 +373,8 @@ impl<'a> ShipBtContext<'a> {
     /// emptied but the ship is still mid-voyage.
     fn replan_to_port(&mut self, port_index: usize) {
         if let (Some(pf), Some(harbor)) = (self.pathfind, self.harbors.for_port(port_index)) {
-            if let Some(path) = pathfind::find_path_to_harbor(pf, self.ship.position, harbor) {
+            if let Some(path) = pathfind::find_path_to_harbor(pf, self.estimated_position(), harbor)
+            {
                 if let Some(last) = path.last().copied() {
                     self.goal.destination = Some(last);
                 }
@@ -321,6 +397,12 @@ impl<'a> ShipBtContext<'a> {
             Some(h) => h,
             None => return false,
         };
+        // Use TRUTH: the ship has truly entered harbor when its hull is
+        // inside the harbor zone. Using the captain's estimate here lets
+        // DR drift teleport the ship into the harbor before the hull is
+        // there (instant docking → instant profit settlement → new
+        // voyage starts while truth still mid-ocean). The pilot/lookout
+        // recognizes the harbor on physical entry.
         harbor.contains_pos(pf.land, self.ship.position)
     }
 
@@ -379,7 +461,7 @@ impl<'a> ShipBtContext<'a> {
         // and pin against the coast.
         if self.ship.nav.waypoints.is_empty() && self.goal.dest_port.is_some() {
             if let Some(dest) = self.goal.destination {
-                if self.ship.position.distance(dest) > REPLAN_DISTANCE_NM {
+                if self.estimated_position().distance(dest) > REPLAN_DISTANCE_NM {
                     if let Some(idx) = self.goal.dest_port {
                         self.replan_to_port(idx);
                     }
@@ -388,11 +470,16 @@ impl<'a> ShipBtContext<'a> {
         }
 
         let land = self.pathfind.map(|c| c.land);
-        let pos = self.ship.position;
-        let steering = self
-            .ship
-            .nav
-            .compute_steering(self.goal, pos, self.stats, self.wind, land);
+        let pos_estimate = self.estimated_position();
+        let pos_truth = self.ship.position;
+        let steering = self.ship.nav.compute_steering(
+            self.goal,
+            pos_estimate,
+            pos_truth,
+            self.stats,
+            self.wind,
+            land,
+        );
         if let Some(s) = steering {
             self.commands.push((
                 self.me,
@@ -470,7 +557,7 @@ impl<'a> ShipBtContext<'a> {
             return Status::Failure;
         }
         let mut idx = (xorshift64(self.rng_state) as usize) % self.ports.len();
-        if self.ship.position.distance(self.ports[idx].position) < 20.0 {
+        if self.estimated_position().distance(self.ports[idx].position) < 20.0 {
             idx = (idx + 1) % self.ports.len();
         }
         self.assign_destination_port(idx);
@@ -604,8 +691,8 @@ impl<'a> ShipBtContext<'a> {
 
     fn act_divert_to_port(&mut self) -> Status {
         if let Some((nearest_idx, _)) = self.ports.iter().enumerate().min_by(|(_, a), (_, b)| {
-            let da = self.ship.position.distance(a.position);
-            let db = self.ship.position.distance(b.position);
+            let da = self.estimated_position().distance(a.position);
+            let db = self.estimated_position().distance(b.position);
             da.partial_cmp(&db).unwrap()
         }) {
             self.assign_destination_port(nearest_idx);
@@ -645,7 +732,7 @@ impl<'a> BtContext for ShipBtContext<'a> {
                     // hold is nearly empty — diverting at 80% of a
                     // transatlantic voyage just wastes the trip.
                     if let Some(dest) = self.goal.destination {
-                        let dist = self.ship.position.distance(dest);
+                        let dist = self.estimated_position().distance(dest);
                         let voyage_days = self.stats.estimated_voyage_days(dist);
                         days_remaining < voyage_days + REACHABILITY_BUFFER_DAYS
                     } else {
