@@ -71,6 +71,11 @@ pub struct World {
     /// Hiring / Anchored ships are intentionally not indexed —
     /// inter-ship interaction at sea is the only consumer.
     pub spatial: SpatialHash,
+    /// Per-tick command buffer (Step 5.c). Filled during the AI Phase
+    /// by `ShipBtContext` (via `ShipTickInputs::commands`), drained by
+    /// the Resolution Phase before physics. Lives on `World` so the
+    /// allocation is reused across ticks.
+    pub commands: Vec<(ShipId, crate::command::ShipCommand)>,
 }
 
 impl World {
@@ -122,6 +127,7 @@ impl World {
             last_month_avg_profit: 0.0,
             ships_built: 0,
             spatial: SpatialHash::new(),
+            commands: Vec::new(),
         }
     }
 
@@ -355,6 +361,17 @@ impl World {
             }
         }
 
+        // Step 5.c: per-tick command buffer. Each ship's AI pushes
+        // intents (currently only `Steer`) into this buffer; the
+        // Resolution sub-step below drains them into actual ship
+        // mutations. For 5.c we drain *immediately after each AI
+        // tick* (no inter-ship interactions yet), so this Vec sees
+        // at most one entry at a time. Reused across ticks via
+        // `clear` to avoid re-allocation; lives as a `World` field so
+        // future steps can carry combat commands across the whole
+        // AI Phase before resolution.
+        self.commands.clear();
+
         // Snapshot the live ship ids so we can iterate while mutating
         // both `ships` and `ship_ais`. SlotMap iteration order is not
         // documented as stable; collecting upfront also pins per-tick
@@ -382,6 +399,7 @@ impl World {
             };
             {
                 let mut inputs = crate::ai::ShipTickInputs {
+                    me: id,
                     ship,
                     stats: &ship_stats,
                     wind: &wind,
@@ -390,9 +408,34 @@ impl World {
                     pathfind: Some(&pathfind),
                     markets: &mut self.markets,
                     goods: &self.goods,
+                    commands: &mut self.commands,
                 };
                 ai.tick(&mut inputs);
             }
+
+            // Step 5.c Resolution Phase: drain steering intents this AI
+            // just emitted and apply them to the ship before physics. For
+            // 5.c every command in the buffer targets the issuing ship,
+            // but we still route by id to mirror the shape Step 6+ needs
+            // (FireBroadside, AttemptBoard targeting other ships).
+            for (target, cmd) in self.commands.drain(..) {
+                match cmd {
+                    crate::command::ShipCommand::Steer { heading, speed } => {
+                        if let Some(target_ship) = self.ships.get_mut(target) {
+                            target_ship.set_steering(heading, speed);
+                        }
+                    }
+                }
+            }
+
+            // Re-borrow the ship: the Resolution drain above took a
+            // mutable borrow of `self.ships`, so `ship` (above) is no
+            // longer valid. The ship is guaranteed to still exist
+            // because we're still inside this id's loop iteration.
+            let ship = match self.ships.get_mut(id) {
+                Some(s) => s,
+                None => continue,
+            };
 
             // Resource consumption
             ship.tick_resources(&ship_stats);

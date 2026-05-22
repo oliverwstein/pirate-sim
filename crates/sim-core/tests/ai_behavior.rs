@@ -2,16 +2,40 @@
 
 use rstest::rstest;
 use sim_core::ai::{ShipAI, ShipTickInputs};
+use sim_core::command::ShipCommand;
 use sim_core::goods::GoodsRegistry;
 use sim_core::harbor::HarborMap;
 use sim_core::market::PortMarket;
 use sim_core::port::{Port, DEFAULT_HARBOR_RADIUS_NM};
 use sim_core::ship::{DockAction, Ship, ShipState, ShipStats};
-use sim_core::types::{Position, WindVector};
+use sim_core::types::{Position, ShipId, WindVector};
 
 /// Helper: create a calm wind (so ship speed is predictable).
 fn calm_wind() -> WindVector {
     WindVector { u: 0.0, v: -5.0 } // light southerly
+}
+
+/// Apply a Steer command back to the ship — the test-side equivalent of
+/// the world's Resolution Phase (Step 5.c). Other command variants are
+/// ignored: these tests don't exercise combat yet.
+fn apply_commands(ship: &mut Ship, commands: &[(ShipId, ShipCommand)]) {
+    for (_id, cmd) in commands {
+        match cmd {
+            ShipCommand::Steer { heading, speed } => ship.set_steering(*heading, *speed),
+        }
+    }
+}
+
+/// A throwaway `ShipId`. The AI stamps it onto every emitted command;
+/// `apply_commands` ignores the id (single-ship tests).
+fn dummy_id() -> ShipId {
+    // `slotmap::KeyData` exposes a `from_ffi(u64)`-style constructor via
+    // `KeyData::from_ffi(1)`, but ShipId is constructed via SlotMap. The
+    // simplest portable option: insert into an empty SlotMap, take the
+    // key, throw the map away.
+    use slotmap::SlotMap;
+    let mut sm: SlotMap<ShipId, ()> = SlotMap::with_key();
+    sm.insert(())
 }
 
 /// Helper: tick the AI with no markets / no goods / no pathfind. Most
@@ -22,17 +46,24 @@ fn tick_ai(ai: &mut ShipAI, ship: &mut Ship, stats: &ShipStats, wind: &WindVecto
     let harbors = HarborMap::empty();
     let mut markets: Vec<PortMarket> = Vec::new();
     let goods = GoodsRegistry::starter();
-    let mut inputs = ShipTickInputs {
-        ship,
-        stats,
-        wind,
-        ports,
-        harbors: &harbors,
-        pathfind: None,
-        markets: &mut markets,
-        goods: &goods,
-    };
-    ai.tick(&mut inputs);
+    let mut commands: Vec<(ShipId, ShipCommand)> = Vec::new();
+    let me = dummy_id();
+    {
+        let mut inputs = ShipTickInputs {
+            me,
+            ship,
+            stats,
+            wind,
+            ports,
+            harbors: &harbors,
+            pathfind: None,
+            markets: &mut markets,
+            goods: &goods,
+            commands: &mut commands,
+        };
+        ai.tick(&mut inputs);
+    }
+    apply_commands(ship, &commands);
 }
 
 /// Helper: tick the AI with explicit markets + goods. Used by the
@@ -48,17 +79,24 @@ fn tick_ai_with_markets(
     goods: &GoodsRegistry,
 ) {
     let harbors = HarborMap::empty();
-    let mut inputs = ShipTickInputs {
-        ship,
-        stats,
-        wind,
-        ports,
-        harbors: &harbors,
-        pathfind: None,
-        markets,
-        goods,
-    };
-    ai.tick(&mut inputs);
+    let mut commands: Vec<(ShipId, ShipCommand)> = Vec::new();
+    let me = dummy_id();
+    {
+        let mut inputs = ShipTickInputs {
+            me,
+            ship,
+            stats,
+            wind,
+            ports,
+            harbors: &harbors,
+            pathfind: None,
+            markets,
+            goods,
+            commands: &mut commands,
+        };
+        ai.tick(&mut inputs);
+    }
+    apply_commands(ship, &commands);
 }
 
 /// Helper: some test ports for the AI to use.

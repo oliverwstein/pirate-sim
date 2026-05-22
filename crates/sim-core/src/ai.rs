@@ -15,6 +15,7 @@
 //! ]
 
 use crate::bt::{self, Behavior, BtContext, BtState, Status};
+use crate::command::ShipCommand;
 use crate::goods::GoodsRegistry;
 use crate::harbor::HarborMap;
 use crate::market::PortMarket;
@@ -22,7 +23,7 @@ use crate::nav::NavGoal;
 use crate::pathfind::{self, PathfindContext};
 use crate::port::Port;
 use crate::ship::{DockAction, Ship, ShipState, ShipStats};
-use crate::types::{Position, WindVector};
+use crate::types::{Position, ShipId, WindVector};
 
 // --- Action IDs ---
 const ACT_SAIL: usize = 0;
@@ -189,6 +190,7 @@ impl ShipAI {
         }
 
         let mut ctx = ShipBtContext {
+            me: inputs.me,
             ship: inputs.ship,
             stats: inputs.stats,
             wind: inputs.wind,
@@ -199,6 +201,7 @@ impl ShipAI {
             pathfind: inputs.pathfind,
             markets: inputs.markets,
             goods: inputs.goods,
+            commands: inputs.commands,
         };
 
         let status = bt::tick(&self.tree, &mut self.state, &mut ctx, 0);
@@ -221,6 +224,10 @@ impl ShipAI {
 /// Per-tick external inputs to the ship AI. The AI merges these with its
 /// own internal state (`goal`, `rng_state`, BT cursor) inside `tick`.
 pub struct ShipTickInputs<'a> {
+    /// The id of the ship being ticked. Stamped onto every command this
+    /// AI emits so the Resolution Phase can route intents back to the
+    /// issuer (and, in later steps, to targets).
+    pub me: ShipId,
     pub ship: &'a mut Ship,
     pub stats: &'a ShipStats,
     pub wind: &'a WindVector,
@@ -229,6 +236,9 @@ pub struct ShipTickInputs<'a> {
     pub pathfind: Option<&'a PathfindContext<'a>>,
     pub markets: &'a mut [PortMarket],
     pub goods: &'a GoodsRegistry,
+    /// Output buffer for `ShipCommand`s emitted this tick. Owned by the
+    /// world and drained by the Resolution Phase.
+    pub commands: &'a mut Vec<(ShipId, ShipCommand)>,
 }
 
 /// Simple xorshift64 RNG — deterministic and fast.
@@ -245,6 +255,7 @@ fn xorshift64(state: &mut u64) -> u64 {
 /// Borrows the per-tick `ship` (which owns `nav` and `dock_action`) plus
 /// AI-side `goal` and `rng_state`, plus all the read-only world state.
 pub struct ShipBtContext<'a> {
+    me: ShipId,
     ship: &'a mut Ship,
     stats: &'a ShipStats,
     wind: &'a WindVector,
@@ -255,6 +266,7 @@ pub struct ShipBtContext<'a> {
     pathfind: Option<&'a PathfindContext<'a>>,
     markets: &'a mut [PortMarket],
     goods: &'a GoodsRegistry,
+    commands: &'a mut Vec<(ShipId, ShipCommand)>,
 }
 
 impl<'a> ShipBtContext<'a> {
@@ -382,7 +394,13 @@ impl<'a> ShipBtContext<'a> {
             .nav
             .compute_steering(self.goal, pos, self.stats, self.wind, land);
         if let Some(s) = steering {
-            self.ship.set_steering(s.heading, s.speed);
+            self.commands.push((
+                self.me,
+                ShipCommand::Steer {
+                    heading: s.heading,
+                    speed: s.speed,
+                },
+            ));
             Status::Running
         } else if self.goal.dest_port.is_some()
             && self.pathfind.is_some()

@@ -537,3 +537,40 @@ Seeded ships are now first-class home-ported ships, consistent with shipyard-bui
 **Deferred:** Pulling `goal`/`rng_state` off `ShipAI` so `World` can fully own/construct `ShipBtContext` (audit's ideal). Sub-helper extractions inside `act_sail` / `act_buy_best` from audit §2. Neither blocks 5.c.
 
 **Next:** 5.c — introduce `ShipCommand::Steer { heading, commanded_speed }`. `act_sail` pushes a Steer command instead of calling `ship.set_steering`; a new Resolution Phase between AI and physics drains the queue. All other ship/market mutations stay in-place per `phase-3-plan.md` ("Steer as the only command initially").
+
+---
+
+## Step 5.c — `ShipCommand::Steer` + Resolution Phase (2026-05-22)
+
+**Scope:** Plumb the Command/Event pipeline's intent half. Per `planning/phase-3-plan.md` §3 and Step 5, the AI now writes a `ShipCommand` to a buffer instead of mutating the ship directly; a new Resolution sub-step drains the buffer between AI and physics. This is the *minimum-viable* version of the cellular-automata shape — only `Steer` is introduced; per-tick buffer is drained immediately after each ship's AI tick (no cross-ship interactions yet). Sets up the data shape that Step 6+ (`FireBroadside`, `AttemptBoard`, `StrikeColors`) will extend.
+
+**Changes:**
+- New module `crates/sim-core/src/command.rs`:
+  - `pub enum ShipCommand { Steer { heading: f32, speed: f32 } }`. Doc-comment notes the planned extensions for combat.
+- `crates/sim-core/src/ai.rs`:
+  - `use crate::command::ShipCommand; use crate::types::{Position, ShipId, WindVector};`
+  - `ShipTickInputs` gains `pub me: ShipId` and `pub commands: &'a mut Vec<(ShipId, ShipCommand)>`.
+  - `ShipBtContext` gains `me: ShipId` and `commands: &'a mut Vec<(ShipId, ShipCommand)>` (private — flow through `ShipTickInputs`).
+  - `act_sail`: the `self.ship.set_steering(s.heading, s.speed)` call is replaced by `self.commands.push((self.me, ShipCommand::Steer { heading: s.heading, speed: s.speed }))`.
+- `crates/sim-core/src/world.rs`:
+  - `World` gains `pub commands: Vec<(ShipId, ShipCommand)>` (allocation reused across ticks).
+  - `tick_hourly_ai_and_physics`: `self.commands.clear()` at the top; per-ship loop now passes `me: id` + `commands: &mut self.commands` in `ShipTickInputs`, then runs a Resolution sub-step that `drain(..)`s the buffer and applies any `Steer` to `self.ships[target]` via `set_steering`. Re-borrows `ship` after the drain (the drain takes `&mut self.ships`).
+- `crates/sim-core/tests/ai_behavior.rs`:
+  - New `apply_commands` helper (test-side Resolution Phase) applies `Steer` back to the ship.
+  - New `dummy_id` helper mints a throwaway `ShipId` via a transient SlotMap.
+  - Both `tick_ai` and `tick_ai_with_markets` now construct a local `Vec<(ShipId, ShipCommand)>`, pass it into `ShipTickInputs`, and apply it after `ai.tick` returns.
+
+**Design notes:**
+- The Resolution drain happens *per-ship* (immediately after each AI tick), not *per-tick* (after the full AI loop). This is the smallest deviation from pre-5.c semantics — physics still sees the freshly-issued steering on the same tick. Once Step 6 lands and ships need to read each other's pre-resolution states, this will become an after-loop drain.
+- Commands are tagged with the issuing `ShipId`. For `Steer` the id always matches the issuer, but tagging now means combat commands (`FireBroadside(target)`, `AttemptBoard(target)`) will need an additional target field rather than a structural change.
+- `World.commands` is a `Vec<(ShipId, ShipCommand)>` rather than a `SecondaryMap<ShipId, Vec<ShipCommand>>` because the typical case is one command per ship per tick; a flat Vec keeps the drain trivial and avoids a second allocation per ship.
+- `apply_commands` lives in the test file rather than on `ShipCommand`/`World` because the production drain has knowledge of `self.ships` (target lookup) that doesn't generalize. A public `apply_steer` helper could be extracted in Step 6 once there's a second caller.
+
+**Verification:**
+- `cargo build --workspace --tests --examples` clean.
+- `cargo test --workspace`: **116 passing**.
+- `cargo clippy --workspace --all-targets -- -D warnings`: clean.
+- `bench_trade -- 365`: **+846,992 pesos** — bit-identical.
+- `bench_trade -- 730`: **+2,869,818 pesos** — bit-identical.
+
+**Next:** Step 6 — `Ship.policy: ShipPolicy`; `Pursue` / `Flee` BT nodes; `SeePrey` condition consults spatial hash + faction relations + policy; hardcoded pirate-sloop spawn near Tortuga. First visible Phase 3 behavior.

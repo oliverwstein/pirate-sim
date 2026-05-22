@@ -2,6 +2,7 @@ pub mod ai;
 pub mod bt;
 pub mod cargo;
 pub mod coastline;
+pub mod command;
 pub mod equilibrium;
 pub mod goods;
 pub mod harbor;
