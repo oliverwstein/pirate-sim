@@ -134,6 +134,14 @@ impl WindGrid {
         let n = (months as usize) * (height as usize) * (width as usize);
         assert_eq!(u_data.len(), n, "u_data size mismatch");
         assert_eq!(v_data.len(), n, "v_data size mismatch");
-        Self { u_data, v_data, width, height, origin, cell_size_nm, months }
+        Self {
+            u_data,
+            v_data,
+            width,
+            height,
+            origin,
+            cell_size_nm,
+            months,
+        }
     }
 }

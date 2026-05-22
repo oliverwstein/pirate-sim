@@ -117,10 +117,7 @@ impl PortMarket {
     /// exactly its target stockpile and prices would be flat (= base
     /// price) everywhere on day 0, so ships would dock and undock
     /// empty until the economy warmed up.
-    pub fn with_recipe(
-        _registry: &GoodsRegistry,
-        recipe: ProductionRecipe,
-    ) -> Self {
+    pub fn with_recipe(_registry: &GoodsRegistry, recipe: ProductionRecipe) -> Self {
         let mut stockpile = Cargo::new();
         for (id, tons) in &recipe.monthly_outputs {
             stockpile.add(*id, *tons * 12.0);
@@ -226,12 +223,16 @@ impl PortMarket {
     /// the local supply. Returns 0.0 when neither flow is set, which
     /// gives flat base pricing.
     fn target_stock(&self, id: GoodId) -> f32 {
-        let from_outputs = self.recipe.monthly_outputs
+        let from_outputs = self
+            .recipe
+            .monthly_outputs
             .iter()
             .find(|(g, _)| *g == id)
             .map(|(_, t)| *t)
             .unwrap_or(0.0);
-        let from_inputs = self.recipe.monthly_inputs
+        let from_inputs = self
+            .recipe
+            .monthly_inputs
             .iter()
             .find(|(g, _)| *g == id)
             .map(|(_, t)| *t)
@@ -335,11 +336,7 @@ impl PortMarket {
     /// merchants of the home port. The ship's "treasury" only fills
     /// up again when capital is drawn for the next outbound cargo
     /// via [`Self::draw_for_outfit`].
-    pub fn deposit_owner_profit(
-        &mut self,
-        ship: &mut crate::ship::Ship,
-        float: f32,
-    ) -> f32 {
+    pub fn deposit_owner_profit(&mut self, ship: &mut crate::ship::Ship, float: f32) -> f32 {
         let surplus = ship.silver - float;
         if surplus <= 0.0 {
             return 0.0;
@@ -420,11 +417,7 @@ impl PortMarket {
     /// out of any silver the ship holds above `float`. Returns the
     /// amount repaid. Called at every dock arrival before dividends
     /// or other port settlement, so creditors are paid first.
-    pub fn collect_debt(
-        &mut self,
-        ship: &mut crate::ship::Ship,
-        float: f32,
-    ) -> f32 {
+    pub fn collect_debt(&mut self, ship: &mut crate::ship::Ship, float: f32) -> f32 {
         if ship.debt <= 0.0 {
             return 0.0;
         }
@@ -503,6 +496,7 @@ impl PortArchetype {
     /// prosperity 1.0 — calibrated coarsely against `production-model.md`.
     pub fn recipe(self) -> ProductionRecipe {
         use crate::goods::ids::*;
+        #[allow(clippy::type_complexity)]
         let (outputs, inputs): (&[(GoodId, f32)], &[(GoodId, f32)]) = match self {
             PortArchetype::SugarIsland => (
                 // Small local provisions output (yams, cassava, fish)
@@ -511,12 +505,26 @@ impl PortArchetype {
                 // exceeds local supply (5 t/mo) — but a visiting ship
                 // can borrow against the next harvest at rising
                 // prices when the wharf is dry.
-                &[(SUGAR, 80.0), (MOLASSES, 30.0), (RUM, 15.0), (PROVISIONS, 5.0)],
-                &[(PROVISIONS, 12.0), (MANUFACTURES, 6.0), (ENSLAVED_PERSONS, 3.0), (NAVAL_STORES, 2.0)],
+                &[
+                    (SUGAR, 80.0),
+                    (MOLASSES, 30.0),
+                    (RUM, 15.0),
+                    (PROVISIONS, 5.0),
+                ],
+                &[
+                    (PROVISIONS, 12.0),
+                    (MANUFACTURES, 6.0),
+                    (ENSLAVED_PERSONS, 3.0),
+                    (NAVAL_STORES, 2.0),
+                ],
             ),
             PortArchetype::TobaccoColony => (
                 &[(TOBACCO, 60.0), (PROVISIONS, 4.0)],
-                &[(PROVISIONS, 6.0), (MANUFACTURES, 4.0), (ENSLAVED_PERSONS, 2.0)],
+                &[
+                    (PROVISIONS, 6.0),
+                    (MANUFACTURES, 4.0),
+                    (ENSLAVED_PERSONS, 2.0),
+                ],
             ),
             PortArchetype::NorthAmericanFarming => (
                 &[(PROVISIONS, 60.0), (NAVAL_STORES, 30.0), (RUM, 10.0)],
@@ -567,7 +575,11 @@ impl PortArchetype {
                 ],
             ),
             PortArchetype::EuropeanAmsterdam => (
-                &[(MANUFACTURES, 120.0), (NAVAL_STORES, 30.0), (PROVISIONS, 80.0)],
+                &[
+                    (MANUFACTURES, 120.0),
+                    (NAVAL_STORES, 30.0),
+                    (PROVISIONS, 80.0),
+                ],
                 &[
                     (SUGAR, 120.0),
                     (TOBACCO, 30.0),
@@ -578,19 +590,11 @@ impl PortArchetype {
             ),
             PortArchetype::EuropeanCadiz => (
                 &[(MANUFACTURES, 30.0), (PROVISIONS, 60.0)],
-                &[
-                    (SILVER, 1.0),
-                    (SUGAR, 40.0),
-                    (TOBACCO, 20.0),
-                ],
+                &[(SILVER, 1.0), (SUGAR, 40.0), (TOBACCO, 20.0)],
             ),
             PortArchetype::EuropeanNantes => (
                 &[(MANUFACTURES, 80.0), (RUM, 20.0), (PROVISIONS, 70.0)],
-                &[
-                    (SUGAR, 80.0),
-                    (TOBACCO, 30.0),
-                    (MOLASSES, 20.0),
-                ],
+                &[(SUGAR, 80.0), (TOBACCO, 30.0), (MOLASSES, 20.0)],
             ),
             // === WEST AFRICA ===
             // Slave-trade ports. Captives sourced from inland trade
@@ -603,19 +607,11 @@ impl PortArchetype {
             // more rum, Elmina relatively more iron/manufactures.
             PortArchetype::AfricanElmina => (
                 &[(ENSLAVED_PERSONS, 30.0), (PROVISIONS, 8.0)],
-                &[
-                    (MANUFACTURES, 12.0),
-                    (RUM, 4.0),
-                    (TOBACCO, 3.0),
-                ],
+                &[(MANUFACTURES, 12.0), (RUM, 4.0), (TOBACCO, 3.0)],
             ),
             PortArchetype::AfricanOuidah => (
                 &[(ENSLAVED_PERSONS, 40.0), (PROVISIONS, 10.0)],
-                &[
-                    (MANUFACTURES, 8.0),
-                    (RUM, 8.0),
-                    (TOBACCO, 4.0),
-                ],
+                &[(MANUFACTURES, 8.0), (RUM, 8.0), (TOBACCO, 4.0)],
             ),
         };
         ProductionRecipe {
@@ -718,7 +714,12 @@ mod tests {
         // Initial 1000 t >> 300 target → prices should crash to floor.
         let base = registry.get(ids::SUGAR).base_price_pesos;
         let p = market.price(ids::SUGAR, &registry);
-        assert!(p < base, "Surplus should depress price (got {} >= {})", p, base);
+        assert!(
+            p < base,
+            "Surplus should depress price (got {} >= {})",
+            p,
+            base
+        );
         assert!(p >= base * PRICE_FLOOR_FRAC - 1e-3);
     }
 
@@ -727,11 +728,19 @@ mod tests {
         let registry = GoodsRegistry::starter();
         let mut market = PortMarket::with_initial_stockpile(&registry);
         // Plantation that *consumes* manufactures: target ≈ inputs × 6.
-        market.recipe.monthly_inputs.push((ids::MANUFACTURES, 200.0));
+        market
+            .recipe
+            .monthly_inputs
+            .push((ids::MANUFACTURES, 200.0));
         // Target = 1200 > stockpile 1000 → mild shortage premium.
         let base = registry.get(ids::MANUFACTURES).base_price_pesos;
         let p = market.price(ids::MANUFACTURES, &registry);
-        assert!(p > base, "Shortage should raise price (got {} <= {})", p, base);
+        assert!(
+            p > base,
+            "Shortage should raise price (got {} <= {})",
+            p,
+            base
+        );
         assert!(p <= base * PRICE_CEIL_FRAC + 1e-3);
     }
 
@@ -781,10 +790,14 @@ mod tests {
         // Output prices should be cheap (surplus); input prices expensive.
         let sugar_base = registry.get(ids::SUGAR).base_price_pesos;
         let manuf_base = registry.get(ids::MANUFACTURES).base_price_pesos;
-        assert!(market.price(ids::SUGAR, &registry) < sugar_base,
-            "producer port should price its output below base");
-        assert!(market.price(ids::MANUFACTURES, &registry) > manuf_base,
-            "consumer port should price its input above base");
+        assert!(
+            market.price(ids::SUGAR, &registry) < sugar_base,
+            "producer port should price its output below base"
+        );
+        assert!(
+            market.price(ids::MANUFACTURES, &registry) > manuf_base,
+            "consumer port should price its input above base"
+        );
     }
 
     #[test]
@@ -798,15 +811,27 @@ mod tests {
         market.tick_month();
 
         // Sugar (output) increased by its monthly figure.
-        let sugar_out = recipe.monthly_outputs.iter()
-            .find(|(g, _)| *g == ids::SUGAR).unwrap().1;
+        let sugar_out = recipe
+            .monthly_outputs
+            .iter()
+            .find(|(g, _)| *g == ids::SUGAR)
+            .unwrap()
+            .1;
         assert!((market.stockpile.get(ids::SUGAR) - (sugar_before + sugar_out)).abs() < 1e-3);
         // Provisions appear on both sides (sugar islands grow some
         // food locally and import the rest); net change = output − input.
-        let prov_out = recipe.monthly_outputs.iter()
-            .find(|(g, _)| *g == ids::PROVISIONS).map(|(_, t)| *t).unwrap_or(0.0);
-        let prov_in = recipe.monthly_inputs.iter()
-            .find(|(g, _)| *g == ids::PROVISIONS).map(|(_, t)| *t).unwrap_or(0.0);
+        let prov_out = recipe
+            .monthly_outputs
+            .iter()
+            .find(|(g, _)| *g == ids::PROVISIONS)
+            .map(|(_, t)| *t)
+            .unwrap_or(0.0);
+        let prov_in = recipe
+            .monthly_inputs
+            .iter()
+            .find(|(g, _)| *g == ids::PROVISIONS)
+            .map(|(_, t)| *t)
+            .unwrap_or(0.0);
         let expected = provisions_before + prov_out - prov_in;
         assert!((market.stockpile.get(ids::PROVISIONS) - expected).abs() < 1e-3);
     }
@@ -833,14 +858,38 @@ mod tests {
 
     #[test]
     fn archetype_for_known_ports() {
-        assert!(matches!(archetype_for("Bridgetown"), PortArchetype::SugarIsland));
-        assert!(matches!(archetype_for("Boston"), PortArchetype::NorthAmericanFarming));
-        assert!(matches!(archetype_for("Cartagena"), PortArchetype::SpanishTreasure));
-        assert!(matches!(archetype_for("Tortuga"), PortArchetype::PirateHaven));
-        assert!(matches!(archetype_for("London"), PortArchetype::EuropeanLondon));
-        assert!(matches!(archetype_for("Cadiz"), PortArchetype::EuropeanCadiz));
-        assert!(matches!(archetype_for("Elmina"), PortArchetype::AfricanElmina));
-        assert!(matches!(archetype_for("Ouidah"), PortArchetype::AfricanOuidah));
+        assert!(matches!(
+            archetype_for("Bridgetown"),
+            PortArchetype::SugarIsland
+        ));
+        assert!(matches!(
+            archetype_for("Boston"),
+            PortArchetype::NorthAmericanFarming
+        ));
+        assert!(matches!(
+            archetype_for("Cartagena"),
+            PortArchetype::SpanishTreasure
+        ));
+        assert!(matches!(
+            archetype_for("Tortuga"),
+            PortArchetype::PirateHaven
+        ));
+        assert!(matches!(
+            archetype_for("London"),
+            PortArchetype::EuropeanLondon
+        ));
+        assert!(matches!(
+            archetype_for("Cadiz"),
+            PortArchetype::EuropeanCadiz
+        ));
+        assert!(matches!(
+            archetype_for("Elmina"),
+            PortArchetype::AfricanElmina
+        ));
+        assert!(matches!(
+            archetype_for("Ouidah"),
+            PortArchetype::AfricanOuidah
+        ));
         // Unknown port falls back to Minor.
         assert!(matches!(archetype_for("Atlantis"), PortArchetype::Minor));
     }
@@ -858,7 +907,9 @@ mod tests {
         let ship_silver_before = ship.silver;
         let port_silver_before = market.silver;
         let stockpile_before = market.stockpile.get(ids::SUGAR);
-        let cost = market.buy(&mut ship, &stats, ids::SUGAR, 5.0, &registry).unwrap();
+        let cost = market
+            .buy(&mut ship, &stats, ids::SUGAR, 5.0, &registry)
+            .unwrap();
 
         // Ship paid; port received; stockpile decreased; cargo grew.
         assert!((ship.silver - (ship_silver_before - cost)).abs() < 1e-3);
@@ -911,7 +962,9 @@ mod tests {
         let initial_silver = ship.silver;
 
         // Tiny round trip: buy 1t and immediately sell it back.
-        market.buy(&mut ship, &stats, ids::SUGAR, 1.0, &registry).unwrap();
+        market
+            .buy(&mut ship, &stats, ids::SUGAR, 1.0, &registry)
+            .unwrap();
         market.sell(&mut ship, ids::SUGAR, 1.0, &registry).unwrap();
 
         // Spread must take a bite — ship strictly poorer.
@@ -945,8 +998,12 @@ mod tests {
         let base = registry.get(ids::SUGAR).base_price_pesos;
         let p = london.sell_price(ids::SUGAR, &registry);
         // Mid was 2× base, sell = 0.95 × that = 1.9× base.
-        assert!(p > base * 1.5,
-            "expected drained London sugar sell price well above base; got {} (base {})", p, base);
+        assert!(
+            p > base * 1.5,
+            "expected drained London sugar sell price well above base; got {} (base {})",
+            p,
+            base
+        );
     }
 
     #[test]
@@ -976,24 +1033,34 @@ mod tests {
 
         // Drain the visible wharf.
         let wharf = market.stockpile.get(ids::SUGAR);
-        market.buy(&mut ship, &stats, ids::SUGAR, wharf, &registry).unwrap();
+        market
+            .buy(&mut ship, &stats, ids::SUGAR, wharf, &registry)
+            .unwrap();
         let price_at_zero = market.buy_price(ids::SUGAR, &registry);
 
         // Now buy more — must succeed via the hinterland-debt path.
         let further = 5.0;
-        let cost = market.buy(&mut ship, &stats, ids::SUGAR, further, &registry).unwrap();
+        let cost = market
+            .buy(&mut ship, &stats, ids::SUGAR, further, &registry)
+            .unwrap();
         let unit_paid = cost / further;
-        assert!(market.debt.get(ids::SUGAR) >= further - 1e-3,
-            "deficit should be recorded as hinterland debt");
-        assert!(unit_paid > price_at_zero - 1e-3,
-            "borrowing against next month should price above the empty-wharf price");
+        assert!(
+            market.debt.get(ids::SUGAR) >= further - 1e-3,
+            "deficit should be recorded as hinterland debt"
+        );
+        assert!(
+            unit_paid > price_at_zero - 1e-3,
+            "borrowing against next month should price above the empty-wharf price"
+        );
 
         // And the next monthly tick should pay debt down before
         // adding to visible stockpile.
         let debt_before = market.debt.get(ids::SUGAR);
         market.tick_month();
-        assert!(market.debt.get(ids::SUGAR) < debt_before,
-            "tick_month should settle outstanding hinterland debt");
+        assert!(
+            market.debt.get(ids::SUGAR) < debt_before,
+            "tick_month should settle outstanding hinterland debt"
+        );
     }
 
     #[test]
@@ -1010,7 +1077,9 @@ mod tests {
         ship.silver = 10_000_000.0;
 
         let wharf = market.stockpile.get(ids::MANUFACTURES);
-        market.buy(&mut ship, &stats, ids::MANUFACTURES, wharf, &registry).unwrap();
+        market
+            .buy(&mut ship, &stats, ids::MANUFACTURES, wharf, &registry)
+            .unwrap();
         let err = market.buy(&mut ship, &stats, ids::MANUFACTURES, 1.0, &registry);
         assert!(matches!(err, Err(TradeError::InsufficientStockpile)));
     }

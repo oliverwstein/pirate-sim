@@ -56,6 +56,12 @@ pub struct NavState {
     pub waypoints: VecDeque<Position>,
 }
 
+impl Default for NavState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl NavState {
     pub fn new() -> Self {
         Self {
@@ -146,8 +152,16 @@ impl NavState {
             // optimal tack. We pick whichever side gives better progress.
             let port_h = normalize_angle(wind_from - stats.no_go_half_angle);
             let stbd_h = normalize_angle(wind_from + stats.no_go_half_angle);
-            let port_vmg = vmg(port_h, bearing_to_target, speed_at_heading(port_h, stats, wind));
-            let stbd_vmg = vmg(stbd_h, bearing_to_target, speed_at_heading(stbd_h, stats, wind));
+            let port_vmg = vmg(
+                port_h,
+                bearing_to_target,
+                speed_at_heading(port_h, stats, wind),
+            );
+            let stbd_vmg = vmg(
+                stbd_h,
+                bearing_to_target,
+                speed_at_heading(stbd_h, stats, wind),
+            );
             port_vmg.max(stbd_vmg).max(MIN_UPWIND_VMG)
         };
 
@@ -222,7 +236,9 @@ mod tests {
         let mut nav = NavState::with_destination(Position::new(100.0, 0.0));
         let stats = ShipStats::sloop();
         let wind = WindVector { u: 0.0, v: 15.0 }; // from south
-        let s = nav.compute_steering(Position::ZERO, &stats, &wind, None).unwrap();
+        let s = nav
+            .compute_steering(Position::ZERO, &stats, &wind, None)
+            .unwrap();
         assert!((s.heading - 90.0).abs() < 1.0);
         assert!(s.speed > 5.0, "beam reach should be fast");
     }
@@ -234,11 +250,16 @@ mod tests {
         let mut nav = NavState::with_destination(Position::new(0.0, 100.0));
         let stats = ShipStats::sloop();
         let wind = WindVector { u: 0.0, v: -15.0 }; // from north
-        let s = nav.compute_steering(Position::ZERO, &stats, &wind, None).unwrap();
+        let s = nav
+            .compute_steering(Position::ZERO, &stats, &wind, None)
+            .unwrap();
         // Heading is direct (north).
         assert!(angle_diff(s.heading, 0.0).abs() < 1.0);
         // Speed is reduced (VMG, not full hull speed).
-        assert!(s.speed < stats.speed_typical, "upwind VMG should be slower than typical");
+        assert!(
+            s.speed < stats.speed_typical,
+            "upwind VMG should be slower than typical"
+        );
         assert!(s.speed > MIN_UPWIND_VMG, "should still make some progress");
     }
 

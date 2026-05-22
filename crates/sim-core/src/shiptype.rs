@@ -127,7 +127,7 @@ impl ShipTypeRegistry {
                     provision_capacity: 16.0,
                     cargo_capacity_tons: 250.0,
                 },
-                build_silver: 9_000.0,        // cheaper than Ship despite larger hold
+                build_silver: 9_000.0, // cheaper than Ship despite larger hold
                 build_naval_stores: 24.0,
                 build_manufactures: 14.0,
                 build_provisions: 16.0,
@@ -165,6 +165,10 @@ impl ShipTypeRegistry {
 
     pub fn len(&self) -> usize {
         self.types.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.types.is_empty()
     }
 }
 

@@ -14,10 +14,10 @@ pub enum Faction {
 impl Faction {
     pub fn color_rgb(&self) -> (u8, u8, u8) {
         match self {
-            Faction::Spain => (255, 215, 0),   // gold
-            Faction::England => (200, 50, 50), // red
-            Faction::France => (70, 130, 255), // blue
-            Faction::Holland => (255, 140, 0), // orange
+            Faction::Spain => (255, 215, 0),    // gold
+            Faction::England => (200, 50, 50),  // red
+            Faction::France => (70, 130, 255),  // blue
+            Faction::Holland => (255, 140, 0),  // orange
             Faction::Pirate => (180, 180, 180), // gray
         }
     }
@@ -43,18 +43,21 @@ pub struct Port {
 /// Per-port shipyard specifications used by `all_ports()`. Yards not
 /// listed here have `shipyard: None`.
 const SHIPYARDS: &[(&str, &[ShipTypeId])] = &[
-    ("Bermuda",      &[st_ids::SLOOP]),
-    ("Boston",       &[st_ids::SLOOP, st_ids::BRIGANTINE, st_ids::BARK]),
+    ("Bermuda", &[st_ids::SLOOP]),
+    ("Boston", &[st_ids::SLOOP, st_ids::BRIGANTINE, st_ids::BARK]),
     ("Philadelphia", &[st_ids::SLOOP, st_ids::BRIGANTINE]),
-    ("Nantes",       &[st_ids::BARK, st_ids::SHIP]),
-    ("Cadiz",        &[st_ids::SHIP]),
-    ("London",       &[st_ids::BRIGANTINE, st_ids::BARK, st_ids::SHIP]),
-    ("Amsterdam",    &[st_ids::FLUYT, st_ids::SHIP]),
+    ("Nantes", &[st_ids::BARK, st_ids::SHIP]),
+    ("Cadiz", &[st_ids::SHIP]),
+    ("London", &[st_ids::BRIGANTINE, st_ids::BARK, st_ids::SHIP]),
+    ("Amsterdam", &[st_ids::FLUYT, st_ids::SHIP]),
 ];
 
 /// Lookup helper: the buildable ship types at this port (or `None`).
 pub fn buildable_at(name: &str) -> Option<&'static [ShipTypeId]> {
-    SHIPYARDS.iter().find(|(n, _)| *n == name).map(|(_, list)| *list)
+    SHIPYARDS
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, list)| *list)
 }
 
 /// Default harbor radius (NM) used when a port doesn't specify one.
@@ -96,7 +99,7 @@ const PORTS: &[(&str, f32, f32, Faction, f32)] = &[
     ("English Harbour", 644.4, -30.0, Faction::England, D),
     ("Charleston", -445.8, 916.8, Faction::England, 25.0),
     ("Boston", 86.4, 1491.6, Faction::England, 20.0),
-    ("New York", -90.6, 1392.6, Faction::England, 60.0),     // NY harbor + lower Hudson + reach to Atlantic
+    ("New York", -90.6, 1392.6, Faction::England, 60.0), // NY harbor + lower Hudson + reach to Atlantic
     ("Philadelphia", -177.8, 1312.6, Faction::England, 30.0), // City at 39.953°N -75.164°W; anchor here at the Delaware Bay mouth (~30 NM SE) since 1-NM grid can't open the river.
     ("Bermuda", 469.2, 892.8, Faction::England, D),
     ("Belize", -942.0, 0.0, Faction::England, 30.0),
@@ -124,15 +127,15 @@ const PORTS: &[(&str, f32, f32, Faction, f32)] = &[
     // 1°E) rather than the City — at 1-NM grid resolution the Thames itself
     // is too narrow to leave open-water cells, and ocean-going ships of the
     // 1680s anchored at the Nore for cargo transfer to lighters anyway.
-    ("London", 4410.0, 2040.0, Faction::England, 30.0),       // 51.5°N 1°E (Nore anchorage)
-    ("Amsterdam", 4644.0, 2092.0, Faction::Holland, 25.0),    // 52.4°N 4.9°E (Ijmuiden / North Sea)
-    ("Cadiz", 3972.0, 1142.0, Faction::Spain, 20.0),          // 36.5°N 6.3°W (Bay of Cadiz)
+    ("London", 4410.0, 2040.0, Faction::England, 30.0), // 51.5°N 1°E (Nore anchorage)
+    ("Amsterdam", 4644.0, 2092.0, Faction::Holland, 25.0), // 52.4°N 4.9°E (Ijmuiden / North Sea)
+    ("Cadiz", 3972.0, 1142.0, Faction::Spain, 20.0),    // 36.5°N 6.3°W (Bay of Cadiz)
     // Nantes proper sits 30 NM up the Loire — the seagoing anchorage was at
     // Paimboeuf / mouth of the estuary near St-Nazaire (47.3°N, 2.2°W).
-    ("Nantes", 4218.0, 1788.0, Faction::France, 25.0),        // 47.3°N 2.2°W (Loire estuary mouth)
+    ("Nantes", 4218.0, 1788.0, Faction::France, 25.0), // 47.3°N 2.2°W (Loire estuary mouth)
     // === WEST AFRICA ===
     // Slave-trade ports. Stand-ins for the much wider Gold Coast and
     // Bight of Benin trade networks.
-    ("Elmina", 4269.0, -745.0, Faction::Holland, 15.0),       // 5.1°N 1.4°W (Dutch since 1637)
-    ("Ouidah", 4470.0, -666.0, Faction::France, 15.0),        // 6.4°N 2.1°E
+    ("Elmina", 4269.0, -745.0, Faction::Holland, 15.0), // 5.1°N 1.4°W (Dutch since 1637)
+    ("Ouidah", 4470.0, -666.0, Faction::France, 15.0),  // 6.4°N 2.1°E
 ];

@@ -105,10 +105,7 @@ fn build_ship_bt() -> Behavior {
 
     Behavior::Selector(vec![
         // Priority 1: If docked, do port activities
-        Behavior::Sequence(vec![
-            Behavior::Condition(COND_IS_DOCKED),
-            dock_tree,
-        ]),
+        Behavior::Sequence(vec![Behavior::Condition(COND_IS_DOCKED), dock_tree]),
         // Priority 2: If low on provisions, divert to nearest port and
         // continue steering toward it. The Sail action *must* run after
         // DivertToPort: DivertToPort only updates `nav.destination` and
@@ -139,6 +136,12 @@ pub struct ShipAI {
     state: BtState,
     /// Simple RNG state (xorshift) for destination selection.
     rng_state: u64,
+}
+
+impl Default for ShipAI {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ShipAI {
@@ -184,6 +187,7 @@ impl ShipAI {
     /// docked port's market (consuming silver and stockpile). When either
     /// is `None`, resupply is free — used by toy/demo tests that don't
     /// model an economy.
+    #[allow(clippy::too_many_arguments)]
     pub fn tick(
         &mut self,
         ship: &mut Ship,
@@ -332,10 +336,8 @@ impl<'a> BtContext for ShipBtContext<'a> {
                         if idx == owner {
                             if let Some(markets) = self.markets.as_deref_mut() {
                                 if idx < markets.len() {
-                                    let paid = markets[idx].deposit_owner_profit(
-                                        self.ship,
-                                        HOME_PORT_FLOAT_SILVER,
-                                    );
+                                    let paid = markets[idx]
+                                        .deposit_owner_profit(self.ship, HOME_PORT_FLOAT_SILVER);
                                     self.ship.lifetime_dividends += paid;
                                 }
                             }
@@ -360,7 +362,10 @@ impl<'a> BtContext for ShipBtContext<'a> {
                 }
 
                 let land = self.pathfind.map(|c| c.land);
-                if let Some(s) = self.nav.compute_steering(self.ship.position, self.stats, self.wind, land) {
+                if let Some(s) =
+                    self.nav
+                        .compute_steering(self.ship.position, self.stats, self.wind, land)
+                {
                     self.ship.set_steering(s.heading, s.speed);
                     Status::Running
                 } else if self.nav.dest_port.is_some()
@@ -387,10 +392,14 @@ impl<'a> BtContext for ShipBtContext<'a> {
             }
             ACT_RESUPPLY => {
                 *self.dock_action = DockAction::Resupplying;
-                let done = match (self.nav.docked_at_port, self.markets.as_deref_mut(), self.goods) {
-                    (Some(idx), Some(markets), Some(goods)) if idx < markets.len() => {
-                        self.ship.tick_resupply_at_market(self.stats, &mut markets[idx], goods)
-                    }
+                let done = match (
+                    self.nav.docked_at_port,
+                    self.markets.as_deref_mut(),
+                    self.goods,
+                ) {
+                    (Some(idx), Some(markets), Some(goods)) if idx < markets.len() => self
+                        .ship
+                        .tick_resupply_at_market(self.stats, &mut markets[idx], goods),
                     // No market wired (test scenario, or unknown port) —
                     // fall back to free resupply so legacy tests pass.
                     _ => self.ship.tick_resupply(self.stats),
@@ -437,17 +446,18 @@ impl<'a> BtContext for ShipBtContext<'a> {
                 // Sell every ton of cargo we arrived with at the
                 // docked port's market. If markets/goods aren't wired
                 // (toy tests), this is a no-op success.
-                let (Some(idx), Some(markets), Some(goods)) =
-                    (self.nav.docked_at_port, self.markets.as_deref_mut(), self.goods)
-                else {
+                let (Some(idx), Some(markets), Some(goods)) = (
+                    self.nav.docked_at_port,
+                    self.markets.as_deref_mut(),
+                    self.goods,
+                ) else {
                     return Status::Success;
                 };
                 if idx >= markets.len() {
                     return Status::Success;
                 }
                 let market = &mut markets[idx];
-                let entries: Vec<(crate::goods::GoodId, f32)> =
-                    self.ship.cargo.iter().collect();
+                let entries: Vec<(crate::goods::GoodId, f32)> = self.ship.cargo.iter().collect();
                 for (gid, tons) in entries {
                     if tons > 0.0 {
                         // Best-effort: ignore "port out of silver" by
@@ -464,9 +474,11 @@ impl<'a> BtContext for ShipBtContext<'a> {
                 // Pick the best (good, dest) and load up. Sets the
                 // ship's destination as a side effect so ACT_UNDOCK
                 // has somewhere to go.
-                let (Some(idx), Some(markets), Some(goods)) =
-                    (self.nav.docked_at_port, self.markets.as_deref_mut(), self.goods)
-                else {
+                let (Some(idx), Some(markets), Some(goods)) = (
+                    self.nav.docked_at_port,
+                    self.markets.as_deref_mut(),
+                    self.goods,
+                ) else {
                     return Status::Success;
                 };
                 if idx >= markets.len() {
@@ -512,8 +524,7 @@ impl<'a> BtContext for ShipBtContext<'a> {
                 // hold, and that the port can supply.
                 let market = &mut markets[idx];
                 let unit = market.buy_price(plan.good, goods).max(0.0001);
-                let cargo_room = self.stats.cargo_capacity_tons
-                    - self.ship.cargo.total_tons();
+                let cargo_room = self.stats.cargo_capacity_tons - self.ship.cargo.total_tons();
 
                 // Outfitting draw: if this is the owner port, top the
                 // ship's strongbox up from the port treasury before
@@ -525,11 +536,7 @@ impl<'a> BtContext for ShipBtContext<'a> {
                     if owner == idx {
                         let want_tons = cargo_room.min(market.stockpile.get(plan.good));
                         let target = unit * want_tons * OUTFIT_DRAW_MULTIPLE;
-                        market.draw_for_outfit(
-                            self.ship,
-                            target,
-                            OUTFIT_PORT_FRACTION_CAP,
-                        );
+                        market.draw_for_outfit(self.ship, target, OUTFIT_PORT_FRACTION_CAP);
                     }
                 }
 
@@ -567,8 +574,8 @@ impl<'a> BtContext for ShipBtContext<'a> {
                 Status::Success
             }
             ACT_DIVERT_TO_PORT => {
-                if let Some((nearest_idx, _)) = self.ports.iter().enumerate()
-                    .min_by(|(_, a), (_, b)| {
+                if let Some((nearest_idx, _)) =
+                    self.ports.iter().enumerate().min_by(|(_, a), (_, b)| {
                         let da = self.ship.position.distance(a.position);
                         let db = self.ship.position.distance(b.position);
                         da.partial_cmp(&db).unwrap()
@@ -609,7 +616,10 @@ impl<'a> BtContext for ShipBtContext<'a> {
             }
             _ => false,
         };
-        if result { Status::Success } else { Status::Failure }
+        if result {
+            Status::Success
+        } else {
+            Status::Failure
+        }
     }
 }
-

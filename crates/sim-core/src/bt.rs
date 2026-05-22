@@ -36,6 +36,12 @@ pub struct BtState {
     pub running_child: Vec<usize>,
 }
 
+impl Default for BtState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl BtState {
     pub fn new() -> Self {
         Self {
@@ -72,6 +78,7 @@ pub fn tick(node: &Behavior, state: &mut BtState, ctx: &mut dyn BtContext, depth
             }
 
             let start = state.running_child[depth];
+            #[allow(clippy::needless_range_loop)]
             for i in start..children.len() {
                 state.running_child[depth] = i;
                 let status = tick(&children[i], state, ctx, depth + 1);
@@ -99,6 +106,7 @@ pub fn tick(node: &Behavior, state: &mut BtState, ctx: &mut dyn BtContext, depth
             }
 
             let start = state.running_child[depth];
+            #[allow(clippy::needless_range_loop)]
             for i in start..children.len() {
                 state.running_child[depth] = i;
                 let status = tick(&children[i], state, ctx, depth + 1);
@@ -118,13 +126,11 @@ pub fn tick(node: &Behavior, state: &mut BtState, ctx: &mut dyn BtContext, depth
             Status::Failure
         }
 
-        Behavior::Invert(child) => {
-            match tick(child, state, ctx, depth) {
-                Status::Success => Status::Failure,
-                Status::Failure => Status::Success,
-                Status::Running => Status::Running,
-            }
-        }
+        Behavior::Invert(child) => match tick(child, state, ctx, depth) {
+            Status::Success => Status::Failure,
+            Status::Failure => Status::Success,
+            Status::Running => Status::Running,
+        },
     }
 }
 
@@ -133,8 +139,8 @@ mod tests {
     use super::*;
 
     struct TestCtx {
-        actions: Vec<Status>,  // what each action returns
-        conditions: Vec<bool>, // what each condition returns
+        actions: Vec<Status>,     // what each action returns
+        conditions: Vec<bool>,    // what each condition returns
         action_calls: Vec<usize>, // track which actions were called
     }
 
@@ -144,7 +150,11 @@ mod tests {
             self.actions[id]
         }
         fn check_condition(&mut self, id: usize) -> Status {
-            if self.conditions[id] { Status::Success } else { Status::Failure }
+            if self.conditions[id] {
+                Status::Success
+            } else {
+                Status::Failure
+            }
         }
     }
 
@@ -186,10 +196,7 @@ mod tests {
 
     #[test]
     fn sequence_resumes_after_running() {
-        let tree = Behavior::Sequence(vec![
-            Behavior::Action(0),
-            Behavior::Action(1),
-        ]);
+        let tree = Behavior::Sequence(vec![Behavior::Action(0), Behavior::Action(1)]);
         let mut state = BtState::new();
 
         // First tick: action 0 succeeds, action 1 is running
@@ -211,10 +218,7 @@ mod tests {
 
     #[test]
     fn selector_succeeds_on_first_success() {
-        let tree = Behavior::Selector(vec![
-            Behavior::Action(0),
-            Behavior::Action(1),
-        ]);
+        let tree = Behavior::Selector(vec![Behavior::Action(0), Behavior::Action(1)]);
         let mut state = BtState::new();
         let mut ctx = TestCtx {
             actions: vec![Status::Failure, Status::Success],
@@ -230,10 +234,7 @@ mod tests {
     fn condition_gates_sequence() {
         // Sequence: [Condition(0), Action(0)]
         // If condition fails, action never runs
-        let tree = Behavior::Sequence(vec![
-            Behavior::Condition(0),
-            Behavior::Action(0),
-        ]);
+        let tree = Behavior::Sequence(vec![Behavior::Condition(0), Behavior::Action(0)]);
         let mut state = BtState::new();
         let mut ctx = TestCtx {
             actions: vec![Status::Success],

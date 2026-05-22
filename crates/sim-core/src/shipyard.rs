@@ -109,7 +109,8 @@ pub fn starting_silver(ty: &ShipType, market: &PortMarket, goods: &GoodsRegistry
         ty.stats.cargo_capacity_tons * avg_export_price
     };
     let cap = market.silver * STARTING_SILVER_PORT_FRACTION_CAP;
-    raw.max(STARTING_SILVER_FLOOR).min(cap.max(STARTING_SILVER_FLOOR))
+    raw.max(STARTING_SILVER_FLOOR)
+        .min(cap.max(STARTING_SILVER_FLOOR))
 }
 
 /// Why one specific type was rejected (or accepted) at a yard.
@@ -267,7 +268,8 @@ mod tests {
 
     fn well_stocked_market() -> PortMarket {
         let goods = GoodsRegistry::starter();
-        let mut market = PortMarket::with_recipe(&goods, PortArchetype::NorthAmericanFarming.recipe());
+        let mut market =
+            PortMarket::with_recipe(&goods, PortArchetype::NorthAmericanFarming.recipe());
         market.stockpile.add(ids::NAVAL_STORES, 200.0);
         market.stockpile.add(ids::MANUFACTURES, 200.0);
         market.stockpile.add(ids::PROVISIONS, 200.0);
@@ -340,6 +342,8 @@ mod tests {
         assert!(matches!(outcome, BuildOutcome::Built { .. }));
         let sloop = types.get(st_ids::SLOOP);
         assert!((silver_before - market.silver - sloop.build_silver).abs() < 1e-2);
-        assert!(ns_before - market.stockpile.get(ids::NAVAL_STORES) >= sloop.build_naval_stores - 1e-3);
+        assert!(
+            ns_before - market.stockpile.get(ids::NAVAL_STORES) >= sloop.build_naval_stores - 1e-3
+        );
     }
 }

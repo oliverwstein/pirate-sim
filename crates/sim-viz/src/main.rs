@@ -545,7 +545,7 @@ fn pick_ship_at(world: &World, world_pos: Position, zoom_px_per_nm: f32) -> Opti
     let mut best: Option<(ShipId, f32)> = None;
     for (id, ship) in &world.ships {
         let d = world_pos.distance(ship.position);
-        if d <= click_r_nm && best.map_or(true, |(_, db)| d < db) {
+        if d <= click_r_nm && best.is_none_or(|(_, db)| d < db) {
             best = Some((id, d));
         }
     }
@@ -560,10 +560,8 @@ fn pick_port_at(world: &World, world_pos: Position) -> Option<usize> {
         let d = world_pos.distance(port.position);
         // Use a generous click radius so small ports are still hittable.
         let click_r = port.harbor_radius_nm.max(15.0);
-        if d <= click_r {
-            if best.map_or(true, |(_, db)| d < db) {
-                best = Some((i, d));
-            }
+        if d <= click_r && best.is_none_or(|(_, db)| d < db) {
+            best = Some((i, d));
         }
     }
     best.map(|(i, _)| i)

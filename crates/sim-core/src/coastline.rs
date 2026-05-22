@@ -91,7 +91,10 @@ impl LandMesh {
 
 fn read_u32(buf: &[u8], cur: &mut usize) -> io::Result<u32> {
     if *cur + 4 > buf.len() {
-        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "coastline u32"));
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "coastline u32",
+        ));
     }
     let v = u32::from_le_bytes(buf[*cur..*cur + 4].try_into().unwrap());
     *cur += 4;
@@ -100,7 +103,10 @@ fn read_u32(buf: &[u8], cur: &mut usize) -> io::Result<u32> {
 
 fn read_f32(buf: &[u8], cur: &mut usize) -> io::Result<f32> {
     if *cur + 4 > buf.len() {
-        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "coastline f32"));
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "coastline f32",
+        ));
     }
     let v = f32::from_le_bytes(buf[*cur..*cur + 4].try_into().unwrap());
     *cur += 4;

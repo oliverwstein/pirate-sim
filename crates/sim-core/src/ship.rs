@@ -4,12 +4,12 @@ use crate::types::{Position, WindVector};
 /// Ship performance characteristics.
 #[derive(Clone, Debug)]
 pub struct ShipStats {
-    pub speed_typical: f32,    // knots in moderate trade winds
-    pub speed_max: f32,        // absolute maximum
-    pub windward_ability: f32, // 0.0-1.0 (how well it sails upwind)
-    pub no_go_half_angle: f32, // degrees from wind that ship cannot sail into
-    pub crew: u32,             // crew complement (determines provision consumption)
-    pub provision_capacity: f32, // max tons of provisions (separate from trade hold)
+    pub speed_typical: f32,       // knots in moderate trade winds
+    pub speed_max: f32,           // absolute maximum
+    pub windward_ability: f32,    // 0.0-1.0 (how well it sails upwind)
+    pub no_go_half_angle: f32,    // degrees from wind that ship cannot sail into
+    pub crew: u32,                // crew complement (determines provision consumption)
+    pub provision_capacity: f32,  // max tons of provisions (separate from trade hold)
     pub cargo_capacity_tons: f32, // max tons of trade cargo
 }
 
@@ -58,12 +58,12 @@ pub const STARTING_SILVER_PESOS: f32 = 5000.0;
 /// A ship: purely physical entity. Heading is set externally by AI/player.
 pub struct Ship {
     pub position: Position,
-    pub heading: f32,          // degrees (0=N, 90=E, clockwise)
-    pub speed: f32,            // current speed in knots
+    pub heading: f32, // degrees (0=N, 90=E, clockwise)
+    pub speed: f32,   // current speed in knots
     pub state: ShipState,
-    pub provisions: f32,       // tons of food remaining (separate from trade hold)
-    pub cargo: Cargo,          // trade goods (subject to cargo_capacity_tons)
-    pub hull_fouling: f32,     // 0 = clean, 100 = fully encrusted
+    pub provisions: f32,   // tons of food remaining (separate from trade hold)
+    pub cargo: Cargo,      // trade goods (subject to cargo_capacity_tons)
+    pub hull_fouling: f32, // 0 = clean, 100 = fully encrusted
     /// Pesos in the ship's strongbox. Spent at port markets to buy
     /// provisions and trade goods; earned by selling cargo.
     pub silver: f32,
@@ -254,12 +254,20 @@ impl Ship {
         // for a multi-hour top-up.
         if self.silver < unit_price * RESUPPLY_RATE_PER_HOUR && self.debt < MAX_SHIP_DEBT {
             let target_advance = unit_price * RESUPPLY_RATE_PER_HOUR;
-            market.extend_credit(self, target_advance, CHANDLER_PORT_FRACTION_CAP, MAX_SHIP_DEBT);
+            market.extend_credit(
+                self,
+                target_advance,
+                CHANDLER_PORT_FRACTION_CAP,
+                MAX_SHIP_DEBT,
+            );
         }
 
         let affordable = self.silver / unit_price;
 
-        let desired = RESUPPLY_RATE_PER_HOUR.min(space).min(stockpile).min(affordable);
+        let desired = RESUPPLY_RATE_PER_HOUR
+            .min(space)
+            .min(stockpile)
+            .min(affordable);
         if desired <= 0.0 {
             return true;
         }
@@ -289,7 +297,11 @@ impl Ship {
     /// Days of provisions remaining at current consumption rate.
     pub fn provisions_days_remaining(&self, stats: &ShipStats) -> f32 {
         let daily = stats.daily_provision_consumption();
-        if daily > 0.0 { self.provisions / daily } else { f32::INFINITY }
+        if daily > 0.0 {
+            self.provisions / daily
+        } else {
+            f32::INFINITY
+        }
     }
 }
 
@@ -335,15 +347,23 @@ fn sail_efficiency(relative_angle: f32, windward_ability: f32) -> f32 {
 /// Signed angle difference in degrees, normalized to [-180, 180].
 pub fn angle_diff(a: f32, b: f32) -> f32 {
     let mut diff = a - b;
-    while diff > 180.0 { diff -= 360.0; }
-    while diff < -180.0 { diff += 360.0; }
+    while diff > 180.0 {
+        diff -= 360.0;
+    }
+    while diff < -180.0 {
+        diff += 360.0;
+    }
     diff
 }
 
 /// Normalize angle to [0, 360).
 pub fn normalize_angle(mut a: f32) -> f32 {
-    while a < 0.0 { a += 360.0; }
-    while a >= 360.0 { a -= 360.0; }
+    while a < 0.0 {
+        a += 360.0;
+    }
+    while a >= 360.0 {
+        a -= 360.0;
+    }
     a
 }
 
@@ -367,7 +387,7 @@ mod tests {
         ship.heading = 0.0; // heading north
         let stats = ShipStats::sloop();
         let wind = WindVector { u: 0.0, v: -15.0 }; // from north
-        // Simulate navigator commanding the raw upwind hull speed (slow).
+                                                    // Simulate navigator commanding the raw upwind hull speed (slow).
         ship.speed = speed_at_heading(ship.heading, &stats, &wind);
         assert!(ship.effective_speed(&stats, &wind) < 5.0);
     }
@@ -402,8 +422,12 @@ mod tests {
 
         let consumed = initial - ship.provisions;
         let expected_daily = stats.daily_provision_consumption();
-        assert!((consumed - expected_daily).abs() < 0.001,
-            "Expected ~{:.4} tons consumed in a day, got {:.4}", expected_daily, consumed);
+        assert!(
+            (consumed - expected_daily).abs() < 0.001,
+            "Expected ~{:.4} tons consumed in a day, got {:.4}",
+            expected_daily,
+            consumed
+        );
     }
 
     #[test]
@@ -429,7 +453,11 @@ mod tests {
         let stats = ShipStats::sloop();
         let days = ship.provisions_days_remaining(&stats);
         // 6.0 tons / (25 * 0.0018 tons/day) = ~133 days
-        assert!(days > 120.0 && days < 140.0, "Expected ~133 days, got {}", days);
+        assert!(
+            days > 120.0 && days < 140.0,
+            "Expected ~133 days, got {}",
+            days
+        );
     }
 
     #[test]
@@ -446,8 +474,10 @@ mod tests {
         // provisioned ship has its entire trade hold still available.
         assert!(stats.cargo_capacity_tons > 0.0);
         assert!(stats.provision_capacity > 0.0);
-        assert!(stats.cargo_capacity_tons > stats.provision_capacity,
-            "Trade hold should dwarf the provisions hold for a merchant ship");
+        assert!(
+            stats.cargo_capacity_tons > stats.provision_capacity,
+            "Trade hold should dwarf the provisions hold for a merchant ship"
+        );
     }
 
     #[test]
@@ -458,11 +488,12 @@ mod tests {
 
     #[test]
     fn test_market_resupply_consumes_silver_and_stockpile() {
-        use crate::goods::{GoodsRegistry, ids};
+        use crate::goods::{ids, GoodsRegistry};
         use crate::market::{PortArchetype, PortMarket};
 
         let goods = GoodsRegistry::starter();
-        let mut market = PortMarket::with_recipe(&goods, PortArchetype::NorthAmericanFarming.recipe());
+        let mut market =
+            PortMarket::with_recipe(&goods, PortArchetype::NorthAmericanFarming.recipe());
         let stats = ShipStats::sloop();
         let mut ship = Ship::new(Position::ZERO, ShipState::Docked);
         ship.provisions = 0.0; // Empty hold.
@@ -478,27 +509,41 @@ mod tests {
         }
 
         // Hold should be at (or very near) capacity.
-        assert!(ship.provisions > stats.provision_capacity * 0.99,
-            "expected near-full provisions, got {}", ship.provisions);
+        assert!(
+            ship.provisions > stats.provision_capacity * 0.99,
+            "expected near-full provisions, got {}",
+            ship.provisions
+        );
         // Silver moved from ship to port.
-        assert!(ship.silver < ship_silver_before, "ship should have spent silver");
-        assert!(market.silver > port_silver_before, "port should have earned silver");
+        assert!(
+            ship.silver < ship_silver_before,
+            "ship should have spent silver"
+        );
+        assert!(
+            market.silver > port_silver_before,
+            "port should have earned silver"
+        );
         // Spent ≈ earned (no leakage; small float drift over many ticks).
         let spent = ship_silver_before - ship.silver;
         let earned = market.silver - port_silver_before;
-        assert!((spent - earned).abs() < 0.5,
-            "spent {} vs earned {}", spent, earned);
+        assert!(
+            (spent - earned).abs() < 0.5,
+            "spent {} vs earned {}",
+            spent,
+            earned
+        );
         // Stockpile dropped by ≈ amount loaded.
         assert!(market.stockpile.get(ids::PROVISIONS) < stockpile_before);
     }
 
     #[test]
     fn test_market_resupply_halts_when_market_dry() {
-        use crate::goods::{GoodsRegistry, ids};
+        use crate::goods::{ids, GoodsRegistry};
         use crate::market::{PortArchetype, PortMarket};
 
         let goods = GoodsRegistry::starter();
-        let mut market = PortMarket::with_recipe(&goods, PortArchetype::NorthAmericanFarming.recipe());
+        let mut market =
+            PortMarket::with_recipe(&goods, PortArchetype::NorthAmericanFarming.recipe());
         // Drain the market.
         let stockpile = market.stockpile.get(ids::PROVISIONS);
         market.stockpile.remove(ids::PROVISIONS, stockpile);
@@ -510,6 +555,9 @@ mod tests {
         // Single tick should flag done immediately.
         let done = ship.tick_resupply_at_market(&stats, &mut market, &goods);
         assert!(done);
-        assert_eq!(ship.provisions, provisions_before, "no provisions should load when market is dry");
+        assert_eq!(
+            ship.provisions, provisions_before,
+            "no provisions should load when market is dry"
+        );
     }
 }

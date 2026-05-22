@@ -109,13 +109,16 @@ pub fn find_best_trade(
             };
             let score = profit + bonus;
             if profit > MIN_PROFIT_THRESHOLD_PESOS_PER_TON
-                && best.as_ref().map_or(true, |(_, s)| score > *s)
+                && best.as_ref().is_none_or(|(_, s)| score > *s)
             {
-                best = Some((TradePlan {
-                    good: good.id,
-                    dest_port: dest_idx,
-                    estimated_profit_per_ton: profit,
-                }, score));
+                best = Some((
+                    TradePlan {
+                        good: good.id,
+                        dest_port: dest_idx,
+                        estimated_profit_per_ton: profit,
+                    },
+                    score,
+                ));
             }
         }
     }
@@ -125,7 +128,7 @@ pub fn find_best_trade(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::goods::{GoodsRegistry, ids};
+    use crate::goods::{ids, GoodsRegistry};
     use crate::market::{PortArchetype, PortMarket};
     use crate::port::Port;
     use crate::ship::ShipStats;
@@ -149,20 +152,28 @@ mod tests {
     fn picks_arbitrage_with_largest_margin() {
         let goods = GoodsRegistry::starter();
         let stats = ShipStats::sloop();
-        let ports = vec![
-            synth_port("A", 0.0, 0.0),
-            synth_port("B", 100.0, 0.0),
-        ];
+        let ports = vec![synth_port("A", 0.0, 0.0), synth_port("B", 100.0, 0.0)];
 
         let mut market_a = PortMarket::with_recipe(&goods, PortArchetype::SugarIsland.recipe());
-        let mut market_b = PortMarket::with_recipe(&goods, PortArchetype::NorthAmericanFarming.recipe());
+        let mut market_b =
+            PortMarket::with_recipe(&goods, PortArchetype::NorthAmericanFarming.recipe());
         // Bias A's sugar price low (huge surplus) and B's high (drained).
         market_a.stockpile.add(ids::SUGAR, 10_000.0);
-        market_b.stockpile.remove(ids::SUGAR, market_b.stockpile.get(ids::SUGAR));
+        market_b
+            .stockpile
+            .remove(ids::SUGAR, market_b.stockpile.get(ids::SUGAR));
 
         let markets = vec![market_a, market_b];
-        let plan = find_best_trade(0, &ports, &markets, &goods, &stats, full_budget(&stats), None)
-            .expect("arbitrage should exist");
+        let plan = find_best_trade(
+            0,
+            &ports,
+            &markets,
+            &goods,
+            &stats,
+            full_budget(&stats),
+            None,
+        )
+        .expect("arbitrage should exist");
         assert_eq!(plan.dest_port, 1);
         assert_eq!(plan.good, ids::SUGAR);
         assert!(plan.estimated_profit_per_ton > 0.0);
@@ -175,35 +186,47 @@ mod tests {
         // Two identical "Minor" ports with the same recipe → every
         // good's price is identical at both ends, so the round trip
         // strictly loses (spread + distance cost).
-        let ports = vec![
-            synth_port("A", 0.0, 0.0),
-            synth_port("B", 1000.0, 0.0),
-        ];
+        let ports = vec![synth_port("A", 0.0, 0.0), synth_port("B", 1000.0, 0.0)];
         let markets = vec![
             PortMarket::with_recipe(&goods, PortArchetype::Minor.recipe()),
             PortMarket::with_recipe(&goods, PortArchetype::Minor.recipe()),
         ];
-        assert!(find_best_trade(0, &ports, &markets, &goods, &stats, full_budget(&stats), None).is_none());
+        assert!(find_best_trade(
+            0,
+            &ports,
+            &markets,
+            &goods,
+            &stats,
+            full_budget(&stats),
+            None
+        )
+        .is_none());
     }
 
     #[test]
     fn skips_goods_origin_lacks() {
         let goods = GoodsRegistry::starter();
         let stats = ShipStats::sloop();
-        let ports = vec![
-            synth_port("A", 0.0, 0.0),
-            synth_port("B", 100.0, 0.0),
-        ];
+        let ports = vec![synth_port("A", 0.0, 0.0), synth_port("B", 100.0, 0.0)];
         let mut market_a = PortMarket::with_recipe(&goods, PortArchetype::SugarIsland.recipe());
         // Drain everything in A. Then nothing can be bought.
-        let snapshot: Vec<_> = market_a.stockpile.iter()
-            .map(|(id, t)| (id, t)).collect();
+        let snapshot: Vec<_> = market_a.stockpile.iter().collect();
         for (id, t) in snapshot {
             market_a.stockpile.remove(id, t);
         }
-        let market_b = PortMarket::with_recipe(&goods, PortArchetype::NorthAmericanFarming.recipe());
+        let market_b =
+            PortMarket::with_recipe(&goods, PortArchetype::NorthAmericanFarming.recipe());
         let markets = vec![market_a, market_b];
-        assert!(find_best_trade(0, &ports, &markets, &goods, &stats, full_budget(&stats), None).is_none());
+        assert!(find_best_trade(
+            0,
+            &ports,
+            &markets,
+            &goods,
+            &stats,
+            full_budget(&stats),
+            None
+        )
+        .is_none());
     }
 
     #[test]
@@ -213,15 +236,24 @@ mod tests {
         // B is 50,000 NM away — far beyond what any provision budget
         // could ever cover. Even with a profitable arbitrage we should
         // refuse to commit.
-        let ports = vec![
-            synth_port("A", 0.0, 0.0),
-            synth_port("B", 50_000.0, 0.0),
-        ];
+        let ports = vec![synth_port("A", 0.0, 0.0), synth_port("B", 50_000.0, 0.0)];
         let mut market_a = PortMarket::with_recipe(&goods, PortArchetype::SugarIsland.recipe());
-        let mut market_b = PortMarket::with_recipe(&goods, PortArchetype::NorthAmericanFarming.recipe());
+        let mut market_b =
+            PortMarket::with_recipe(&goods, PortArchetype::NorthAmericanFarming.recipe());
         market_a.stockpile.add(ids::SUGAR, 10_000.0);
-        market_b.stockpile.remove(ids::SUGAR, market_b.stockpile.get(ids::SUGAR));
+        market_b
+            .stockpile
+            .remove(ids::SUGAR, market_b.stockpile.get(ids::SUGAR));
         let markets = vec![market_a, market_b];
-        assert!(find_best_trade(0, &ports, &markets, &goods, &stats, full_budget(&stats), None).is_none());
+        assert!(find_best_trade(
+            0,
+            &ports,
+            &markets,
+            &goods,
+            &stats,
+            full_budget(&stats),
+            None
+        )
+        .is_none());
     }
 }

@@ -9,12 +9,10 @@
 //!
 //! Usage: `cargo run --release --example equilibrium_report`
 
-use sim_core::equilibrium::{
-    self, EquilibriumScenario, FreightCostModel, PortSpec,
-};
+use sim_core::equilibrium::{self, EquilibriumScenario, FreightCostModel, PortSpec};
+use sim_core::goods::GoodsRegistry;
 use sim_core::market::{archetype_for, PortMarket};
 use sim_core::port::all_ports;
-use sim_core::goods::GoodsRegistry;
 use sim_core::ship::ShipStats;
 
 fn main() {
@@ -42,7 +40,9 @@ fn main() {
     //    roughly what historical ocean freight rates worked out to
     //    when expressed per-ton-NM (a very rough order-of-magnitude
     //    fit, not a calibrated number).
-    let cost_simple = FreightCostModel::Linear { pesos_per_ton_nm: 0.05 };
+    let cost_simple = FreightCostModel::Linear {
+        pesos_per_ton_nm: 0.05,
+    };
 
     // ── Cost model B: voyage-based for a sloop. Day-rate is wages +
     //    maintenance + insurance for a 25-man crew, very loosely
