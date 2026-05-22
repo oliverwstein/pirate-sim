@@ -358,3 +358,38 @@ Phases 1 & 2 were implemented prior to the creation of this log; you can now exp
 - `copilot-instructions.md` updated implicitly: 365-day and 730-day bench runs are now part of every Step verification going forward (alongside 60-day smoke).
 
 **Next action:** Step 4 (Factions + spatial hash). The remaining "ships in the red" at 365/730 are Amsterdam fluyts saturating one destination — they're sailing, just not profitably. That's an economic-rebalancing topic for Phase 4, not Step 3 crewing.
+
+---
+
+## Step 4.a — Faction renames + `#[repr(u8)]` (2026-05-22)
+
+**Scope:** Pure-mechanical rename, behavior-preserving. Slice 1 of 4 for Step 4 (Factions + spatial hash).
+
+**Decisions taken (with user, before coding):**
+- **Drop the Relations Matrix from Step 4.** Faction-vs-faction relations (Hostile/Neutral/Friendly) are inherently dynamic (wars, treaties) and quantitative (thresholds). Phase 3 has no wars yet, so the Phase 3 consumers of "hostility" are (a) viz sight-lines, which only need a faction-equality check, and (b) Pursue/Flee in Step 6, which are better expressed per-ship via `ShipPolicy` (Pirate hostile to all merchants; Privateer{against: FactionSet}; Navy hostile to declared enemies; Merchant hostile to none). Revisit relations in Phase 4 when wars exist.
+- **Reflected on Sid Meier's Pirates! mechanics** to validate Step 4 doesn't preclude later work. Concluded:
+  - Per-ship and per-port faction flags: ✅ (Port.faction exists; Ship.faction lands in 4.b).
+  - Captured-prize flag flip: ✅ trivial (`Ship.faction = capturer.faction` in Step 8).
+  - Port capture: ✅ Port.faction is already mutable.
+  - Letters of Marque (Privateer commission): unlocked by making `Faction` `#[repr(u8)]` so a future `FactionSet` is a bitset. Done in 4.a.
+  - Dynamic war/peace, treasure fleets, sighted-but-unidentified: not modeled; out of Step 4 scope but not blocked.
+- **Spatial hash API (lands in 4.c) will support faction-filtered neighbor queries** from day one — `neighbors(pos, range_nm, |id, ship| predicate)`.
+- **Every ship must have an owner port.** Seeded ships (in `bench_trade`) currently use `Ship::new` which sets `owner_port = None`; will be fixed in 4.b alongside the `Ship.faction` field. Test-only ships in `market.rs`/`ship.rs` keep `Ship::new` as scaffolding.
+
+**Changes (4.a):**
+- `crates/sim-core/src/port.rs` — `Faction` enum: `Holland → Netherlands`, `Pirate → Free`; added `#[repr(u8)]` with explicit discriminants (Spain=0, England=1, France=2, Netherlands=3, Free=4); doc-comment rewritten to reflect the Phase 3 model (Free = independents; piracy is a per-ship `ShipPolicy`, not a faction).
+- `crates/sim-core/src/harbor.rs`, `crates/sim-core/src/pop.rs` — `Faction::Holland → Faction::Netherlands` and `Faction::Pirate → Faction::Free` (mechanical).
+- `data/registries/ports.ron` — same RON-side renames; header comment updated.
+
+**Verification:**
+- `cargo build --workspace --tests --examples` clean.
+- `cargo test --workspace`: 91 sim-core unit + 19 integration = **110 passing** (same as before; pure rename).
+- `cargo clippy --workspace --all-targets -- -D warnings`: clean.
+- `bench_trade -- 365`: identical fleet metrics and equilibrium deviations vs. pre-rename (rename is observation-free).
+- `bench_trade -- 730`: identical bankruptcy verdict (14 ships in the red — pre-existing Amsterdam-fluyt saturation).
+
+**Deferred to 4.b/4.c/4.d:**
+- `Ship.faction` field (4.b).
+- Seeded-with-port ship constructor + bench_trade migration (4.b).
+- `crates/sim-core/src/spatial.rs` 10 NM dynamic spatial hash with filtered queries (4.c).
+- Viz: ship faction colors + faint sight-lines between differing-faction ships (4.d).

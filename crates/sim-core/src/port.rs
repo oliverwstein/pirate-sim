@@ -3,25 +3,31 @@ use crate::shiptype::{ShipTypeId, ShipTypeRegistry};
 use crate::types::Position;
 use serde::Deserialize;
 
-/// Faction allegiance (simplified for Phase 1; Phase 3 keeps 5 factions
-/// but renames `Holland` → `Netherlands` is a future cleanup).
+/// Faction allegiance. Phase 3 keeps 5 factions: the four colonial powers
+/// plus `Free` (independents, including pirates — actual piracy is a
+/// per-ship `ShipPolicy`, not a faction).
+///
+/// `#[repr(u8)]` so a future `FactionSet` can be a compact bitset (used
+/// e.g. for `ShipPolicy::Privateer { against: FactionSet }` in Step 6
+/// and dynamic war-declaration sets in Phase 4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[repr(u8)]
 pub enum Faction {
-    Spain,
-    England,
-    France,
-    Holland,
-    Pirate,
+    Spain = 0,
+    England = 1,
+    France = 2,
+    Netherlands = 3,
+    Free = 4,
 }
 
 impl Faction {
     pub fn color_rgb(&self) -> (u8, u8, u8) {
         match self {
-            Faction::Spain => (255, 215, 0),    // gold
-            Faction::England => (200, 50, 50),  // red
-            Faction::France => (70, 130, 255),  // blue
-            Faction::Holland => (255, 140, 0),  // orange
-            Faction::Pirate => (180, 180, 180), // gray
+            Faction::Spain => (255, 215, 0),       // gold
+            Faction::England => (200, 50, 50),     // red
+            Faction::France => (70, 130, 255),     // blue
+            Faction::Netherlands => (255, 140, 0), // orange
+            Faction::Free => (180, 180, 180),      // gray
         }
     }
 }

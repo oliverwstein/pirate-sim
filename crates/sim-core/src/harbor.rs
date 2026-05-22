@@ -208,7 +208,7 @@ mod tests {
         let port = Port {
             name: "Test".to_string(),
             position: Position::new(20.0, 20.0),
-            faction: Faction::Pirate,
+            faction: Faction::Free,
             harbor_radius_nm: 5.0,
             shipyard: None,
             category: crate::pop::PortCategory::SmallColonial,
@@ -241,7 +241,7 @@ mod tests {
         let port = Port {
             name: "WestSide".to_string(),
             position: Position::new(8.0, 10.0), // west of wall
-            faction: Faction::Pirate,
+            faction: Faction::Free,
             harbor_radius_nm: 8.0, // would cross wall if straight-line
             shipyard: None,
             category: crate::pop::PortCategory::SmallColonial,

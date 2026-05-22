@@ -10,10 +10,10 @@
 //   name              — display name (used for archetype lookup; see
 //                       market::archetype_for in code)
 //   position          — (x_nm, y_nm)
-//   faction           — Spain | England | France | Holland | Pirate
-//                       (the 5-faction Phase 3 model — Holland is the
-//                       on-disk spelling kept for back-compat with the
-//                       Faction::Holland enum variant; rename later)
+//   faction           — Spain | England | France | Netherlands | Free
+//                       (the 5-faction Phase 3 model; `Free` covers
+//                       independents/pirate havens — actual piracy is a
+//                       per-ship `ShipPolicy`)
 //   harbor_radius_nm  — radius of the harbor zone (default 8.0; widen for
 //                       river-mouth or estuary ports)
 //   shipyard          — Some(["sloop", "ship", ...]) listing ship-type
@@ -63,15 +63,15 @@
 
     // === DUTCH ===
     // Curaçao (Willemstad): the great Dutch entrepôt of the Spanish Main.
-    (name: "Willemstad",      position: (214.2, -323.4),  faction: Holland, harbor_radius_nm: 8.0,  shipyard: None, category: CaribbeanEntrepot),
-    (name: "St. Eustatius",   position: (571.8, -1.2),    faction: Holland, harbor_radius_nm: 8.0,  shipyard: None, category: SmallColonial),
+    (name: "Willemstad",      position: (214.2, -323.4),  faction: Netherlands, harbor_radius_nm: 8.0,  shipyard: None, category: CaribbeanEntrepot),
+    (name: "St. Eustatius",   position: (571.8, -1.2),    faction: Netherlands, harbor_radius_nm: 8.0,  shipyard: None, category: SmallColonial),
     // Paramaribo: moved to mouth of Suriname river.
-    (name: "Paramaribo",      position: (1039.8, -685.0), faction: Holland, harbor_radius_nm: 15.0, shipyard: None, category: SmallColonial),
+    (name: "Paramaribo",      position: (1039.8, -685.0), faction: Netherlands, harbor_radius_nm: 15.0, shipyard: None, category: SmallColonial),
 
     // === PIRATE HAVENS ===
-    (name: "Tortuga",         position: (-16.8, 152.4),   faction: Pirate,  harbor_radius_nm: 8.0,  shipyard: None, category: PirateHaven),
-    (name: "Nassau",          position: (-291.0, 453.0),  faction: Pirate,  harbor_radius_nm: 8.0,  shipyard: None, category: PirateHaven),
-    (name: "Tobago",          position: (709.8, -375.0),  faction: Pirate,  harbor_radius_nm: 8.0,  shipyard: None, category: PirateHaven),
+    (name: "Tortuga",         position: (-16.8, 152.4),   faction: Free,     harbor_radius_nm: 8.0,  shipyard: None, category: PirateHaven),
+    (name: "Nassau",          position: (-291.0, 453.0),  faction: Free,     harbor_radius_nm: 8.0,  shipyard: None, category: PirateHaven),
+    (name: "Tobago",          position: (709.8, -375.0),  faction: Free,     harbor_radius_nm: 8.0,  shipyard: None, category: PirateHaven),
 
     // === EUROPE ===
     // London at the Nore anchorage (Thames Estuary mouth, 51.5°N 1°E);
@@ -80,7 +80,7 @@
     (name: "London",          position: (4410.0, 2040.0), faction: England, harbor_radius_nm: 30.0, shipyard: Some(["brigantine", "bark", "ship"]), category: EuropeanHub),
     // Amsterdam at Ijmuiden / North Sea (52.4°N 4.9°E). Dutch yards
     // pioneered the fluyt.
-    (name: "Amsterdam",       position: (4644.0, 2092.0), faction: Holland, harbor_radius_nm: 25.0, shipyard: Some(["fluyt", "ship"]), category: EuropeanHub),
+    (name: "Amsterdam",       position: (4644.0, 2092.0), faction: Netherlands, harbor_radius_nm: 25.0, shipyard: Some(["fluyt", "ship"]), category: EuropeanHub),
     // Cadiz: Bay of Cadiz (36.5°N 6.3°W). Royal yards built large ships.
     (name: "Cadiz",           position: (3972.0, 1142.0), faction: Spain,   harbor_radius_nm: 20.0, shipyard: Some(["ship"]), category: EuropeanHub),
     // Nantes: anchorage at Paimboeuf / Loire estuary mouth near St-Nazaire
@@ -91,6 +91,6 @@
     // Slave-trade ports — stand-ins for the wider Gold Coast and Bight
     // of Benin networks. Modeled as transient entrepôts (the European
     // factors had small permanent staff but high ship turnover).
-    (name: "Elmina",          position: (4269.0, -745.0), faction: Holland, harbor_radius_nm: 15.0, shipyard: None, category: CaribbeanEntrepot), // Dutch since 1637
+    (name: "Elmina",          position: (4269.0, -745.0), faction: Netherlands, harbor_radius_nm: 15.0, shipyard: None, category: CaribbeanEntrepot), // Dutch since 1637
     (name: "Ouidah",          position: (4470.0, -666.0), faction: France,  harbor_radius_nm: 15.0, shipyard: None, category: CaribbeanEntrepot),
 ]

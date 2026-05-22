@@ -80,9 +80,9 @@ pub fn faction_growth_multiplier(faction: Faction) -> f32 {
     match faction {
         Faction::England => 1.00,
         Faction::France => 0.90,
-        Faction::Holland => 1.20,
+        Faction::Netherlands => 1.20,
         Faction::Spain => 0.50,
-        Faction::Pirate => 0.30,
+        Faction::Free => 0.30,
     }
 }
 
@@ -160,7 +160,7 @@ mod tests {
 
     #[test]
     fn seed_pirate_haven_is_small() {
-        let d = PortDemographics::seed(PortCategory::PirateHaven, Faction::Pirate);
+        let d = PortDemographics::seed(PortCategory::PirateHaven, Faction::Free);
         assert!(d.total() < 50);
     }
 
@@ -194,10 +194,10 @@ mod tests {
         // month — but the pool never *grows* without arrivals.
         // (Step 3.c adds transient supply from ship arrivals; stochastic
         // mortality is a Phase-4 refinement.)
-        let mut d = PortDemographics::seed(PortCategory::PirateHaven, Faction::Pirate);
+        let mut d = PortDemographics::seed(PortCategory::PirateHaven, Faction::Free);
         let start = d.total();
         for _ in 0..12 {
-            tick_monthly(&mut d, Faction::Pirate);
+            tick_monthly(&mut d, Faction::Free);
         }
         assert!(
             d.total() <= start,
