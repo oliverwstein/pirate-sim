@@ -445,3 +445,32 @@ Seeded ships are now first-class home-ported ships, consistent with shipyard-bui
 - bench_trade -- 730: fleet P/L +2.87M pesos.
 
 **Next:** 4.d — viz: draw ships in their faction colors; faint sight-lines between differing-faction ships within visual range. Uses `world.spatial.neighbors(...)` with a faction-filter closure.
+
+---
+
+## Step 4.d — Viz: faction colors + sight-lines (2026-05-22)
+
+**Scope:** First user-visible change of Step 4. Ships are drawn in their faction color; faint white lines connect Sailing ships of different factions that are within visual range.
+
+**Changes (sim-viz/src/main.rs):**
+- Imported `SPATIAL_CELL_NM` from `sim-core::spatial`.
+- New constants: `SHIP_SIGHT_RANGE_NM = SPATIAL_CELL_NM` (10 NM, matches the spatial cell and the 17C horizon-from-quarterdeck range); `SIGHT_LINE_COLOR = (0.85, 0.85, 0.9, 0.18)` (faint cool-white).
+- `draw_ships`:
+  - Ship triangle color is now `ship.faction.color_rgb()` per-ship (was hardcoded `SHIP_COLOR`).
+  - Between the path-drawing loop and the ship-triangle loop, added a new pass that — for each Sailing ship — calls `world.spatial.neighbors(pos, SHIP_SIGHT_RANGE_NM, |id| id != me && other.faction != mine)` and draws faint lines from this ship to each returned neighbor. Pairs are drawn twice (overlapping), accepted for visual simplicity.
+- Removed dead `SHIP_COLOR` constant.
+
+**Verification:**
+- `cargo build --workspace --tests --examples` clean.
+- `cargo test --workspace`: 116 passing.
+- `cargo clippy --workspace --all-targets -- -D warnings`: clean.
+- bench_trade -- 365: fleet P/L unchanged (+847k pesos) — viz changes don't touch headless behavior.
+
+**Step 4 complete.** Plumbing for factions + spatial queries is in place. No AI behavior change yet — the spatial index is consumed only by the viz layer at this point. Step 5 (pipeline refactor with read/mutate phases) and Step 6 (ShipPolicy + Pursue/Flee BT nodes) will be the first AI-side consumers.
+
+**Cross-cutting summary across Step 4 (a → d):**
+- `Faction` enum: `Holland → Netherlands`, `Pirate → Free`, `#[repr(u8)]`.
+- `Ship.faction: Faction` field; `Ship::seeded_at_port` constructor; seeded fleet is now home-ported and remits dividends (fleet P/L +27% at 365 days).
+- `crates/sim-core/src/spatial.rs`: 10 NM dynamic spatial hash with filter-closure `neighbors` API.
+- Viz: faction-colored ship triangles; faint sight-lines between differing-faction ships.
+- 6 new unit tests (116 total). All commits behavior-preserving in the headless bench except the home-port side-effect noted in 4.b.

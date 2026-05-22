@@ -1,6 +1,7 @@
 use macroquad::prelude::*;
 use sim_core::ai::ShipAI;
 use sim_core::ship::{Ship, ShipState};
+use sim_core::spatial::SPATIAL_CELL_NM;
 use sim_core::types::{Position, ShipId};
 use sim_core::world::World;
 use std::path::Path;
@@ -8,7 +9,12 @@ use std::path::Path;
 const SEA_COLOR: Color = Color::new(0.08, 0.20, 0.35, 1.0);
 const LAND_COLOR: Color = Color::new(0.15, 0.40, 0.12, 1.0);
 const COAST_COLOR: Color = Color::new(0.05, 0.15, 0.05, 0.9);
-const SHIP_COLOR: Color = Color::new(1.0, 0.9, 0.2, 1.0);
+/// Visual sighting range (NM) used to draw faint lines between
+/// differing-faction ships near each other. Matches the 17C horizon
+/// from a quarterdeck on a clear day; equals one spatial-hash cell.
+const SHIP_SIGHT_RANGE_NM: f32 = SPATIAL_CELL_NM;
+/// Stroke color/alpha for "I see a foreign sail" sight-lines.
+const SIGHT_LINE_COLOR: Color = Color::new(0.85, 0.85, 0.9, 0.18);
 const WIND_COLOR: Color = Color::new(0.5, 0.7, 1.0, 0.6);
 const PATH_COLOR: Color = Color::new(1.0, 0.9, 0.2, 0.5);
 const SELECT_COLOR: Color = Color::new(0.4, 0.9, 1.0, 1.0);
@@ -279,6 +285,37 @@ fn draw_ships(world: &World, camera: &Camera, selected_ship: Option<ShipId>) {
         }
     }
 
+    // Inter-faction sight lines: for each Sailing ship, draw a faint
+    // line to any *Sailing* neighbor of a different faction within
+    // visual range. Uses the world's dynamic spatial hash; each pair
+    // is drawn twice (overlapping exactly), which is visually
+    // indistinguishable from one stroke and avoids the cost of an
+    // ordered-key dedupe.
+    for (id, ship) in &world.ships {
+        if ship.state != ShipState::Sailing {
+            continue;
+        }
+        let mine = ship.faction;
+        let others = world
+            .spatial
+            .neighbors(ship.position, SHIP_SIGHT_RANGE_NM, |other_id| {
+                other_id != id
+                    && world
+                        .ships
+                        .get(other_id)
+                        .map(|o| o.faction != mine)
+                        .unwrap_or(false)
+            });
+        if others.is_empty() {
+            continue;
+        }
+        let from = camera.world_to_screen(ship.position);
+        for other_id in others {
+            let to = camera.world_to_screen(world.ships[other_id].position);
+            draw_line(from.x, from.y, to.x, to.y, 1.0, SIGHT_LINE_COLOR);
+        }
+    }
+
     for (id, ship) in &world.ships {
         let sp = camera.world_to_screen(ship.position);
         let size = 6.0;
@@ -295,7 +332,9 @@ fn draw_ships(world: &World, camera: &Camera, selected_ship: Option<ShipId>) {
             sp.y - size * 0.5 * (rad - 2.5).cos(),
         );
 
-        draw_triangle(tip, left, right, SHIP_COLOR);
+        let (r, g, b) = ship.faction.color_rgb();
+        let color = Color::new(r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, 1.0);
+        draw_triangle(tip, left, right, color);
 
         if selected_ship == Some(id) {
             draw_circle_lines(sp.x, sp.y, size * 2.2, 2.0, SELECT_COLOR);
