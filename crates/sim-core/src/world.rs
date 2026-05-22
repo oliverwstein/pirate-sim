@@ -15,6 +15,7 @@ use crate::port::{all_ports, Port};
 use crate::ship::{Ship, ShipState, ShipStats};
 use crate::shiptype::{self, ShipTypeRegistry};
 use crate::shipyard::{self, BuildOutcome};
+use crate::spatial::SpatialHash;
 use crate::types::{ShipId, SimDate};
 use crate::weather::WeatherSystem;
 
@@ -64,6 +65,12 @@ pub struct World {
     /// Diagnostic counter: total number of ships built by the
     /// shipyard system since `World::load`.
     pub ships_built: u32,
+    /// Dynamic spatial index over Sailing ships, rebuilt at the top
+    /// of every hourly tick. Read by viz (Step 4.d) and, in Step 6+,
+    /// by AI `SeePrey` / `Pursue` / `Flee` conditions. Docked /
+    /// Hiring / Anchored ships are intentionally not indexed —
+    /// inter-ship interaction at sea is the only consumer.
+    pub spatial: SpatialHash,
 }
 
 impl World {
@@ -114,6 +121,7 @@ impl World {
             silver_at_month_start: SecondaryMap::new(),
             last_month_avg_profit: 0.0,
             ships_built: 0,
+            spatial: SpatialHash::new(),
         }
     }
 
@@ -333,6 +341,19 @@ impl World {
             month,
             &self.navmesh,
         );
+
+        // Rebuild the spatial index over Sailing ships before any AI
+        // decisions are made this tick. Cheap (single pass, BTreeMap
+        // insertion); rebuilt-each-tick keeps the API stable as we
+        // move toward the Step-5 read/mutate phase split. Docked,
+        // Hiring, and Anchored ships are intentionally excluded —
+        // they are not candidates for at-sea interaction.
+        self.spatial.clear();
+        for (id, ship) in &self.ships {
+            if ship.state == ShipState::Sailing {
+                self.spatial.insert(id, ship.position);
+            }
+        }
 
         // Snapshot the live ship ids so we can iterate while mutating
         // both `ships` and `ship_ais`. SlotMap iteration order is not

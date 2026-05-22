@@ -15,6 +15,7 @@ pub mod port;
 pub mod ship;
 pub mod shiptype;
 pub mod shipyard;
+pub mod spatial;
 pub mod trade;
 pub mod types;
 pub mod weather;

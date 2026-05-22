@@ -417,3 +417,31 @@ Seeded ships are now first-class home-ported ships, consistent with shipyard-bui
 - bench_trade -- 365 and -- 730 ran cleanly.
 
 **Next:** 4.c — `spatial.rs` 10 NM dynamic spatial hash with filter-closure neighbor query, rebuilt each `tick_hourly_ai_and_physics`. No AI consumers yet.
+
+---
+
+## Step 4.c — Dynamic spatial hash (2026-05-22)
+
+**Scope:** New `crates/sim-core/src/spatial.rs` with a 10 NM uniform-grid spatial index, rebuilt over `Sailing` ships at the top of every hourly tick. No AI consumers yet (4.d viz will be the first).
+
+**Design choices:**
+- **Cell size 10 NM** matches typical 17C visibility from a quarterdeck on a clear day. A range query of `r` NM touches an `O((r/10)²)` cell block.
+- **Storage: `BTreeMap<(i32, i32), Vec<(ShipId, Position)>>`.** BTree gives deterministic iteration order (important for reproducible bench output). Each entry carries the exact position so `neighbors` can do precise Euclidean distance checks without an external lookup into `World::ships`.
+- **API: `neighbors(pos, range_nm, filter)`** where `filter: FnMut(ShipId) -> bool` is invoked AFTER the distance check — only on true neighbors. This is the agreed-on hook for faction-aware queries; callers express "ships within visual range that are not of my faction" without a second pass.
+- **Rebuilt each tick** at the top of `tick_hourly_ai_and_physics`. Cheap (single pass, ~tens of ships now, hundreds later). When Step 5's pipeline refactor lands, the rebuild moves into the Mutation Phase formally; the API stays put.
+- **Indexes only `Sailing` ships.** Docked / Hiring / Anchored ships aren't candidates for at-sea interaction; excluding them simplifies the Step 6 SeePrey condition (no false hits against ships safely in harbor).
+- **`#[derive(Default, Clone, Debug)]`** so `World` initialization stays uniform with the other sub-systems.
+
+**Changes:**
+- `crates/sim-core/src/spatial.rs` — new module: `SpatialHash`, `SPATIAL_CELL_NM = 10.0`, 6 unit tests covering empty, in-range vs out-of-range, true-Euclidean (not cell-membership), filter exclusion, clear, and negative-coord cell binning.
+- `crates/sim-core/src/lib.rs` — register `pub mod spatial;`.
+- `crates/sim-core/src/world.rs` — `pub spatial: SpatialHash` field on `World`; initialized in `World::load`; rebuilt at top of `tick_hourly_ai_and_physics` (Sailing ships only).
+
+**Verification:**
+- `cargo build --workspace --tests --examples` clean.
+- `cargo test --workspace`: 97 sim-core unit (was 91; +6 spatial) + 19 integration = **116 passing**.
+- `cargo clippy --workspace --all-targets -- -D warnings`: clean.
+- bench_trade -- 365: fleet P/L +847k pesos (identical to 4.b — no AI consumer yet).
+- bench_trade -- 730: fleet P/L +2.87M pesos.
+
+**Next:** 4.d — viz: draw ships in their faction colors; faint sight-lines between differing-faction ships within visual range. Uses `world.spatial.neighbors(...)` with a faction-filter closure.
