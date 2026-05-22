@@ -229,7 +229,12 @@ mod tests {
         for _ in 0..24 {
             tick_monthly(&mut d, Faction::England);
         }
-        assert!(d.total() > start / 4, "collapsed: {} → {}", start, d.total());
+        assert!(
+            d.total() > start / 4,
+            "collapsed: {} → {}",
+            start,
+            d.total()
+        );
         assert!(d.total() < start * 4, "exploded: {} → {}", start, d.total());
     }
 }

@@ -231,6 +231,7 @@ fn main() {
             ShipState::Sailing => "sailing",
             ShipState::Docked => "docked",
             ShipState::Anchored => "anchored",
+            ShipState::Hiring => "hiring",
         };
         let cargo: Vec<String> = ship
             .cargo
@@ -284,14 +285,7 @@ fn main() {
             "category", "ports", "seasoned", "unseasoned", "total"
         );
         for (cat, (n, s, u)) in &sums {
-            println!(
-                "  {:<20} {:>7} {:>12} {:>12} {:>12}",
-                cat,
-                n,
-                s,
-                u,
-                s + u
-            );
+            println!("  {:<20} {:>7} {:>12} {:>12} {:>12}", cat, n, s, u, s + u);
         }
     }
 
@@ -299,8 +293,7 @@ fn main() {
     // fleet (those are the shipyard's actual output, not what we
     // seeded for the demo).
     if world.ships.len() > n_ships {
-        let mut counts: std::collections::BTreeMap<&str, u32> =
-            std::collections::BTreeMap::new();
+        let mut counts: std::collections::BTreeMap<&str, u32> = std::collections::BTreeMap::new();
         for &id in ship_ids.iter().skip(n_ships) {
             let ship = &world.ships[id];
             let name = world.ship_types.get(ship.ship_type).name.as_str();

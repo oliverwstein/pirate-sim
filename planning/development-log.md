@@ -157,3 +157,35 @@ Phases 1 & 2 were implemented prior to the creation of this log; you can now exp
   - PirateHaven: 4 ports, 74 total
 
 **Next action:** Step 3.b — `Ship.crew_alive`, `ShipState::Hiring`, and the daily recruitment loop drawing from these pools.
+
+---
+
+## 2026-05-24 — Step 3.b: Hiring state + crew on ships
+
+**Goal:** Decouple shipyard build from crewing. A new hull leaves the yard with **no sailors** and sits in `ShipState::Hiring`, drawing from the local `PortDemographics` pool until it reaches a minimum crew. Only then does it transition to `Docked` and become visible to the AI.
+
+**Implementation:**
+- `ShipStats` got two derived helpers: `crew_typical() = crew as u16` and `crew_min() = ceil(crew * 0.4).max(2)`. No RON-schema change in 3.b; per-type minimums can be added later if calibration demands it.
+- `ShipState` gains a `Hiring` variant (doc-comment references crewing-plan §3). All exhaustive matches updated: `bench_trade` shows `"hiring"`; viz renders `HIRING (crew n/typical)` and counts hiring ships as docked for the lobby panel.
+- `Ship.crew_alive: u16`. `Ship::new` defaults to `stats.crew_typical()` (back-compat for seed ships & tests). `Ship::freshly_built` sets `state: Hiring, crew_alive: 0`.
+- `World.last_hire_day: u16`. New daily hiring tick in `World::tick` (gated on `date.day_of_year` transition, **before** path/AI work). For each `Hiring` ship: draw up to `HIRE_PER_DAY = 5` sailors from its owner port (seasoned-first, then unseasoned). Transition to `Docked` when `crew_alive >= crew_min()`.
+
+**Design decisions:**
+- **World-level hiring pass, not AI-driven (Option A).** Keeps `&mut demographics` out of `ShipBtContext` and fits the "AI is read-only" direction of Step 5's pipeline refactor. The AI never observes `Hiring` — by the time a ship is `Docked`, it's already crewed.
+- **Crew helpers derived, not stored.** Avoids touching ship_types.ron in 3.b. `crew_min = ceil(crew * 0.4).max(2)` mirrors crewing-plan §2's "skeleton crew" rule of thumb.
+- **`Ship::new` stays fully-crewed.** Tests and AI integration tests already construct ships ad-hoc; auto-Hiring them would have broken dozens of tests for no behavioral benefit. Only the *shipyard* path produces empty hulls — that's where the design intent lives.
+- **Flat 5 sailors/day, no faction multiplier yet.** 3.b is plumbing; faction-fill-rate, demand pressure, and sign-on bounties land in 3.c.
+- **Seasoned-first draw.** Crewing-plan §5 — ships prefer experienced hands; unseasoned only when seasoned dries up. Simpler than weighted sampling and matches historical hiring priority.
+
+**Considered alternatives:**
+- Hourly hiring with fractional accumulation: rejected. Once/day is simpler, matches the design doc's per-day rate, and avoids carrying a partial-sailor counter on each Hiring ship.
+- Drain unseasoned first (to preserve veterans): rejected. Captains historically wanted seasoned hands; "skim the cream" matches both the design and intuition.
+- Make `crew_min` an explicit RON field: deferred. Derive-and-tune now; promote to data if calibration needs per-type tuning.
+
+**Verification:**
+- `cargo build --workspace --tests --examples`: clean after adding `ShipState::Hiring` arms in viz and bench_trade.
+- `cargo test --workspace`: **102 passed** (+1 new shipyard test: `freshly_built_ship_starts_hiring_with_no_crew`).
+- `cargo clippy --workspace --all-targets -- -D warnings`: clean.
+- `bench_trade`: **2 bankrupt ships** (was 5). Legitimate behavior change — shipyard-built ships now spend their first few days hiring rather than immediately incurring debt by sailing, slightly damping the bankruptcy rate. Equilibrium mispricing metrics unchanged in shape. The "5 bankrupt" baseline is retired; "2 bankrupt" is the new Phase-3 baseline for Step 3.b.
+
+**Next action:** User review, then commit as "Step 3.b: Hiring state + crew on ships". After that, Step 3.c (wages, morale, discharge).

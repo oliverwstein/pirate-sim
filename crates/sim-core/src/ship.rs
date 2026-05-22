@@ -33,6 +33,20 @@ impl ShipStats {
         self.crew as f32 * 0.0018
     }
 
+    /// Minimum crew to safely put to sea. Derived as 40% of the
+    /// design complement until per-type minimums land in the RON.
+    /// See `planning/crewing-plan.md §2`.
+    pub fn crew_min(&self) -> u16 {
+        let m = (self.crew as f32 * 0.4).ceil() as u16;
+        m.max(2)
+    }
+
+    /// Design complement (`stats.crew` rendered as u16 for crew
+    /// arithmetic). Will become its own RON field in a later step.
+    pub fn crew_typical(&self) -> u16 {
+        self.crew as u16
+    }
+
     /// Estimated voyage time in days for a great-circle distance, used
     /// for AI reachability/provisioning decisions. The 0.55 factor
     /// derates `speed_typical` for tacking, calms, and storm slow-downs;
@@ -49,6 +63,11 @@ pub enum ShipState {
     Sailing,
     Docked,
     Anchored,
+    /// Freshly-built or freshly-discharged hull awaiting a crew.
+    /// World ticks daily and draws sailors from the home port's
+    /// `PortDemographics`; transitions to `Docked` when
+    /// `crew_alive >= stats.crew_min()`. See `planning/crewing-plan.md §3`.
+    Hiring,
 }
 
 /// Default starting silver (pesos) for a freshly-spawned merchant ship.
@@ -97,6 +116,11 @@ pub struct Ship {
     /// is what bills of exchange between merchant correspondents
     /// enabled.
     pub debt: f32,
+    /// Live head-count. Distinct from `stats.crew_typical()` (the
+    /// design complement). Ships need `>= stats.crew_min()` to put
+    /// to sea; provisions burn and effective speed scale with this
+    /// in Step 3.c. See `planning/crewing-plan.md`.
+    pub crew_alive: u16,
 }
 
 impl Ship {
@@ -116,6 +140,9 @@ impl Ship {
             starting_silver: STARTING_SILVER_PESOS,
             lifetime_dividends: 0.0,
             debt: 0.0,
+            // Test / seed-fleet ships start fully crewed; the Hiring
+            // loop is for shipyard-built hulls only.
+            crew_alive: stats.crew_typical(),
         }
     }
 
@@ -134,7 +161,9 @@ impl Ship {
             position,
             heading: 0.0,
             speed: 0.0,
-            state: ShipState::Docked,
+            // Built hulls start in Hiring — they need a crew before
+            // the AI's dock tree can do anything with them.
+            state: ShipState::Hiring,
             provisions: stats.provision_capacity,
             cargo: Cargo::new(),
             hull_fouling: 0.0,
@@ -144,6 +173,7 @@ impl Ship {
             starting_silver,
             lifetime_dividends: 0.0,
             debt: 0.0,
+            crew_alive: 0,
         }
     }
 

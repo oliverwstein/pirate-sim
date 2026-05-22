@@ -47,6 +47,9 @@ pub struct World {
     /// The month for which `markets` last received their monthly tick.
     /// Used to fire production exactly once per month transition.
     last_market_month: u8,
+    /// The day-of-year for which the hiring loop last ran. Used to
+    /// fire the daily Hiring tick exactly once per day transition.
+    last_hire_day: u16,
     /// Per-ship silver at the start of the current month. Keyed by
     /// `ShipId`. Used at the next month transition to compute monthly
     /// profit (silver delta), which feeds the shipyard "math pencils"
@@ -89,6 +92,7 @@ impl World {
 
         let date = SimDate::new(1680, 0, 1);
         let last_market_month = date.month();
+        let last_hire_day = date.day_of_year;
 
         Self {
             map,
@@ -106,6 +110,7 @@ impl World {
             ship_ais: SecondaryMap::new(),
             date,
             last_market_month,
+            last_hire_day,
             silver_at_month_start: SecondaryMap::new(),
             last_month_avg_profit: 0.0,
             ships_built: 0,
@@ -212,6 +217,56 @@ impl World {
             }
 
             self.last_market_month = month;
+        }
+
+        // Daily hiring tick. For every ship in `Hiring` state at its
+        // owner port, draw up to HIRE_PER_DAY sailors from the local
+        // `PortDemographics` (seasoned-first). When a ship reaches its
+        // `crew_min`, it transitions to `Docked` and the AI takes over.
+        // Sign-on bounties, faction multipliers, and demand pressure
+        // land in Step 3.c per planning/crewing-plan.md §5.
+        let today = self.date.day_of_year;
+        if today != self.last_hire_day {
+            const HIRE_PER_DAY: u16 = 5;
+            let ids: Vec<ShipId> = self.ships.keys().collect();
+            for id in ids {
+                let (port_idx, want, ship_type) = match self.ships.get(id) {
+                    Some(s) if s.state == ShipState::Hiring => {
+                        let port = match s.owner_port {
+                            Some(p) => p,
+                            None => continue,
+                        };
+                        let stats = self.ship_types.get(s.ship_type).stats.clone();
+                        let typical = stats.crew_typical();
+                        if s.crew_alive >= typical {
+                            (port, 0u16, s.ship_type)
+                        } else {
+                            (port, typical - s.crew_alive, s.ship_type)
+                        }
+                    }
+                    _ => continue,
+                };
+                let stats = &self.ship_types.get(ship_type).stats;
+                let cap = want.min(HIRE_PER_DAY);
+                let demo = match self.demographics.get_mut(port_idx) {
+                    Some(d) => d,
+                    None => continue,
+                };
+                // Seasoned-first draw, then unseasoned.
+                let from_seasoned = (demo.seasoned as u16).min(cap);
+                let remaining = cap - from_seasoned;
+                let from_unseasoned = (demo.unseasoned as u16).min(remaining);
+                let drawn = from_seasoned + from_unseasoned;
+                demo.seasoned -= from_seasoned as u32;
+                demo.unseasoned -= from_unseasoned as u32;
+                if let Some(s) = self.ships.get_mut(id) {
+                    s.crew_alive += drawn;
+                    if s.crew_alive >= stats.crew_min() {
+                        s.state = ShipState::Docked;
+                    }
+                }
+            }
+            self.last_hire_day = today;
         }
 
         let pathfind = PathfindContext::new(

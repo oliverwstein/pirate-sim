@@ -74,10 +74,7 @@ pub fn all_ports(ship_types: &ShipTypeRegistry) -> Vec<Port> {
 
 /// Parse a port catalog from a RON string. Each `shipyard` ship-type
 /// name is looked up in `ship_types`; an unknown name returns an error.
-pub fn from_ron_str(
-    s: &str,
-    ship_types: &ShipTypeRegistry,
-) -> Result<Vec<Port>, PortLoadError> {
+pub fn from_ron_str(s: &str, ship_types: &ShipTypeRegistry) -> Result<Vec<Port>, PortLoadError> {
     let records: Vec<PortRecord> = ron::from_str(s).map_err(PortLoadError::Ron)?;
     let mut ports = Vec::with_capacity(records.len());
     for r in records {

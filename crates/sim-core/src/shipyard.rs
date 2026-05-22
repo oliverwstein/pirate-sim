@@ -348,4 +348,17 @@ mod tests {
             ns_before - market.stockpile.get(ids::NAVAL_STORES) >= sloop.build_naval_stores - 1e-3
         );
     }
+
+    #[test]
+    fn freshly_built_ship_starts_hiring_with_no_crew() {
+        let goods = GoodsRegistry::starter();
+        let mut market = well_stocked_market();
+        let types = ShipTypeRegistry::starter();
+        let port = yard_port("Boston", &[st_ids::SLOOP]);
+        let (outcome, ship) = try_build(&port, 0, &mut market, &goods, &types, 2000.0);
+        assert!(matches!(outcome, BuildOutcome::Built { .. }));
+        let ship = ship.expect("ship");
+        assert_eq!(ship.state, crate::ship::ShipState::Hiring);
+        assert_eq!(ship.crew_alive, 0);
+    }
 }
