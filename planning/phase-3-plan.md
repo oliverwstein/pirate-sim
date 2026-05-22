@@ -265,10 +265,15 @@ data/
 > Step 6. The combat tick is hourly throughout (no sub-tick). See
 > `planning/development-log.md` 2026-05-22 for the decision record.
 
+**Progress (as of 2026-05-23):**
+- ✅ Step 1 — SlotMap migration (commit `05e62b6`)
+- ✅ Step 2 — RON extraction: goods + ship types (`b3dc793`), ports (`ce0219e`)
+- ⏭ Step 3 — Port demographics + crew on ships *(next)*
+
 1. **Generational Indices (SlotMap).** Swap `Vec<Ship>` and `Vec<ShipAI>` for `SlotMap<ShipId, _>`. Update internal indexers, viz selection, bench_trade. *Bench + tests unchanged.*
-2. **RON extraction.** Move `GoodsRegistry`, `ShipTypeRegistry`, and the port list into `data/*.ron` via `serde + ron`. Reserve a slot for `factions.ron`. *Bench + tests unchanged.*
+2. **RON extraction.** Move `GoodsRegistry`, `ShipTypeRegistry`, and the port list into `data/*.ron` via `serde + ron`. Reserve a slot for `factions.ron`. *Bench + tests unchanged.* **Loading order precedent:** registries with no dependencies first; downstream registries take upstream as `&` and resolve named references at load (e.g. port shipyard names → `ShipTypeId`). Apply the same pattern to factions in Step 4.
 3. **Port demographics + crew on ships.** Add the two-tier `PortDemographics` per the section above. Add `Ship.crew_alive: u16`, hired at launch, discharged at dock, lost to attrition at sea. Monthly tick: pool growth + mortality + maturation. Provisions burn rate scales with `crew_alive`; `effective_speed` gets an under/over-crew curve. `shipyard::try_build` requires `stats.crew_min` sailors. `bench_trade` prints crew + pool columns.
-4. **Factions & Dynamic Spatial Hash.** Five factions (Spain, England, France, Netherlands, Free); Relations Matrix; faction colors. `Ship.faction: FactionId`; `Port.faction: FactionId`. Dynamic spatial hash (10 NM cells). Viz draws ships in faction colors and faint sight-lines between ships of differing factions within visual range.
+4. **Factions & Dynamic Spatial Hash.** Five factions (Spain, England, France, Netherlands, Free); Relations Matrix; faction colors. `Ship.faction: FactionId`; `Port.faction: FactionId`. Dynamic spatial hash (10 NM cells). Viz draws ships in faction colors and faint sight-lines between ships of differing factions within visual range. **Includes renaming `Faction::Holland` → `Faction::Netherlands`** (kept under the old name through Steps 1–3 for back-compat with the existing enum).
 5. **The Pipeline Refactor (Double Buffering).** Rewrite `World::tick` into the `AI Phase → Resolution → Mutation → Cleanup` pipeline. Introduce `ShipCommand::Steer(Steering)` as the only command initially. `ShipBtContext` becomes strictly read-only re ships. *Behavior identical; bench + tests unchanged.*
 6. **The Chase (Maneuver AI).** Add `Ship.policy: ShipPolicy`. Add `Pursue` and `Flee` BT nodes. `SeePrey` condition consults spatial hash + relations + policy. Hardcoded scenario: spawn a pirate sloop near Tortuga. First visible Phase 3 behavior.
 7. **Gunnery & Damage Events.** Add `FireBroadside { attacker, target }` commands when within cannon range (~0.25 NM = 500 yd). Resolution emits `DamageEvent { hull, rigging, crew_killed }`. Hull and rigging integrity on `Ship`; rigging damage cuts `effective_speed`. Powder and shot are new Goods consumed per broadside. Ships can now be battered to a halt.
