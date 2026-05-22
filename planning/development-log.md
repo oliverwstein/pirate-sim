@@ -474,3 +474,24 @@ Seeded ships are now first-class home-ported ships, consistent with shipyard-bui
 - `crates/sim-core/src/spatial.rs`: 10 NM dynamic spatial hash with filter-closure `neighbors` API.
 - Viz: faction-colored ship triangles; faint sight-lines between differing-faction ships.
 - 6 new unit tests (116 total). All commits behavior-preserving in the headless bench except the home-port side-effect noted in 4.b.
+
+---
+
+## Step 5.a — Extract `execute_action` arms into named methods (2026-05-22)
+
+**Scope:** Pure cosmetic refactor per `planning/code-health-audit.md` §2. The 286-line `match` in `BtContext::execute_action` was extracted into 8 named methods on `ShipBtContext`. Behavior identical at the bench. Opens the door for 5.b (collapse `ShipAI::tick` to take a context) and 5.c (introduce `ShipCommand::Steer` + Resolution Phase) to land arm-by-arm in reviewable diffs.
+
+**Changes (`crates/sim-core/src/ai.rs`):**
+- The `impl BtContext for ShipBtContext` block's `execute_action` is now a one-line `match` dispatcher to `self.act_sail()`, `self.act_resupply()`, …, `self.act_divert_to_port()`.
+- 8 new methods on `impl<'a> ShipBtContext<'a>`: `act_sail`, `act_resupply`, `act_careen`, `act_undock`, `act_choose_destination`, `act_sell_all`, `act_buy_best`, `act_divert_to_port`. Each carries its original body verbatim (incl. comments) — no logic changes.
+- Secondary helper extractions suggested by the audit (`arrive_at_destination_harbor` inside `act_sail`; `outfit_draw_if_home` + `tramping_credit_if_needed` inside `act_buy_best`) are **deferred**: they would help readability further but are not needed for 5.b/5.c, and the diff is already large at 561-line +/-.
+
+**Verification:**
+- `cargo build --workspace --tests --examples` clean (first try — no borrow-checker drama).
+- `cargo test --workspace`: 116 passing.
+- `cargo clippy --workspace --all-targets -- -D warnings`: clean.
+- `bench_trade -- 365`: fleet P/L **+846,992 pesos — identical** to pre-5.a.
+
+**Atlantic-fleet calibration research** (background agent completed during 5.a): preserved in `~/.copilot/session-state/<id>/files/atlantic-fleet-numbers-1650-1720.md`. **Key takeaway for Step 10 calibration: target ~500 ships baseline for Caribbean basin ~1680, scaling to 800–1000 by 1720.** Current bench runs ~25 ships at 365 days — order-of-magnitude undershoot to be addressed in Step 10.
+
+**Next:** 5.b — promote `ShipBtContext` to a per-tick type owned by `World::tick_hourly_ai_and_physics`; reduce `ShipAI::tick` 8-arg signature to `pub fn tick(&mut self, ctx: &mut ShipBtContext<'_>)`. Drops the two `Option<&mut …>` legacy slots; test scaffolding migrates to real empty markets/goods.

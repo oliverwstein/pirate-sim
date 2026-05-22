@@ -312,293 +312,316 @@ impl<'a> ShipBtContext<'a> {
         };
         harbor.contains_pos(pf.land, self.ship.position)
     }
+
+    // ───────── BT action implementations ─────────
+    //
+    // One method per `ACT_*` id, dispatched from `execute_action`
+    // below. Extracted from the original 286-line `match` per
+    // `planning/code-health-audit.md` §2, ahead of Step 5.c's
+    // command-queue rewrite (which will change every arm's
+    // mutation pattern). Keeping each arm self-contained makes
+    // that subsequent diff reviewable arm-by-arm.
+
+    fn act_sail(&mut self) -> Status {
+        // Harbor-zone arrival: if we're inside the destination's
+        // harbor zone, transition to Docked immediately. The literal
+        // port coordinate may still be far away (e.g., Philadelphia
+        // up the Delaware) — that's fine.
+        if self.in_destination_harbor() {
+            let port_idx = self.nav.dest_port;
+            self.ship.dock();
+            *self.dock_action = DockAction::Idle;
+            self.nav.docked_at_port = port_idx;
+            self.nav.destination = None;
+            self.nav.dest_port = None;
+            self.nav.clear_path();
+            // Settle any outstanding chandler/freight debt at
+            // this port first — creditors come before owners.
+            // Fungible: it doesn't matter which port originally
+            // advanced the credit; the merchant network settles
+            // it via bills of exchange between correspondents.
+            if let (Some(idx), Some(markets)) = (port_idx, self.markets.as_deref_mut()) {
+                if idx < markets.len() {
+                    markets[idx].collect_debt(self.ship, HOME_PORT_FLOAT_SILVER);
+                }
+            }
+            // Home-port settlement: if this is the owner port,
+            // the supercargo books proceeds with the owners.
+            // Silver above the operating float is paid into
+            // the port treasury (dividend to shareholders);
+            // the ship keeps just enough to cover provisions
+            // and incidentals at the next port of call.
+            if let (Some(idx), Some(owner)) = (port_idx, self.ship.owner_port) {
+                if idx == owner {
+                    if let Some(markets) = self.markets.as_deref_mut() {
+                        if idx < markets.len() {
+                            let paid = markets[idx]
+                                .deposit_owner_profit(self.ship, HOME_PORT_FLOAT_SILVER);
+                            self.ship.lifetime_dividends += paid;
+                        }
+                    }
+                }
+            }
+            return Status::Success;
+        }
+
+        // Replan when our planned route has been exhausted but we're
+        // still nowhere near the destination. Without this, a ship
+        // that drifts/tacks past its last waypoint will dead-reckon
+        // straight toward the destination — through land, if any —
+        // and pin against the coast.
+        if self.nav.waypoints.is_empty() && self.nav.dest_port.is_some() {
+            if let Some(dest) = self.nav.destination {
+                if self.ship.position.distance(dest) > REPLAN_DISTANCE_NM {
+                    if let Some(idx) = self.nav.dest_port {
+                        self.replan_to_port(idx);
+                    }
+                }
+            }
+        }
+
+        let land = self.pathfind.map(|c| c.land);
+        if let Some(s) = self
+            .nav
+            .compute_steering(self.ship.position, self.stats, self.wind, land)
+        {
+            self.ship.set_steering(s.heading, s.speed);
+            Status::Running
+        } else if self.nav.dest_port.is_some()
+            && self.pathfind.is_some()
+            && !self.in_destination_harbor()
+        {
+            // We "arrived" at the path's last waypoint (the harbor
+            // anchor) but the ship's actual position is just outside
+            // the harbor cell set. Replan from here so the new path
+            // ends with the ship inside the harbor zone, rather than
+            // false-docking in open water (which is the canonical
+            // way ships used to get stuck near small-harbor ports
+            // like Amsterdam/Nantes).
+            if let Some(idx) = self.nav.dest_port {
+                self.replan_to_port(idx);
+            }
+            Status::Running
+        } else {
+            // Arrived at a free-form destination (no harbor zone).
+            self.ship.dock();
+            *self.dock_action = DockAction::Idle;
+            Status::Success
+        }
+    }
+
+    fn act_resupply(&mut self) -> Status {
+        *self.dock_action = DockAction::Resupplying;
+        let done = match (
+            self.nav.docked_at_port,
+            self.markets.as_deref_mut(),
+            self.goods,
+        ) {
+            (Some(idx), Some(markets), Some(goods)) if idx < markets.len() => self
+                .ship
+                .tick_resupply_at_market(self.stats, &mut markets[idx], goods),
+            // No market wired (test scenario, or unknown port) —
+            // fall back to free resupply so legacy tests pass.
+            _ => self.ship.tick_resupply(self.stats),
+        };
+        if done {
+            *self.dock_action = DockAction::Idle;
+            Status::Success
+        } else {
+            Status::Running
+        }
+    }
+
+    fn act_careen(&mut self) -> Status {
+        *self.dock_action = DockAction::Careening;
+        if self.ship.tick_careen() {
+            *self.dock_action = DockAction::Idle;
+            Status::Success
+        } else {
+            Status::Running
+        }
+    }
+
+    fn act_undock(&mut self) -> Status {
+        if self.nav.destination.is_some() {
+            self.ship.undock();
+            self.nav.docked_at_port = None;
+            *self.dock_action = DockAction::Idle;
+            Status::Success
+        } else {
+            *self.dock_action = DockAction::Idle;
+            Status::Failure
+        }
+    }
+
+    fn act_choose_destination(&mut self) -> Status {
+        if self.ports.is_empty() {
+            return Status::Failure;
+        }
+        let mut idx = (xorshift64(self.rng_state) as usize) % self.ports.len();
+        if self.ship.position.distance(self.ports[idx].position) < 20.0 {
+            idx = (idx + 1) % self.ports.len();
+        }
+        self.assign_destination_port(idx);
+        Status::Success
+    }
+
+    fn act_sell_all(&mut self) -> Status {
+        // Sell every ton of cargo we arrived with at the
+        // docked port's market. If markets/goods aren't wired
+        // (toy tests), this is a no-op success.
+        let (Some(idx), Some(markets), Some(goods)) = (
+            self.nav.docked_at_port,
+            self.markets.as_deref_mut(),
+            self.goods,
+        ) else {
+            return Status::Success;
+        };
+        if idx >= markets.len() {
+            return Status::Success;
+        }
+        let market = &mut markets[idx];
+        let entries: Vec<(crate::goods::GoodId, f32)> = self.ship.cargo.iter().collect();
+        for (gid, tons) in entries {
+            if tons > 0.0 {
+                // Best-effort: ignore "port out of silver" by
+                // selling whatever the port can afford. For
+                // v1 we just attempt the full amount; if the
+                // port can't pay, the cargo stays aboard and
+                // we'll try again on the next leg.
+                let _ = market.sell(self.ship, gid, tons, goods);
+            }
+        }
+        Status::Success
+    }
+
+    fn act_buy_best(&mut self) -> Status {
+        // Pick the best (good, dest) and load up. Sets the
+        // ship's destination as a side effect so ACT_UNDOCK
+        // has somewhere to go.
+        let (Some(idx), Some(markets), Some(goods)) = (
+            self.nav.docked_at_port,
+            self.markets.as_deref_mut(),
+            self.goods,
+        ) else {
+            return Status::Success;
+        };
+        if idx >= markets.len() {
+            return Status::Success;
+        }
+        // Reachability budget: assume we leave with a full
+        // provisions hold. The trade planner uses this to
+        // skip destinations we can't physically reach.
+        let daily = self.stats.daily_provision_consumption().max(1e-6);
+        let provision_budget_days = self.stats.provision_capacity / daily;
+        // Home bias: as the ship's strongbox swells above the
+        // operating float, increase its pull toward home. This
+        // models the supercargo's fiduciary duty to settle
+        // proceeds with the owners — a ship sitting on a fat
+        // purse won't keep chasing marginal arbitrage forever.
+        let home_bias = self.ship.owner_port.map(|home_idx| {
+            let surplus = (self.ship.silver - HOME_PORT_FLOAT_SILVER).max(0.0);
+            // Roughly: a ship sitting on +5k surplus pulls
+            // toward home with a 25 peso/ton bias, fully
+            // dominating ordinary arbitrage. The cap of 200
+            // ensures a flush ship will home-in even against
+            // the fattest opportunistic margin.
+            crate::trade::HomeBias {
+                home_port: home_idx,
+                bias_pesos_per_ton: (surplus / 200.0).min(200.0),
+            }
+        });
+        let plan = crate::trade::find_best_trade(
+            idx,
+            self.ports,
+            markets,
+            goods,
+            self.stats,
+            provision_budget_days,
+            home_bias,
+        );
+        let plan = match plan {
+            Some(p) => p,
+            None => return Status::Success,
+        };
+
+        // Buy as many tons as we can afford, that fit in the
+        // hold, and that the port can supply.
+        let market = &mut markets[idx];
+        let unit = market.buy_price(plan.good, goods).max(0.0001);
+        let cargo_room = self.stats.cargo_capacity_tons - self.ship.cargo.total_tons();
+
+        // Outfitting draw: if this is the owner port, top the
+        // ship's strongbox up from the port treasury before
+        // computing what we can afford. Historically the
+        // outbound cargo was paid for with capital drawn from
+        // the home-port owners, not from cash earned on prior
+        // voyages — those proceeds were settled on arrival.
+        if let Some(owner) = self.ship.owner_port {
+            if owner == idx {
+                let want_tons = cargo_room.min(market.stockpile.get(plan.good));
+                let target = unit * want_tons * OUTFIT_DRAW_MULTIPLE;
+                market.draw_for_outfit(self.ship, target, OUTFIT_PORT_FRACTION_CAP);
+            }
+        }
+
+        // Tramping / freight credit: at any other port, if we
+        // still can't load anything meaningful (too little
+        // silver for the hold space we have), take cargo on
+        // consignment from the local factor. Booked as debt;
+        // repaid out of the sale proceeds at the destination.
+        let want_tons = cargo_room.min(market.stockpile.get(plan.good));
+        let need_silver = unit * want_tons;
+        if self.ship.silver < need_silver
+            && self.ship.debt < crate::ship::MAX_SHIP_DEBT
+            && want_tons > 0.0
+        {
+            let shortfall = need_silver - self.ship.silver;
+            market.extend_credit(
+                self.ship,
+                shortfall,
+                TRAMP_PORT_FRACTION_CAP,
+                crate::ship::MAX_SHIP_DEBT,
+            );
+        }
+
+        let affordable = self.ship.silver / unit;
+        let in_stock = market.stockpile.get(plan.good);
+        let tons = cargo_room.min(affordable).min(in_stock).max(0.0);
+        if tons > 0.0 {
+            let _ = market.buy(self.ship, self.stats, plan.good, tons, goods);
+        }
+
+        // Always set the destination — even when the buy fell
+        // through (broke / no room) — so the ship still sails
+        // to the chosen port and tries selling/buying again.
+        self.assign_destination_port(plan.dest_port);
+        Status::Success
+    }
+
+    fn act_divert_to_port(&mut self) -> Status {
+        if let Some((nearest_idx, _)) = self.ports.iter().enumerate().min_by(|(_, a), (_, b)| {
+            let da = self.ship.position.distance(a.position);
+            let db = self.ship.position.distance(b.position);
+            da.partial_cmp(&db).unwrap()
+        }) {
+            self.assign_destination_port(nearest_idx);
+        }
+        Status::Success
+    }
 }
 
 impl<'a> BtContext for ShipBtContext<'a> {
     fn execute_action(&mut self, id: usize) -> Status {
         match id {
-            ACT_SAIL => {
-                // Harbor-zone arrival: if we're inside the destination's
-                // harbor zone, transition to Docked immediately. The literal
-                // port coordinate may still be far away (e.g., Philadelphia
-                // up the Delaware) — that's fine.
-                if self.in_destination_harbor() {
-                    let port_idx = self.nav.dest_port;
-                    self.ship.dock();
-                    *self.dock_action = DockAction::Idle;
-                    self.nav.docked_at_port = port_idx;
-                    self.nav.destination = None;
-                    self.nav.dest_port = None;
-                    self.nav.clear_path();
-                    // Settle any outstanding chandler/freight debt at
-                    // this port first — creditors come before owners.
-                    // Fungible: it doesn't matter which port originally
-                    // advanced the credit; the merchant network settles
-                    // it via bills of exchange between correspondents.
-                    if let (Some(idx), Some(markets)) = (port_idx, self.markets.as_deref_mut()) {
-                        if idx < markets.len() {
-                            markets[idx].collect_debt(self.ship, HOME_PORT_FLOAT_SILVER);
-                        }
-                    }
-                    // Home-port settlement: if this is the owner port,
-                    // the supercargo books proceeds with the owners.
-                    // Silver above the operating float is paid into
-                    // the port treasury (dividend to shareholders);
-                    // the ship keeps just enough to cover provisions
-                    // and incidentals at the next port of call.
-                    if let (Some(idx), Some(owner)) = (port_idx, self.ship.owner_port) {
-                        if idx == owner {
-                            if let Some(markets) = self.markets.as_deref_mut() {
-                                if idx < markets.len() {
-                                    let paid = markets[idx]
-                                        .deposit_owner_profit(self.ship, HOME_PORT_FLOAT_SILVER);
-                                    self.ship.lifetime_dividends += paid;
-                                }
-                            }
-                        }
-                    }
-                    return Status::Success;
-                }
-
-                // Replan when our planned route has been exhausted but we're
-                // still nowhere near the destination. Without this, a ship
-                // that drifts/tacks past its last waypoint will dead-reckon
-                // straight toward the destination — through land, if any —
-                // and pin against the coast.
-                if self.nav.waypoints.is_empty() && self.nav.dest_port.is_some() {
-                    if let Some(dest) = self.nav.destination {
-                        if self.ship.position.distance(dest) > REPLAN_DISTANCE_NM {
-                            if let Some(idx) = self.nav.dest_port {
-                                self.replan_to_port(idx);
-                            }
-                        }
-                    }
-                }
-
-                let land = self.pathfind.map(|c| c.land);
-                if let Some(s) =
-                    self.nav
-                        .compute_steering(self.ship.position, self.stats, self.wind, land)
-                {
-                    self.ship.set_steering(s.heading, s.speed);
-                    Status::Running
-                } else if self.nav.dest_port.is_some()
-                    && self.pathfind.is_some()
-                    && !self.in_destination_harbor()
-                {
-                    // We "arrived" at the path's last waypoint (the harbor
-                    // anchor) but the ship's actual position is just outside
-                    // the harbor cell set. Replan from here so the new path
-                    // ends with the ship inside the harbor zone, rather than
-                    // false-docking in open water (which is the canonical
-                    // way ships used to get stuck near small-harbor ports
-                    // like Amsterdam/Nantes).
-                    if let Some(idx) = self.nav.dest_port {
-                        self.replan_to_port(idx);
-                    }
-                    Status::Running
-                } else {
-                    // Arrived at a free-form destination (no harbor zone).
-                    self.ship.dock();
-                    *self.dock_action = DockAction::Idle;
-                    Status::Success
-                }
-            }
-            ACT_RESUPPLY => {
-                *self.dock_action = DockAction::Resupplying;
-                let done = match (
-                    self.nav.docked_at_port,
-                    self.markets.as_deref_mut(),
-                    self.goods,
-                ) {
-                    (Some(idx), Some(markets), Some(goods)) if idx < markets.len() => self
-                        .ship
-                        .tick_resupply_at_market(self.stats, &mut markets[idx], goods),
-                    // No market wired (test scenario, or unknown port) —
-                    // fall back to free resupply so legacy tests pass.
-                    _ => self.ship.tick_resupply(self.stats),
-                };
-                if done {
-                    *self.dock_action = DockAction::Idle;
-                    Status::Success
-                } else {
-                    Status::Running
-                }
-            }
-            ACT_CAREEN => {
-                *self.dock_action = DockAction::Careening;
-                if self.ship.tick_careen() {
-                    *self.dock_action = DockAction::Idle;
-                    Status::Success
-                } else {
-                    Status::Running
-                }
-            }
-            ACT_UNDOCK => {
-                if self.nav.destination.is_some() {
-                    self.ship.undock();
-                    self.nav.docked_at_port = None;
-                    *self.dock_action = DockAction::Idle;
-                    Status::Success
-                } else {
-                    *self.dock_action = DockAction::Idle;
-                    Status::Failure
-                }
-            }
-            ACT_CHOOSE_DESTINATION => {
-                if self.ports.is_empty() {
-                    return Status::Failure;
-                }
-                let mut idx = (xorshift64(self.rng_state) as usize) % self.ports.len();
-                if self.ship.position.distance(self.ports[idx].position) < 20.0 {
-                    idx = (idx + 1) % self.ports.len();
-                }
-                self.assign_destination_port(idx);
-                Status::Success
-            }
-            ACT_SELL_ALL => {
-                // Sell every ton of cargo we arrived with at the
-                // docked port's market. If markets/goods aren't wired
-                // (toy tests), this is a no-op success.
-                let (Some(idx), Some(markets), Some(goods)) = (
-                    self.nav.docked_at_port,
-                    self.markets.as_deref_mut(),
-                    self.goods,
-                ) else {
-                    return Status::Success;
-                };
-                if idx >= markets.len() {
-                    return Status::Success;
-                }
-                let market = &mut markets[idx];
-                let entries: Vec<(crate::goods::GoodId, f32)> = self.ship.cargo.iter().collect();
-                for (gid, tons) in entries {
-                    if tons > 0.0 {
-                        // Best-effort: ignore "port out of silver" by
-                        // selling whatever the port can afford. For
-                        // v1 we just attempt the full amount; if the
-                        // port can't pay, the cargo stays aboard and
-                        // we'll try again on the next leg.
-                        let _ = market.sell(self.ship, gid, tons, goods);
-                    }
-                }
-                Status::Success
-            }
-            ACT_BUY_BEST => {
-                // Pick the best (good, dest) and load up. Sets the
-                // ship's destination as a side effect so ACT_UNDOCK
-                // has somewhere to go.
-                let (Some(idx), Some(markets), Some(goods)) = (
-                    self.nav.docked_at_port,
-                    self.markets.as_deref_mut(),
-                    self.goods,
-                ) else {
-                    return Status::Success;
-                };
-                if idx >= markets.len() {
-                    return Status::Success;
-                }
-                // Reachability budget: assume we leave with a full
-                // provisions hold. The trade planner uses this to
-                // skip destinations we can't physically reach.
-                let daily = self.stats.daily_provision_consumption().max(1e-6);
-                let provision_budget_days = self.stats.provision_capacity / daily;
-                // Home bias: as the ship's strongbox swells above the
-                // operating float, increase its pull toward home. This
-                // models the supercargo's fiduciary duty to settle
-                // proceeds with the owners — a ship sitting on a fat
-                // purse won't keep chasing marginal arbitrage forever.
-                let home_bias = self.ship.owner_port.map(|home_idx| {
-                    let surplus = (self.ship.silver - HOME_PORT_FLOAT_SILVER).max(0.0);
-                    // Roughly: a ship sitting on +5k surplus pulls
-                    // toward home with a 25 peso/ton bias, fully
-                    // dominating ordinary arbitrage. The cap of 200
-                    // ensures a flush ship will home-in even against
-                    // the fattest opportunistic margin.
-                    crate::trade::HomeBias {
-                        home_port: home_idx,
-                        bias_pesos_per_ton: (surplus / 200.0).min(200.0),
-                    }
-                });
-                let plan = crate::trade::find_best_trade(
-                    idx,
-                    self.ports,
-                    markets,
-                    goods,
-                    self.stats,
-                    provision_budget_days,
-                    home_bias,
-                );
-                let plan = match plan {
-                    Some(p) => p,
-                    None => return Status::Success,
-                };
-
-                // Buy as many tons as we can afford, that fit in the
-                // hold, and that the port can supply.
-                let market = &mut markets[idx];
-                let unit = market.buy_price(plan.good, goods).max(0.0001);
-                let cargo_room = self.stats.cargo_capacity_tons - self.ship.cargo.total_tons();
-
-                // Outfitting draw: if this is the owner port, top the
-                // ship's strongbox up from the port treasury before
-                // computing what we can afford. Historically the
-                // outbound cargo was paid for with capital drawn from
-                // the home-port owners, not from cash earned on prior
-                // voyages — those proceeds were settled on arrival.
-                if let Some(owner) = self.ship.owner_port {
-                    if owner == idx {
-                        let want_tons = cargo_room.min(market.stockpile.get(plan.good));
-                        let target = unit * want_tons * OUTFIT_DRAW_MULTIPLE;
-                        market.draw_for_outfit(self.ship, target, OUTFIT_PORT_FRACTION_CAP);
-                    }
-                }
-
-                // Tramping / freight credit: at any other port, if we
-                // still can't load anything meaningful (too little
-                // silver for the hold space we have), take cargo on
-                // consignment from the local factor. Booked as debt;
-                // repaid out of the sale proceeds at the destination.
-                let want_tons = cargo_room.min(market.stockpile.get(plan.good));
-                let need_silver = unit * want_tons;
-                if self.ship.silver < need_silver
-                    && self.ship.debt < crate::ship::MAX_SHIP_DEBT
-                    && want_tons > 0.0
-                {
-                    let shortfall = need_silver - self.ship.silver;
-                    market.extend_credit(
-                        self.ship,
-                        shortfall,
-                        TRAMP_PORT_FRACTION_CAP,
-                        crate::ship::MAX_SHIP_DEBT,
-                    );
-                }
-
-                let affordable = self.ship.silver / unit;
-                let in_stock = market.stockpile.get(plan.good);
-                let tons = cargo_room.min(affordable).min(in_stock).max(0.0);
-                if tons > 0.0 {
-                    let _ = market.buy(self.ship, self.stats, plan.good, tons, goods);
-                }
-
-                // Always set the destination — even when the buy fell
-                // through (broke / no room) — so the ship still sails
-                // to the chosen port and tries selling/buying again.
-                self.assign_destination_port(plan.dest_port);
-                Status::Success
-            }
-            ACT_DIVERT_TO_PORT => {
-                if let Some((nearest_idx, _)) =
-                    self.ports.iter().enumerate().min_by(|(_, a), (_, b)| {
-                        let da = self.ship.position.distance(a.position);
-                        let db = self.ship.position.distance(b.position);
-                        da.partial_cmp(&db).unwrap()
-                    })
-                {
-                    self.assign_destination_port(nearest_idx);
-                }
-                Status::Success
-            }
+            ACT_SAIL => self.act_sail(),
+            ACT_RESUPPLY => self.act_resupply(),
+            ACT_CAREEN => self.act_careen(),
+            ACT_UNDOCK => self.act_undock(),
+            ACT_CHOOSE_DESTINATION => self.act_choose_destination(),
+            ACT_SELL_ALL => self.act_sell_all(),
+            ACT_BUY_BEST => self.act_buy_best(),
+            ACT_DIVERT_TO_PORT => self.act_divert_to_port(),
             _ => Status::Failure,
         }
     }
