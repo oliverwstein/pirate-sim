@@ -123,6 +123,12 @@ pub struct Ship {
     /// to sea; provisions burn and effective speed scale with this
     /// in Step 3.c. See `planning/crewing-plan.md`.
     pub crew_alive: u16,
+    /// Wages accrued to the crew but not yet paid. Accrues while at
+    /// sea at `crew_alive * WAGE_PESOS_PER_MAN_MONTH / (30 * 24)`
+    /// per hour; paid out of `Ship.silver` into the destination
+    /// port's market silver on each dock visit. See
+    /// `planning/crewing-plan.md §6`.
+    pub wages_owed_pesos: f32,
 }
 
 impl Ship {
@@ -145,6 +151,7 @@ impl Ship {
             // Test / seed-fleet ships start fully crewed; the Hiring
             // loop is for shipyard-built hulls only.
             crew_alive: stats.crew_typical(),
+            wages_owed_pesos: 0.0,
         }
     }
 
@@ -176,6 +183,7 @@ impl Ship {
             lifetime_dividends: 0.0,
             debt: 0.0,
             crew_alive: 0,
+            wages_owed_pesos: 0.0,
         }
     }
 
@@ -383,6 +391,23 @@ const RESUPPLY_RATE_PER_HOUR: f32 = 0.5;
 /// Fouling points removed per hour while careening at a port.
 const CAREEN_RATE_PER_HOUR: f32 = 3.0;
 
+/// Monthly wage per crewman, pesos. Historical reference: an ordinary
+/// English seaman c. 1670–1680 earned ~15–25 shillings/month, with a
+/// peso worth ~4–5 shillings — giving a baseline of roughly 3 pesos/
+/// month. We use 3.0 as the peacetime baseline and add a ~30% Caribbean
+/// tropical premium (yellow-fever, hurricane, scurvy risk) for ~4.0
+/// pesos/man/month. Dutch and Spanish merchant rates were in the same
+/// order of magnitude (2–3 and 4–8 pesos respectively). See
+/// `planning/crewing-plan.md §6.1`; calibration in 3.d may revisit.
+/// Faction-conditional rates (privateer/pirate share systems, Navy
+/// back-pay) land in 3.c.3 or 3.d.
+pub const WAGE_PESOS_PER_MAN_MONTH: f32 = 4.0;
+
+/// Sign-on bounty paid per recruit at hire, in pesos. One month's
+/// wage per crewing-plan §6.2 — historical contracts paid a month
+/// up front to seal the enlistment.
+pub const SIGN_ON_BOUNTY_PESOS: f32 = WAGE_PESOS_PER_MAN_MONTH;
+
 /// Maximum outstanding chandler/factor debt a single ship can
 /// accumulate before further credit is refused. Sized to cover a
 /// few hold-fillings of cheap cargo plus a season's provisions.
@@ -500,6 +525,21 @@ mod tests {
             expected_daily,
             consumed
         );
+    }
+
+    #[test]
+    fn fresh_ship_has_zero_wages_owed() {
+        let ship = Ship::new(Position::ZERO, ShipState::Sailing);
+        assert_eq!(ship.wages_owed_pesos, 0.0);
+        let stats = ShipStats::sloop();
+        let built = Ship::freshly_built(
+            Position::ZERO,
+            0,
+            1000.0,
+            crate::shiptype::ids::SLOOP,
+            &stats,
+        );
+        assert_eq!(built.wages_owed_pesos, 0.0);
     }
 
     #[test]

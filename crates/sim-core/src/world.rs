@@ -245,7 +245,7 @@ impl World {
         const HIRE_PER_DAY: u16 = 5;
         let ids: Vec<ShipId> = self.ships.keys().collect();
         for id in ids {
-            let (port_idx, want, ship_type) = match self.ships.get(id) {
+            let (port_idx, want, ship_type, ship_silver) = match self.ships.get(id) {
                 Some(s) if s.state == ShipState::Hiring => {
                     let port = match s.owner_port {
                         Some(p) => p,
@@ -254,15 +254,22 @@ impl World {
                     let stats = self.ship_types.get(s.ship_type).stats.clone();
                     let typical = stats.crew_typical();
                     if s.crew_alive >= typical {
-                        (port, 0u16, s.ship_type)
+                        (port, 0u16, s.ship_type, s.silver)
                     } else {
-                        (port, typical - s.crew_alive, s.ship_type)
+                        (port, typical - s.crew_alive, s.ship_type, s.silver)
                     }
                 }
                 _ => continue,
             };
             let stats = &self.ship_types.get(ship_type).stats;
             let cap = want.min(HIRE_PER_DAY);
+            // Sign-on bounty cap: each sailor costs SIGN_ON_BOUNTY_PESOS,
+            // debited from ship.silver (crewing-plan §6.2). If the ship
+            // can't afford the full draw, hire fewer this day.
+            let affordable = (ship_silver / crate::ship::SIGN_ON_BOUNTY_PESOS)
+                .floor()
+                .max(0.0) as u16;
+            let cap = cap.min(affordable);
             let demo = match self.demographics.get_mut(port_idx) {
                 Some(d) => d,
                 None => continue,
@@ -274,11 +281,18 @@ impl World {
             let drawn = from_seasoned + from_unseasoned;
             demo.seasoned -= from_seasoned as u32;
             demo.unseasoned -= from_unseasoned as u32;
+            let bounty = drawn as f32 * crate::ship::SIGN_ON_BOUNTY_PESOS;
             if let Some(s) = self.ships.get_mut(id) {
                 s.crew_alive += drawn;
+                s.silver -= bounty;
                 if s.crew_alive >= stats.crew_min() {
                     s.state = ShipState::Docked;
                 }
+            }
+            // Bounty flows into the port economy (sailors spend it
+            // immediately on grog and supplies).
+            if let Some(market) = self.markets.get_mut(port_idx) {
+                market.silver += bounty;
             }
         }
         self.last_hire_day = today;
@@ -334,6 +348,34 @@ impl World {
 
             // Resource consumption
             ship.tick_resources(&ship_stats);
+
+            // Wages: accrue while at sea, pay out into the port's
+            // market silver while docked. See crewing-plan §6 / §3.3.
+            // Wage payout flows from ship.silver to the docked port's
+            // PortMarket.silver (sailors immediately spend pay on grog
+            // and supplies — closed-economy property preserved).
+            match ship.state {
+                ShipState::Sailing => {
+                    let hourly = (ship.crew_alive as f32) * crate::ship::WAGE_PESOS_PER_MAN_MONTH
+                        / (30.0 * 24.0);
+                    ship.wages_owed_pesos += hourly;
+                }
+                ShipState::Docked => {
+                    if ship.wages_owed_pesos > 0.0 {
+                        if let Some(port_idx) = ai.nav.docked_at_port {
+                            let pay = ship.wages_owed_pesos.min(ship.silver.max(0.0));
+                            if pay > 0.0 {
+                                ship.silver -= pay;
+                                ship.wages_owed_pesos -= pay;
+                                if let Some(market) = self.markets.get_mut(port_idx) {
+                                    market.silver += pay;
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
 
             if ship.state != ShipState::Sailing {
                 continue;

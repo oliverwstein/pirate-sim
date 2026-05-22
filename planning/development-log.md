@@ -246,3 +246,40 @@ Phases 1 & 2 were implemented prior to the creation of this log; you can now exp
 - Finding #3 (`ShipAI::tick` 8-arg sig) — free with Step 5; no standalone work.
 
 **Next action:** Step 3.c.2 — wages accrual + sign-on bounty + discharge on dock (discharged wages flow into the port's `PortMarket.silver`).
+
+---
+
+## 2026-05-24 — Step 3.c.2: wages accrual + sign-on bounty + port-silver flow
+
+**Goal:** Close the sailor-side money loop. Crew now cost money at hire (sign-on bounty) and over time (running wages), and that silver flows into the port economy when paid — preserving the closed-economy property while making crew an actual operating expense.
+
+**Decision: deferred discharge.** After web research, historical 17C merchant practice was to **keep trained crew aboard for the duration of a voyage** (turnaround 2–10 days; shore leave hours-to-days, supervised; wholesale discharge only at voyage end / refit / lay-up). The crewing-plan §3.4 spec ("discharge on every dock arrival") is too aggressive for our continuously-trading merchant AI — it would dump and re-hire dozens of crew per ship per month. Discharge will be wired later, gated on a refit / long-dwell trigger that proxies "end of voyage". User confirmed conservative scope for 3.c.2.
+
+**Implementation:**
+- `Ship.wages_owed_pesos: f32`, initialized 0.0 in both constructors.
+- `pub const WAGE_PESOS_PER_MAN_MONTH: f32 = 4.0` — **corrected** from the crewing-plan §6.1 figure of 1.3 pesos. The spec had a peso-to-shilling conversion off by ~4x (a peso was 4–5 shillings, not 22). Historical English ordinary-seaman: 15–25 sh/mo ≈ 3–5 pesos/mo; with a ~30% Caribbean tropical premium, the baseline is ~4 pesos. Dutch (2–3) and Spanish (4–8) ranges bracket this. `SIGN_ON_BOUNTY_PESOS = WAGE_PESOS_PER_MAN_MONTH` (one month's wage per recruit per §6.2). Faction-conditional rates (privateer/pirate share systems) deferred.
+- **Sign-on bounty** (in `tick_daily_hiring`):
+  - `affordable_draw = floor(ship.silver / SIGN_ON_BOUNTY_PESOS)`. Hire cap = min(typical-gap, HIRE_PER_DAY, affordable_draw, pool_available).
+  - On hire: ship.silver -= drawn * bounty; port market.silver += drawn * bounty.
+- **Wages accrual** (in `tick_hourly_ai_and_physics`, post-AI-tick, before physics):
+  - Sailing: `wages_owed_pesos += crew_alive * WAGE / (30*24)` per hour.
+  - Docked: pay min(wages_owed, ship.silver) into the docked port's market silver via `ai.nav.docked_at_port`. Unpaid portion stays on the ship (will weight Morale in 3.c.3).
+- New ship test: `fresh_ship_has_zero_wages_owed`.
+
+**Design decisions:**
+- **Sign-on bounty flows to port silver, symmetric with wage payout.** User direction. Both events represent sailors immediately spending their cash ashore. Keeps total system silver conserved.
+- **Wage payout on every Docked-state hour, not just on the dock-transition tick.** Simpler and idempotent — if the port market is full, the payout still happens; if the ship's silver is short, only what's affordable is paid. Avoids needing to track a "previous state" per ship.
+- **Bounty cap by silver, not credit.** An undercapitalized ship hires *fewer* sailors per day instead of going into debt to hire them. Matches the §3.2 footnote: "If the ship cannot afford the bounty, hiring stalls — visible in viz, fixable by the captain selling cargo or borrowing from the home port treasury (mechanism added in Step 9)."
+- **`max(0.0)` on ship.silver in the payout calculation.** Defensive against negative silver from other systems (e.g., debt-mode accounting). Wages can't make a positive payment from a negative balance.
+
+**Considered alternatives:**
+- Pay wages on the dock-arrival transition tick only: rejected — needs prev-state tracking and is no simpler.
+- Have sign-on bounty go into the demographics pool itself as a stat: rejected — pool tracks sailor head-counts, not pesos. Port market silver is the established place for port-side money.
+- Faction-rated wage table now: deferred to 3.c.3 alongside privateer/pirate share systems.
+
+**Verification:**
+- `cargo test --workspace`: **105 passed** (+1 new).
+- `cargo clippy --workspace --all-targets -- -D warnings`: clean.
+- `bench_trade`: 2 bankrupt (Phase-3 baseline preserved). Equilibrium deltas unchanged in shape. Wage flows are real but small relative to cargo silver: ~25 crew × 4.0 peso × 2 months ≈ 200 pesos/ship transferred to port markets over the 60-day run. Sustainability check: wages remain ~20–30% of typical voyage revenue, leaving healthy margin.
+
+**Next action:** 3.c.3 — morale field + hourly modifiers per §8. Morale will read provisions_days_remaining, wages_owed, and gates on damage events (the damage hooks are stubs until Step 7). Most effects are inert until Step 9 mutiny; this step lays the channel.
