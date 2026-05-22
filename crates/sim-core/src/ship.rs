@@ -27,8 +27,10 @@ impl ShipStats {
         }
     }
 
-    /// Daily provision consumption in tons (based on crew size).
-    /// Historical: ~4 lbs/man/day total food = 0.0018 tons/man/day.
+    /// Daily provision consumption in tons for a ship of design
+    /// crew complement. Historical: ~4 lbs/man/day total food =
+    /// 0.0018 tons/man/day. Use `Ship::daily_provision_burn` for
+    /// the *actual* current burn rate (scales with `crew_alive`).
     pub fn daily_provision_consumption(&self) -> f32 {
         self.crew as f32 * 0.0018
     }
@@ -209,9 +211,10 @@ impl Ship {
     /// `_stats` and `_wind` are kept in the signature for API compatibility
     /// and future use (e.g., gust gusts overriding command), but the speed
     /// model is now driven by the navigator via `set_steering`.
-    pub fn effective_speed(&self, _stats: &ShipStats, _wind: &WindVector) -> f32 {
+    pub fn effective_speed(&self, stats: &ShipStats, _wind: &WindVector) -> f32 {
         let fouling_penalty = 1.0 - self.hull_fouling * 0.003;
-        self.speed * fouling_penalty
+        let crew_mult = self.crew_speed_multiplier(stats);
+        self.speed * fouling_penalty * crew_mult
     }
 
     /// Advance position by one time step. Returns new position (doesn't apply it).
@@ -229,12 +232,49 @@ impl Ship {
         self.position + Position::new(dx, dy)
     }
 
+    /// Actual current daily provision burn in tons, scaled by
+    /// `crew_alive`. See `planning/crewing-plan.md §7.2`.
+    pub fn daily_provision_burn(&self) -> f32 {
+        self.crew_alive as f32 * 0.0018
+    }
+
+    /// Crew-driven speed multiplier in `[0.0, 1.0]`. See
+    /// `planning/crewing-plan.md §7.1`. Piecewise: below `crew_min`
+    /// the ship cannot sail (0.0); at `crew_min` it sails at 60% of
+    /// rigged speed; at 60% of `crew_typical` it reaches 84%; at
+    /// `crew_typical` it reaches 100%; overcrewing does not boost
+    /// speed (capped at 1.0).
+    ///
+    /// Note: the spec text in §7.1 had an internal inconsistency
+    /// between the formula (which yielded 1.0 at ratio=0.6) and the
+    /// "60% → 84%" annotation. We implement the annotation; calibration
+    /// in 3.d can revisit.
+    pub fn crew_speed_multiplier(&self, stats: &ShipStats) -> f32 {
+        let typical = stats.crew_typical().max(1) as f32;
+        let min = stats.crew_min();
+        if self.crew_alive < min {
+            return 0.0;
+        }
+        let ratio = (self.crew_alive as f32 / typical).min(1.0);
+        let min_ratio = min as f32 / typical;
+        if ratio <= 0.6 {
+            // Lerp 0.60 → 0.84 over [min_ratio, 0.6].
+            let span = (0.6 - min_ratio).max(1e-6);
+            let t = (ratio - min_ratio) / span;
+            0.60 + 0.24 * t
+        } else {
+            // Lerp 0.84 → 1.00 over [0.6, 1.0].
+            let t = (ratio - 0.6) / 0.4;
+            0.84 + 0.16 * t
+        }
+    }
+
     /// Consume provisions and accumulate fouling for one hour.
     /// Called by world tick. Returns true if provisions are exhausted.
-    pub fn tick_resources(&mut self, stats: &ShipStats) -> bool {
+    pub fn tick_resources(&mut self, _stats: &ShipStats) -> bool {
         // TODO: provisions should only be consumed while sailing. Likewise, a ship should not accumulate fouling while careened, and should accumulate more while docked or anchored than while sailing.
-        // Provision consumption: per hour = daily / 24
-        let hourly_consumption = stats.daily_provision_consumption() / 24.0;
+        // Provision consumption: per hour = daily / 24, scaled by crew_alive.
+        let hourly_consumption = self.daily_provision_burn() / 24.0;
         self.provisions = (self.provisions - hourly_consumption).max(0.0);
 
         // Hull fouling: accumulates ~1 point per 5 days in tropics
@@ -325,9 +365,10 @@ impl Ship {
         self.hull_fouling <= 0.0
     }
 
-    /// Days of provisions remaining at current consumption rate.
-    pub fn provisions_days_remaining(&self, stats: &ShipStats) -> f32 {
-        let daily = stats.daily_provision_consumption();
+    /// Days of provisions remaining at current consumption rate
+    /// (scaled by `crew_alive`).
+    pub fn provisions_days_remaining(&self, _stats: &ShipStats) -> f32 {
+        let daily = self.daily_provision_burn();
         if daily > 0.0 {
             self.provisions / daily
         } else {
@@ -459,6 +500,46 @@ mod tests {
             expected_daily,
             consumed
         );
+    }
+
+    #[test]
+    fn crew_speed_multiplier_piecewise() {
+        let stats = ShipStats::sloop();
+        let typical = stats.crew_typical(); // 25
+        let min = stats.crew_min(); // 10
+        let mut ship = Ship::new(Position::ZERO, ShipState::Sailing);
+
+        // Below min: zero.
+        ship.crew_alive = min - 1;
+        assert_eq!(ship.crew_speed_multiplier(&stats), 0.0);
+
+        // At min: 60%.
+        ship.crew_alive = min;
+        assert!((ship.crew_speed_multiplier(&stats) - 0.60).abs() < 1e-3);
+
+        // At 60% of typical: 84%.
+        ship.crew_alive = (typical as f32 * 0.6) as u16;
+        assert!((ship.crew_speed_multiplier(&stats) - 0.84).abs() < 1e-2);
+
+        // At typical: 100%.
+        ship.crew_alive = typical;
+        assert!((ship.crew_speed_multiplier(&stats) - 1.00).abs() < 1e-3);
+
+        // Overcrew: still 100%.
+        ship.crew_alive = typical + 20;
+        assert!((ship.crew_speed_multiplier(&stats) - 1.00).abs() < 1e-3);
+    }
+
+    #[test]
+    fn provision_burn_scales_with_crew_alive() {
+        let mut ship = Ship::new(Position::ZERO, ShipState::Sailing);
+        ship.crew_alive = 20;
+        let full = ship.daily_provision_burn();
+        ship.crew_alive = 10;
+        let half = ship.daily_provision_burn();
+        assert!((half * 2.0 - full).abs() < 1e-3);
+        ship.crew_alive = 0;
+        assert_eq!(ship.daily_provision_burn(), 0.0);
     }
 
     #[test]

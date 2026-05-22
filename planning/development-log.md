@@ -189,3 +189,29 @@ Phases 1 & 2 were implemented prior to the creation of this log; you can now exp
 - `bench_trade`: **2 bankrupt ships** (was 5). Legitimate behavior change — shipyard-built ships now spend their first few days hiring rather than immediately incurring debt by sailing, slightly damping the bankruptcy rate. Equilibrium mispricing metrics unchanged in shape. The "5 bankrupt" baseline is retired; "2 bankrupt" is the new Phase-3 baseline for Step 3.b.
 
 **Next action:** User review, then commit as "Step 3.b: Hiring state + crew on ships". After that, Step 3.c (wages, morale, discharge).
+
+---
+
+## 2026-05-24 — Step 3.c.1: provisions burn & effective speed scale with crew_alive
+
+**Goal:** Make the two "physical" crew effects from crewing-plan §7 actually do something — provisions burn (§7.2) and effective speed (§7.1) — without yet touching wages or morale.
+
+**Implementation:**
+- `Ship::daily_provision_burn(&self) -> f32` returns `crew_alive * 0.0018 tons/day`. `tick_resources` and `provisions_days_remaining` switched to this; the original `ShipStats::daily_provision_consumption` is retained as a "design burn" reference but is no longer called by the live tick.
+- `Ship::crew_speed_multiplier(&self, stats) -> f32` implements the piecewise curve: below `crew_min` → 0.0; at `crew_min` → 0.60; at 0.6 of `crew_typical` → 0.84; at `crew_typical` → 1.00; overcrew capped at 1.00. Multiplied into `effective_speed`.
+- New unit tests: `crew_speed_multiplier_piecewise`, `provision_burn_scales_with_crew_alive`.
+
+**Design decisions:**
+- **Implement the §7.1 annotation, not the formula.** The spec text contradicts itself: the formula `0.6 + 0.4 * (ratio - min_ratio) / (0.6 - min_ratio)` yields 1.0 at ratio=0.6, but the annotation says "60% → 84%". The annotation is internally consistent (continuous, monotone 60→84→100); the formula's other branch starts at 0.84 which only meets the first branch if the first branch ends at 0.84. So we lerp 0.60→0.84 over `[min_ratio, 0.6]` and 0.84→1.00 over `[0.6, 1.0]`. Calibration (3.d) can revisit.
+- **Keep `ShipStats::daily_provision_consumption`** rather than delete. Other callers (e.g., `equilibrium.rs`, AI planning lookahead) may want the design-spec burn rate for forecasting "if I had a full crew, how long would my provisions last?". The clear method name (`Ship::daily_provision_burn` vs `ShipStats::daily_provision_consumption`) keeps the distinction visible.
+
+**Considered alternatives:**
+- Delete the ShipStats helper entirely: rejected — `crates/sim-core/src/equilibrium.rs` doesn't currently call it, but the AI's voyage-cost estimate at `estimated_voyage_days` uses `speed_typical * 0.55`; if a future planner needs design-burn for ETA-based provisioning checks, the helper is the right thing to call. Marginal API surface, real conceptual distinction.
+- Make crew curve discontinuous (spec formula literally): rejected — produces a speed jump (sudden drop from 1.0 to 0.84) at exactly the band boundary, which is calibration-hostile.
+
+**Verification:**
+- `cargo test --workspace`: **104 passed** (+2 new in ship::tests).
+- `cargo clippy --workspace --all-targets -- -D warnings`: clean.
+- `bench_trade`: identical Phase-3 baseline (2 bankrupt). Expected: seeded ships start fully crewed, so the crew multiplier is exactly 1.0 and burn rate is unchanged. Shipyard-built ships sail at 60% speed with `crew_min` crew until further hiring lands in 3.c.2 — small enough volume in the 60-day window not to move the verdict.
+
+**Next action:** 3.c.2 — wages, sign-on bounty, discharge (with paid wages flowing into the destination port's `PortMarket.silver` per user direction).
