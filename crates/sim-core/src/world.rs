@@ -1,18 +1,20 @@
 use std::path::Path;
 
+use slotmap::{SecondaryMap, SlotMap};
+
 use crate::ai::ShipAI;
 use crate::coastline::{CoastlineMap, LandMesh};
 use crate::goods::GoodsRegistry;
 use crate::harbor::HarborMap;
 use crate::map::MapSystem;
-use crate::market::{PortMarket, archetype_for};
+use crate::market::{archetype_for, PortMarket};
 use crate::navmesh::Navmesh;
 use crate::pathfind::PathfindContext;
-use crate::port::{Port, all_ports};
+use crate::port::{all_ports, Port};
 use crate::ship::{Ship, ShipState, ShipStats};
 use crate::shiptype::{self, ShipTypeRegistry};
 use crate::shipyard::{self, BuildOutcome};
-use crate::types::SimDate;
+use crate::types::{ShipId, SimDate};
 use crate::weather::WeatherSystem;
 
 pub struct World {
@@ -30,18 +32,22 @@ pub struct World {
     pub ship_types: ShipTypeRegistry,
     /// Per-port economic state, parallel to `ports` (index = port index).
     pub markets: Vec<PortMarket>,
-    pub ships: Vec<Ship>,
-    pub ship_ais: Vec<ShipAI>,
+    /// All live ships, keyed by generational `ShipId`. Sunken ships are
+    /// removed from the map; their ids become permanently invalid,
+    /// preventing aliasing.
+    pub ships: SlotMap<ShipId, Ship>,
+    /// AI controller for each ship, keyed by the same `ShipId`.
+    pub ship_ais: SecondaryMap<ShipId, ShipAI>,
     pub date: SimDate,
     /// The month for which `markets` last received their monthly tick.
     /// Used to fire production exactly once per month transition.
     last_market_month: u8,
-    /// Per-ship silver at the start of the current month. Parallel to
-    /// `ships`. Used at the next month transition to compute monthly
+    /// Per-ship silver at the start of the current month. Keyed by
+    /// `ShipId`. Used at the next month transition to compute monthly
     /// profit (silver delta), which feeds the shipyard "math pencils"
     /// decision. A freshly-spawned ship's entry is initialized to its
     /// starting silver so its first-month delta is meaningful.
-    silver_at_month_start: Vec<f32>,
+    silver_at_month_start: SecondaryMap<ShipId, f32>,
     /// Last completed month's average per-ship silver delta (pesos).
     /// Used by `shipyard::try_build` as the expected per-ship monthly
     /// profit for new vessels. Starts at 0 (no fleet history); first
@@ -59,10 +65,9 @@ impl World {
         let ports = all_ports();
         let harbors = HarborMap::build(&map.land, &ports);
         let navmesh = Navmesh::build(&map.land);
-        let coastline = CoastlineMap::load(&data_dir.join("grids/coastline.bin"))
-            .unwrap_or_default();
-        let land_mesh = LandMesh::load(&data_dir.join("grids/land_polys.bin"))
-            .unwrap_or_default();
+        let coastline =
+            CoastlineMap::load(&data_dir.join("grids/coastline.bin")).unwrap_or_default();
+        let land_mesh = LandMesh::load(&data_dir.join("grids/land_polys.bin")).unwrap_or_default();
         let goods = GoodsRegistry::starter();
         let markets: Vec<PortMarket> = ports
             .iter()
@@ -86,21 +91,24 @@ impl World {
             goods,
             ship_types: ShipTypeRegistry::starter(),
             markets,
-            ships: Vec::new(),
-            ship_ais: Vec::new(),
+            ships: SlotMap::with_key(),
+            ship_ais: SecondaryMap::new(),
             date,
             last_market_month,
-            silver_at_month_start: Vec::new(),
+            silver_at_month_start: SecondaryMap::new(),
             last_month_avg_profit: 0.0,
             ships_built: 0,
         }
     }
 
-    /// Add a ship with its AI controller.
-    pub fn add_ship(&mut self, ship: Ship, ai: ShipAI) {
-        self.silver_at_month_start.push(ship.silver);
-        self.ships.push(ship);
-        self.ship_ais.push(ai);
+    /// Add a ship with its AI controller. Returns the freshly-minted
+    /// `ShipId` so callers can hold a stable handle.
+    pub fn add_ship(&mut self, ship: Ship, ai: ShipAI) -> ShipId {
+        let starting = ship.silver;
+        let id = self.ships.insert(ship);
+        self.ship_ais.insert(id, ai);
+        self.silver_at_month_start.insert(id, starting);
+        id
     }
 
     /// Advance the simulation by one hour.
@@ -132,8 +140,11 @@ impl World {
                 let total_delta: f32 = self
                     .ships
                     .iter()
-                    .zip(self.silver_at_month_start.iter())
-                    .map(|(s, prev)| s.silver - prev)
+                    .filter_map(|(id, s)| {
+                        self.silver_at_month_start
+                            .get(id)
+                            .map(|prev| s.silver - prev)
+                    })
                     .sum();
                 self.last_month_avg_profit = total_delta / self.ships.len() as f32;
             } else {
@@ -164,7 +175,9 @@ impl World {
                     // the first dock-cycle tick. We seed
                     // `nav.docked_at_port = idx` so the dock tree knows
                     // which market to trade with.
-                    let mut ai = ShipAI::with_seed(0xA15E_C0FF_u64 ^ (idx as u64) ^ (self.ships_built as u64));
+                    let mut ai = ShipAI::with_seed(
+                        0xA15E_C0FF_u64 ^ (idx as u64) ^ (self.ships_built as u64),
+                    );
                     ai.nav.docked_at_port = Some(idx);
                     newly_built.push((ship, ai));
                 }
@@ -178,8 +191,9 @@ impl World {
             // were appended, so their starting silver is what we'll
             // compare against next month.
             self.silver_at_month_start.clear();
-            self.silver_at_month_start
-                .extend(self.ships.iter().map(|s| s.silver));
+            for (id, ship) in &self.ships {
+                self.silver_at_month_start.insert(id, ship.silver);
+            }
 
             self.last_market_month = month;
         }
@@ -192,14 +206,33 @@ impl World {
             &self.navmesh,
         );
 
-        for i in 0..self.ships.len() {
-            let ship_stats: ShipStats =
-                self.ship_types.get(self.ships[i].ship_type).stats.clone();
-            let wind = self.weather.wind.wind_at(self.ships[i].position, month);
+        // Snapshot the live ship ids so we can iterate while mutating
+        // both `ships` and `ship_ais`. SlotMap iteration order is not
+        // documented as stable; collecting upfront also pins per-tick
+        // ordering for determinism.
+        let ids: Vec<ShipId> = self.ships.keys().collect();
+        for id in ids {
+            let ship_stats: ShipStats = {
+                let ship = match self.ships.get(id) {
+                    Some(s) => s,
+                    None => continue, // defensive: ship was removed mid-tick
+                };
+                self.ship_types.get(ship.ship_type).stats.clone()
+            };
+            let wind = self.weather.wind.wind_at(self.ships[id].position, month);
 
-            // AI decides heading (or docks/undocks)
-            self.ship_ais[i].tick(
-                &mut self.ships[i],
+            // AI decides heading (or docks/undocks). Two distinct
+            // SecondaryMap/SlotMap fields => safe split borrow.
+            let ai = match self.ship_ais.get_mut(id) {
+                Some(a) => a,
+                None => continue,
+            };
+            let ship = match self.ships.get_mut(id) {
+                Some(s) => s,
+                None => continue,
+            };
+            ai.tick(
+                ship,
                 &ship_stats,
                 &wind,
                 &self.ports,
@@ -210,9 +243,9 @@ impl World {
             );
 
             // Resource consumption
-            self.ships[i].tick_resources(&ship_stats);
+            ship.tick_resources(&ship_stats);
 
-            if self.ships[i].state != ShipState::Sailing {
+            if ship.state != ShipState::Sailing {
                 continue;
             }
 
@@ -224,25 +257,25 @@ impl World {
             // on land at our 1 NM/cell resolution. From inside land,
             // `farthest_clear_point` would otherwise refuse all motion and
             // strand the ship. Snap to the nearest sea cell first.
-            if self.map.land.is_land(self.ships[i].position) {
-                if let Some(cell) = self.map.land.pos_to_cell(self.ships[i].position) {
+            if self.map.land.is_land(ship.position) {
+                if let Some(cell) = self.map.land.pos_to_cell(ship.position) {
                     if let Some(sea) = self.map.land.nearest_sea_cell(cell.0, cell.1, 32) {
-                        self.ships[i].position = self.map.land.cell_to_pos(sea.0, sea.1);
+                        ship.position = self.map.land.cell_to_pos(sea.0, sea.1);
                     }
                 }
             }
 
-            let new_pos = self.ships[i].compute_next_position(&ship_stats, &wind, 1.0);
-            let old_pos = self.ships[i].position;
+            let new_pos = ship.compute_next_position(&ship_stats, &wind, 1.0);
+            let old_pos = ship.position;
             let safe_pos = self.map.land.farthest_clear_point(old_pos, new_pos);
 
             if safe_pos.distance(old_pos) > 0.05 {
-                self.ships[i].position = safe_pos;
+                ship.position = safe_pos;
                 // Speed reflects how far we actually traveled.
                 let traveled = safe_pos.distance(old_pos);
-                self.ships[i].speed = traveled; // 1 hour tick → NM == kt
+                ship.speed = traveled; // 1 hour tick → NM == kt
             } else {
-                self.ships[i].speed = 0.0;
+                ship.speed = 0.0;
             }
         }
 

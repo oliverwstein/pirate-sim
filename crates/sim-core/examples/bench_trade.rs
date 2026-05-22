@@ -9,12 +9,11 @@
 //! Usage: `cargo run --release --example bench_trade`
 
 use sim_core::ai::ShipAI;
-use sim_core::equilibrium::{
-    self, EquilibriumScenario, FreightCostModel, PortSpec,
-};
+use sim_core::equilibrium::{self, EquilibriumScenario, FreightCostModel, PortSpec};
 use sim_core::goods::{ids, GoodId};
 use sim_core::market::archetype_for;
 use sim_core::ship::{Ship, ShipState, ShipStats};
+use sim_core::types::ShipId;
 use sim_core::world::World;
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -37,7 +36,7 @@ fn snapshot_system(
         }
     }
     let mut tr: BTreeMap<u8, f32> = BTreeMap::new();
-    for s in &world.ships {
+    for (_, s) in &world.ships {
         for (gid, tons) in s.cargo.iter() {
             *tr.entry(gid.0).or_insert(0.0) += tons;
         }
@@ -87,7 +86,8 @@ fn main() {
         ("Amsterdam", 89),
         ("Nantes", 97),
     ];
-    let mut origin_names = Vec::new();
+    let mut origin_names: Vec<&str> = Vec::new();
+    let mut ship_ids: Vec<ShipId> = Vec::new();
     for (name, seed) in starts {
         let Some(idx) = world.ports.iter().position(|p| p.name == *name) else {
             println!("(skip) port {} not found", name);
@@ -97,12 +97,16 @@ fn main() {
         let ship = Ship::new(port_pos, ShipState::Docked);
         let mut ai = ShipAI::with_seed(*seed);
         ai.nav.docked_at_port = Some(idx);
+        let id = world.add_ship(ship, ai);
         origin_names.push(*name);
-        world.add_ship(ship, ai);
+        ship_ids.push(id);
     }
 
     let n_ships = world.ships.len();
-    println!("Phase 2 calibration run: {} days, {} ships", SIM_DAYS, n_ships);
+    println!(
+        "Phase 2 calibration run: {} days, {} ships",
+        SIM_DAYS, n_ships
+    );
     println!();
 
     // Sample a few ports each week so we can see prices oscillate.
@@ -142,26 +146,40 @@ fn main() {
     let mut in_transit_per_month: Vec<Vec<(GoodId, f32)>> = Vec::new();
     // Take an initial snapshot at month 0 (before any production).
     snapshot_system(&world, &mut stockpile_per_month, &mut in_transit_per_month);
-    record_recipe_flow(&world, &mut production_per_month, &mut consumption_per_month);
+    record_recipe_flow(
+        &world,
+        &mut production_per_month,
+        &mut consumption_per_month,
+    );
 
     // Simulate.
     for h in 1..=SIM_HOURS {
         world.tick();
         // Track origin names for any newly-built ships so the report
-        // can label them. Their starting silver lives on the Ship
-        // itself (`ship.starting_silver`), so there's no race here.
-        while world.ships.len() > origin_names.len() {
-            let i = origin_names.len();
-            let owner_name = world.ships[i]
-                .owner_port
-                .and_then(|idx| world.ports.get(idx).map(|p| p.name))
-                .unwrap_or("?");
-            origin_names.push(owner_name);
+        // can label them. Scan for ShipIds we haven't seen yet (SlotMap
+        // iteration order is not specified, but newly-inserted keys
+        // simply aren't in our `ship_ids` Vec yet).
+        if world.ships.len() > ship_ids.len() {
+            let known: std::collections::HashSet<ShipId> = ship_ids.iter().copied().collect();
+            for (id, ship) in &world.ships {
+                if !known.contains(&id) {
+                    let owner_name = ship
+                        .owner_port
+                        .and_then(|idx| world.ports.get(idx).map(|p| p.name))
+                        .unwrap_or("?");
+                    origin_names.push(owner_name);
+                    ship_ids.push(id);
+                }
+            }
         }
         // Detect month transition and snapshot at end of month.
         if world.date.month() != last_observed_month {
             snapshot_system(&world, &mut stockpile_per_month, &mut in_transit_per_month);
-            record_recipe_flow(&world, &mut production_per_month, &mut consumption_per_month);
+            record_recipe_flow(
+                &world,
+                &mut production_per_month,
+                &mut consumption_per_month,
+            );
             last_observed_month = world.date.month();
         }
         if h % (24 * 7) == 0 {
@@ -183,12 +201,22 @@ fn main() {
     println!("Per-ship P/L after {} days:", SIM_DAYS);
     println!(
         "{:<3}  {:<14}  {:<10}  {:>10}  {:>10}  {:>10}  {:>8}  {:>10}  {:<10}  {:<24}",
-        "#", "from", "type", "silver_in", "silver_out", "dividends", "debt", "P/L", "state", "cargo"
+        "#",
+        "from",
+        "type",
+        "silver_in",
+        "silver_out",
+        "dividends",
+        "debt",
+        "P/L",
+        "state",
+        "cargo"
     );
     let mut total_pl = 0.0f32;
     let mut total_debt = 0.0f32;
     let mut bankrupt = 0;
-    for (i, ship) in world.ships.iter().enumerate() {
+    for (i, &id) in ship_ids.iter().enumerate() {
+        let ship = &world.ships[id];
         // True lifetime P/L includes dividends paid back to the
         // owner port (which may have settled silver out of the
         // strongbox) and subtracts any outstanding chandler/freight
@@ -204,7 +232,9 @@ fn main() {
             ShipState::Docked => "docked",
             ShipState::Anchored => "anchored",
         };
-        let cargo: Vec<String> = ship.cargo.iter()
+        let cargo: Vec<String> = ship
+            .cargo
+            .iter()
             .filter(|(_, t)| *t > 0.01)
             .map(|(id, t)| format!("{}:{:.1}", world.goods.get(id).name, t))
             .collect();
@@ -217,10 +247,15 @@ fn main() {
         );
     }
     println!();
-    println!("Fleet total P/L: {:+.0} pesos   (outstanding debt: {:.0})", total_pl, total_debt);
+    println!(
+        "Fleet total P/L: {:+.0} pesos   (outstanding debt: {:.0})",
+        total_pl, total_debt
+    );
     println!("Bankrupt ships:  {}/{}", bankrupt, world.ships.len());
-    println!("Ships built by shipyards: {}  (last_month_avg_profit = {:+.0})",
-        world.ships_built, world.last_month_avg_profit);
+    println!(
+        "Ships built by shipyards: {}  (last_month_avg_profit = {:+.0})",
+        world.ships_built, world.last_month_avg_profit
+    );
 
     // Builds-by-type summary: only count ships beyond the starter
     // fleet (those are the shipyard's actual output, not what we
@@ -228,13 +263,12 @@ fn main() {
     if world.ships.len() > n_ships {
         let mut counts: std::collections::BTreeMap<&'static str, u32> =
             std::collections::BTreeMap::new();
-        for ship in world.ships.iter().skip(n_ships) {
+        for &id in ship_ids.iter().skip(n_ships) {
+            let ship = &world.ships[id];
             let name = world.ship_types.get(ship.ship_type).name;
             *counts.entry(name).or_insert(0) += 1;
         }
-        let parts: Vec<String> = counts.iter()
-            .map(|(n, c)| format!("{} {}", c, n))
-            .collect();
+        let parts: Vec<String> = counts.iter().map(|(n, c)| format!("{} {}", c, n)).collect();
         println!("  by type: {}", parts.join(", "));
     }
 
@@ -250,11 +284,15 @@ fn main() {
         "  {:<18} {:<7} {}",
         "good",
         "kind",
-        header_months.iter().map(|h| format!("{:>10}", h)).collect::<String>()
+        header_months
+            .iter()
+            .map(|h| format!("{:>10}", h))
+            .collect::<String>()
     );
     // Union of all goods that show up anywhere in any snapshot.
     let mut all_goods: std::collections::BTreeSet<u8> = std::collections::BTreeSet::new();
-    for snap in stockpile_per_month.iter()
+    for snap in stockpile_per_month
+        .iter()
         .chain(in_transit_per_month.iter())
         .chain(production_per_month.iter())
         .chain(consumption_per_month.iter())
@@ -264,7 +302,10 @@ fn main() {
         }
     }
     let lookup = |snap: &Vec<(GoodId, f32)>, gid: GoodId| -> f32 {
-        snap.iter().find(|(g, _)| *g == gid).map(|(_, v)| *v).unwrap_or(0.0)
+        snap.iter()
+            .find(|(g, _)| *g == gid)
+            .map(|(_, v)| *v)
+            .unwrap_or(0.0)
     };
     let series_line = |snaps: &Vec<Vec<(GoodId, f32)>>, gid: GoodId| -> String {
         (0..n_months)
@@ -303,12 +344,32 @@ fn main() {
     for gid_raw in all_goods {
         let gid = GoodId(gid_raw);
         let name = world.goods.get(gid).name;
-        println!("  {:<18} {:<7} {}", name, "prod",    series_line(&production_per_month,  gid));
-        println!("  {:<18} {:<7} {}", "",   "cons",    series_line(&consumption_per_month, gid));
-        println!("  {:<18} {:<7} {}", "",   "net",     net_line(gid));
-        println!("  {:<18} {:<7} {}", "",   "stock",   series_line(&stockpile_per_month,   gid));
-        println!("  {:<18} {:<7} {}", "",   "transit", series_line(&in_transit_per_month,  gid));
-        println!("  {:<18} {:<7} {}", "",   "Δtotal",  delta_total_line(gid));
+        println!(
+            "  {:<18} {:<7} {}",
+            name,
+            "prod",
+            series_line(&production_per_month, gid)
+        );
+        println!(
+            "  {:<18} {:<7} {}",
+            "",
+            "cons",
+            series_line(&consumption_per_month, gid)
+        );
+        println!("  {:<18} {:<7} {}", "", "net", net_line(gid));
+        println!(
+            "  {:<18} {:<7} {}",
+            "",
+            "stock",
+            series_line(&stockpile_per_month, gid)
+        );
+        println!(
+            "  {:<18} {:<7} {}",
+            "",
+            "transit",
+            series_line(&in_transit_per_month, gid)
+        );
+        println!("  {:<18} {:<7} {}", "", "Δtotal", delta_total_line(gid));
     }
 
     // ── Annualized structural flow. Recipe × prosperity is steady-state
@@ -317,8 +378,13 @@ fn main() {
     //    can sustain the fleet's demand and a year of port consumption.
     println!();
     println!("Annualized structural flow (12 × steady-state month):");
-    println!("  {:<18} {:>10} {:>10} {:>10}", "good", "prod/yr", "cons/yr", "net/yr");
-    for gid_raw in stockpile_per_month[0].iter().map(|(g, _)| g.0)
+    println!(
+        "  {:<18} {:>10} {:>10} {:>10}",
+        "good", "prod/yr", "cons/yr", "net/yr"
+    );
+    for gid_raw in stockpile_per_month[0]
+        .iter()
+        .map(|(g, _)| g.0)
         .chain(production_per_month[0].iter().map(|(g, _)| g.0))
         .chain(consumption_per_month[0].iter().map(|(g, _)| g.0))
         .collect::<std::collections::BTreeSet<_>>()
@@ -337,7 +403,8 @@ fn main() {
     //    to the equilibrium "delivered" price. Big numbers = the
     //    simulation is structurally far from where a frictionless
     //    trade-allocator would push it.
-    let port_specs: Vec<PortSpec> = world.ports
+    let port_specs: Vec<PortSpec> = world
+        .ports
         .iter()
         .map(|p| PortSpec::from_world(p, archetype_for(p.name).recipe()))
         .collect();
@@ -356,7 +423,10 @@ fn main() {
     for (port_idx, port) in world.ports.iter().enumerate() {
         let spec = &port_specs[port_idx];
         let mut seen = std::collections::HashSet::new();
-        for (good, _) in spec.recipe.monthly_outputs.iter()
+        for (good, _) in spec
+            .recipe
+            .monthly_outputs
+            .iter()
             .chain(spec.recipe.monthly_inputs.iter())
         {
             let good: GoodId = *good;
@@ -403,7 +473,11 @@ fn main() {
         for d in sorted.iter().take(10) {
             println!(
                 "    {:<24} {:<18} {:>10.1} {:>10.1} {:>7.0}%",
-                d.0, d.1, d.2, d.3, d.4 * 100.0
+                d.0,
+                d.1,
+                d.2,
+                d.3,
+                d.4 * 100.0
             );
         }
     }
@@ -416,7 +490,9 @@ fn main() {
     // (geography matters).
     println!();
     println!("Calibration verdict:");
-    let losers = world.ships.iter()
+    let losers = world
+        .ships
+        .values()
         .filter(|s| (s.silver - s.starting_silver) + s.lifetime_dividends < 0.0)
         .count();
     if bankrupt > 0 {
@@ -429,10 +505,8 @@ fn main() {
             "  ⚠ {} ship(s) ended in the red — successful voyages should reliably profit",
             losers
         );
-    } else if total_pl < world.ships.iter().map(|s| s.starting_silver).sum::<f32>() * 0.5 {
-        println!(
-            "  ⚠ fleet barely profitable — trade margins or world prices may be too thin"
-        );
+    } else if total_pl < world.ships.values().map(|s| s.starting_silver).sum::<f32>() * 0.5 {
+        println!("  ⚠ fleet barely profitable — trade margins or world prices may be too thin");
     } else {
         println!("  ✓ every ship in the black with healthy variance");
     }
