@@ -128,6 +128,9 @@ impl World {
     }
 
     /// Advance the simulation by one hour.
+    /// Advance the simulation by one hour. Dispatches to per-cadence
+    /// helpers; see `tick_monthly`, `tick_daily_hiring`, and
+    /// `tick_hourly_ai_and_physics`.
     pub fn tick(&mut self) {
         let month = self.date.month();
         // PathfindContext uses a single "representative" stats — the
@@ -138,141 +141,157 @@ impl World {
         // inside the planner) without changing the navmesh.
         let pathfind_stats = self.ship_types.get(shiptype::ids::SLOOP).stats.clone();
 
-        // Monthly economic tick: produce outputs, consume inputs at every
-        // port. Fired exactly once per month transition. After production
-        // settles, compute last month's average per-ship silver delta and
-        // let each shipyard port decide whether to commission a new ship.
-        if month != self.last_market_month {
-            for market in &mut self.markets {
-                market.tick_month();
-            }
-            // Monthly sailor-pool tick: growth, maturation, mortality.
-            // Parallel index with `ports` and `markets`.
-            for (i, d) in self.demographics.iter_mut().enumerate() {
-                pop::tick_monthly(d, self.ports[i].faction);
-            }
+        self.tick_monthly(month);
+        self.tick_daily_hiring();
+        self.tick_hourly_ai_and_physics(month, &pathfind_stats);
 
-            // Average per-ship silver delta over the just-completed month.
-            // The new-ship delta is implicitly excluded for ships added
-            // mid-month: their snapshot was their starting silver, so
-            // their first-month delta represents however much (or little)
-            // they actually traded.
-            if !self.ships.is_empty() {
-                let total_delta: f32 = self
-                    .ships
-                    .iter()
-                    .filter_map(|(id, s)| {
-                        self.silver_at_month_start
-                            .get(id)
-                            .map(|prev| s.silver - prev)
-                    })
-                    .sum();
-                self.last_month_avg_profit = total_delta / self.ships.len() as f32;
-            } else {
-                self.last_month_avg_profit = 0.0;
-            }
+        self.date.advance_hours(1);
+    }
 
-            // Shipyards decide whether to build. Collect new ships first
-            // (each build mutates its own market; we can't iterate over
-            // self.ports and call methods that borrow self.markets
-            // mutably in a single pass).
-            let mut newly_built: Vec<(Ship, ShipAI)> = Vec::new();
-            for (idx, port) in self.ports.iter().enumerate() {
-                if port.shipyard.is_none() {
-                    continue;
-                }
-                let market = &mut self.markets[idx];
-                let (outcome, ship) = shipyard::try_build(
-                    port,
-                    idx,
-                    market,
-                    &self.goods,
-                    &self.ship_types,
-                    self.last_month_avg_profit,
-                );
-                if let (BuildOutcome::Built { .. }, Some(ship)) = (outcome, ship) {
-                    // New ship docks at home port immediately; the AI's
-                    // BUY_BEST tree will pick its first destination on
-                    // the first dock-cycle tick. We seed
-                    // `nav.docked_at_port = idx` so the dock tree knows
-                    // which market to trade with.
-                    let mut ai = ShipAI::with_seed(
-                        0xA15E_C0FF_u64 ^ (idx as u64) ^ (self.ships_built as u64),
-                    );
-                    ai.nav.docked_at_port = Some(idx);
-                    newly_built.push((ship, ai));
-                }
-            }
-            for (ship, ai) in newly_built {
-                self.ships_built += 1;
-                self.add_ship(ship, ai);
-            }
-
-            // Reset snapshots for the new month — *after* the new ships
-            // were appended, so their starting silver is what we'll
-            // compare against next month.
-            self.silver_at_month_start.clear();
-            for (id, ship) in &self.ships {
-                self.silver_at_month_start.insert(id, ship.silver);
-            }
-
-            self.last_market_month = month;
+    /// Monthly economic tick: market production/consumption, sailor
+    /// pool dynamics, fleet profit snapshot, shipyard build decisions,
+    /// and per-ship silver snapshot reset. Fires exactly once per
+    /// month transition (gated on `self.last_market_month`).
+    fn tick_monthly(&mut self, month: u8) {
+        if month == self.last_market_month {
+            return;
+        }
+        for market in &mut self.markets {
+            market.tick_month();
+        }
+        // Monthly sailor-pool tick: growth, maturation, mortality.
+        // Parallel index with `ports` and `markets`.
+        for (i, d) in self.demographics.iter_mut().enumerate() {
+            pop::tick_monthly(d, self.ports[i].faction);
         }
 
-        // Daily hiring tick. For every ship in `Hiring` state at its
-        // owner port, draw up to HIRE_PER_DAY sailors from the local
-        // `PortDemographics` (seasoned-first). When a ship reaches its
-        // `crew_min`, it transitions to `Docked` and the AI takes over.
-        // Sign-on bounties, faction multipliers, and demand pressure
-        // land in Step 3.c per planning/crewing-plan.md §5.
+        // Average per-ship silver delta over the just-completed month.
+        // The new-ship delta is implicitly excluded for ships added
+        // mid-month: their snapshot was their starting silver, so
+        // their first-month delta represents however much (or little)
+        // they actually traded.
+        if !self.ships.is_empty() {
+            let total_delta: f32 = self
+                .ships
+                .iter()
+                .filter_map(|(id, s)| {
+                    self.silver_at_month_start
+                        .get(id)
+                        .map(|prev| s.silver - prev)
+                })
+                .sum();
+            self.last_month_avg_profit = total_delta / self.ships.len() as f32;
+        } else {
+            self.last_month_avg_profit = 0.0;
+        }
+
+        // Shipyards decide whether to build. Collect new ships first
+        // (each build mutates its own market; we can't iterate over
+        // self.ports and call methods that borrow self.markets
+        // mutably in a single pass).
+        let mut newly_built: Vec<(Ship, ShipAI)> = Vec::new();
+        for (idx, port) in self.ports.iter().enumerate() {
+            if port.shipyard.is_none() {
+                continue;
+            }
+            let market = &mut self.markets[idx];
+            let (outcome, ship) = shipyard::try_build(
+                port,
+                idx,
+                market,
+                &self.goods,
+                &self.ship_types,
+                self.last_month_avg_profit,
+            );
+            if let (BuildOutcome::Built { .. }, Some(ship)) = (outcome, ship) {
+                // New ship docks at home port immediately; the AI's
+                // BUY_BEST tree will pick its first destination on
+                // the first dock-cycle tick. We seed
+                // `nav.docked_at_port = idx` so the dock tree knows
+                // which market to trade with.
+                let mut ai =
+                    ShipAI::with_seed(0xA15E_C0FF_u64 ^ (idx as u64) ^ (self.ships_built as u64));
+                ai.nav.docked_at_port = Some(idx);
+                newly_built.push((ship, ai));
+            }
+        }
+        for (ship, ai) in newly_built {
+            self.ships_built += 1;
+            self.add_ship(ship, ai);
+        }
+
+        // Reset snapshots for the new month — *after* the new ships
+        // were appended, so their starting silver is what we'll
+        // compare against next month.
+        self.silver_at_month_start.clear();
+        for (id, ship) in &self.ships {
+            self.silver_at_month_start.insert(id, ship.silver);
+        }
+
+        self.last_market_month = month;
+    }
+
+    /// Daily hiring tick. For every ship in `Hiring` state at its
+    /// owner port, draw up to `HIRE_PER_DAY` sailors from the local
+    /// `PortDemographics` (seasoned-first). When a ship reaches its
+    /// `crew_min`, it transitions to `Docked` and the AI takes over.
+    /// Sign-on bounties, faction multipliers, and demand pressure
+    /// land in Step 3.c per `planning/crewing-plan.md §5`.
+    fn tick_daily_hiring(&mut self) {
         let today = self.date.day_of_year;
-        if today != self.last_hire_day {
-            const HIRE_PER_DAY: u16 = 5;
-            let ids: Vec<ShipId> = self.ships.keys().collect();
-            for id in ids {
-                let (port_idx, want, ship_type) = match self.ships.get(id) {
-                    Some(s) if s.state == ShipState::Hiring => {
-                        let port = match s.owner_port {
-                            Some(p) => p,
-                            None => continue,
-                        };
-                        let stats = self.ship_types.get(s.ship_type).stats.clone();
-                        let typical = stats.crew_typical();
-                        if s.crew_alive >= typical {
-                            (port, 0u16, s.ship_type)
-                        } else {
-                            (port, typical - s.crew_alive, s.ship_type)
-                        }
-                    }
-                    _ => continue,
-                };
-                let stats = &self.ship_types.get(ship_type).stats;
-                let cap = want.min(HIRE_PER_DAY);
-                let demo = match self.demographics.get_mut(port_idx) {
-                    Some(d) => d,
-                    None => continue,
-                };
-                // Seasoned-first draw, then unseasoned.
-                let from_seasoned = (demo.seasoned as u16).min(cap);
-                let remaining = cap - from_seasoned;
-                let from_unseasoned = (demo.unseasoned as u16).min(remaining);
-                let drawn = from_seasoned + from_unseasoned;
-                demo.seasoned -= from_seasoned as u32;
-                demo.unseasoned -= from_unseasoned as u32;
-                if let Some(s) = self.ships.get_mut(id) {
-                    s.crew_alive += drawn;
-                    if s.crew_alive >= stats.crew_min() {
-                        s.state = ShipState::Docked;
+        if today == self.last_hire_day {
+            return;
+        }
+        const HIRE_PER_DAY: u16 = 5;
+        let ids: Vec<ShipId> = self.ships.keys().collect();
+        for id in ids {
+            let (port_idx, want, ship_type) = match self.ships.get(id) {
+                Some(s) if s.state == ShipState::Hiring => {
+                    let port = match s.owner_port {
+                        Some(p) => p,
+                        None => continue,
+                    };
+                    let stats = self.ship_types.get(s.ship_type).stats.clone();
+                    let typical = stats.crew_typical();
+                    if s.crew_alive >= typical {
+                        (port, 0u16, s.ship_type)
+                    } else {
+                        (port, typical - s.crew_alive, s.ship_type)
                     }
                 }
+                _ => continue,
+            };
+            let stats = &self.ship_types.get(ship_type).stats;
+            let cap = want.min(HIRE_PER_DAY);
+            let demo = match self.demographics.get_mut(port_idx) {
+                Some(d) => d,
+                None => continue,
+            };
+            // Seasoned-first draw, then unseasoned.
+            let from_seasoned = (demo.seasoned as u16).min(cap);
+            let remaining = cap - from_seasoned;
+            let from_unseasoned = (demo.unseasoned as u16).min(remaining);
+            let drawn = from_seasoned + from_unseasoned;
+            demo.seasoned -= from_seasoned as u32;
+            demo.unseasoned -= from_unseasoned as u32;
+            if let Some(s) = self.ships.get_mut(id) {
+                s.crew_alive += drawn;
+                if s.crew_alive >= stats.crew_min() {
+                    s.state = ShipState::Docked;
+                }
             }
-            self.last_hire_day = today;
         }
+        self.last_hire_day = today;
+    }
 
+    /// Hourly per-ship AI + physics tick: each ship gets an AI
+    /// decision, consumes resources, and (if sailing) advances its
+    /// position with land-collision sweep.
+    fn tick_hourly_ai_and_physics(&mut self, month: u8, pathfind_stats: &ShipStats) {
         let pathfind = PathfindContext::new(
             &self.map.land,
             &self.weather.wind,
-            &pathfind_stats,
+            pathfind_stats,
             month,
             &self.navmesh,
         );
@@ -349,7 +368,5 @@ impl World {
                 ship.speed = 0.0;
             }
         }
-
-        self.date.advance_hours(1);
     }
 }

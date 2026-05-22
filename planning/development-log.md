@@ -215,3 +215,34 @@ Phases 1 & 2 were implemented prior to the creation of this log; you can now exp
 - `bench_trade`: identical Phase-3 baseline (2 bankrupt). Expected: seeded ships start fully crewed, so the crew multiplier is exactly 1.0 and burn rate is unchanged. Shipyard-built ships sail at 60% speed with `crew_min` crew until further hiring lands in 3.c.2 — small enough volume in the 60-day window not to move the verdict.
 
 **Next action:** 3.c.2 — wages, sign-on bounty, discharge (with paid wages flowing into the destination port's `PortMarket.silver` per user direction).
+
+---
+
+## 2026-05-24 — Refactor: extract World::tick cadences (audit follow-up)
+
+**Goal:** Honor the top finding of `planning/code-health-audit.md` — split `World::tick`'s growing per-cadence blocks into named methods before Step 3.c.2 (discharge) and 3.c.3 (hourly morale tick) add more weight.
+
+**Implementation (mechanical, no semantic change):**
+- `World::tick` shrunk from ~220 lines to ~15: computes `month` + `pathfind_stats`, then dispatches to:
+  - `tick_monthly(month)` — markets, pop dynamics, profit snapshot, shipyard build decisions, snapshot reset. Early-return when `month == self.last_market_month`.
+  - `tick_daily_hiring()` — Hiring-state ships drain sailors from local pool. Early-return when `day_of_year == self.last_hire_day`.
+  - `tick_hourly_ai_and_physics(month, pathfind_stats)` — builds `PathfindContext`; per-ship AI tick + resource consumption + position advance with land-collision sweep.
+- Ordering preserved exactly: monthly → daily → hourly → `advance_hours(1)`.
+
+**Design decisions:**
+- **Three private methods, not three pub methods.** External callers always tick the whole hour. Exposing them invites surprising states (e.g., a caller running `tick_monthly` without the matching `advance_hours`). If a future test or scenario needs partial control, we can promote on demand.
+- **`pathfind_stats` constructed in `tick()`, passed in.** The PathfindContext also lives there. Building it inside `tick_hourly_ai_and_physics` would have been fine too; keeping construction in `tick()` keeps the per-method responsibilities cleaner ("the hourly method does the per-ship work, given the contexts").
+- **Constants stay local to their cadence.** `HIRE_PER_DAY` stays inside `tick_daily_hiring` as a `const`; no need to lift it to module scope until 3.c.2 wants to share with discharge logic.
+
+**Verification:**
+- `cargo build --workspace --tests --examples`: clean.
+- `cargo test --workspace`: **104 passed**, identical to pre-refactor.
+- `cargo clippy --workspace --all-targets -- -D warnings`: clean.
+- `bench_trade`: bit-identical output (2 bankrupt, same equilibrium deltas).
+
+**Audit status after this commit:**
+- Finding #1 (World::tick) — **done**.
+- Finding #2 (`ShipBtContext::execute_action`) — deferred to Step 5 opening commit, per audit recommendation.
+- Finding #3 (`ShipAI::tick` 8-arg sig) — free with Step 5; no standalone work.
+
+**Next action:** Step 3.c.2 — wages accrual + sign-on bounty + discharge on dock (discharged wages flow into the port's `PortMarket.silver`).
