@@ -225,7 +225,14 @@ pub fn try_build(
     }
 
     let start_silver = starting_silver(ty, market, goods);
-    let ship = Ship::freshly_built(port.position, port_idx, start_silver, chosen, &ty.stats);
+    let ship = Ship::freshly_built(
+        port.position,
+        port_idx,
+        start_silver,
+        chosen,
+        &ty.stats,
+        port.faction,
+    );
 
     (
         BuildOutcome::Built {

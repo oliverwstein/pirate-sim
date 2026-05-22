@@ -393,3 +393,27 @@ Phases 1 & 2 were implemented prior to the creation of this log; you can now exp
 - Seeded-with-port ship constructor + bench_trade migration (4.b).
 - `crates/sim-core/src/spatial.rs` 10 NM dynamic spatial hash with filtered queries (4.c).
 - Viz: ship faction colors + faint sight-lines between differing-faction ships (4.d).
+
+---
+
+## Step 4.b — `Ship.faction` field + seeded-with-port constructor (2026-05-22)
+
+**Scope:** Add `Ship.faction: Faction` and route it through the two construction paths. No new consumers yet (4.c/4.d will use it).
+
+**Changes:**
+- `ship.rs` — added `pub faction: Faction` field on `Ship`. Doc explains it's mutable (Step 8 prize capture will change it to the capturer's faction). `Ship::new` defaults to `Faction::Free` (test/scaffolding only). `Ship::freshly_built` gained a `faction: Faction` parameter — caller in `shipyard::try_build` passes `port.faction`. New `Ship::seeded_at_port(pos, owner_port, faction)` constructor for the starter fleet — fully crewed, `state = Docked`, `owner_port = Some(idx)`, faction set from caller.
+- `shipyard.rs` — pass `port.faction` through to `Ship::freshly_built`.
+- `bench_trade.rs` — starter fleet seeded via `Ship::seeded_at_port`, inheriting each ship's port's faction. Seeded ships now have `owner_port = Some(idx)` (previously `None`), bringing them under the home-port remittance machinery.
+
+**Behavioral side-effect (intended):**
+Seeded ships are now first-class home-ported ships, consistent with shipyard-built hulls. They participate in `ai.rs` `home_bias` destination-selection and remit surplus silver to the home port on dock.
+- 365-day bench: fleet P/L **+667k → +847k pesos (+27%)**.
+- "Bankrupt" count (silver-only, dividend-blind threshold) ticked from 10 → 11 at 365d, 14 → 16 at 730d — those hulls likely show positive lifetime P/L once dividends are counted; bench bankrupt heuristic is a Phase-2 stopgap to be revisited in calibration.
+
+**Verification:**
+- `cargo build --workspace --tests --examples` clean.
+- `cargo test --workspace`: 110 passing.
+- `cargo clippy --workspace --all-targets -- -D warnings`: clean.
+- bench_trade -- 365 and -- 730 ran cleanly.
+
+**Next:** 4.c — `spatial.rs` 10 NM dynamic spatial hash with filter-closure neighbor query, rebuilt each `tick_hourly_ai_and_physics`. No AI consumers yet.

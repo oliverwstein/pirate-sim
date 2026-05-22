@@ -1,4 +1,5 @@
 use crate::cargo::Cargo;
+use crate::port::Faction;
 use crate::types::{Position, WindVector};
 use serde::Deserialize;
 
@@ -136,6 +137,12 @@ pub struct Ship {
     /// throttle recruitment (0.4–0.7) and speed (0.25–0.4); deeper
     /// bands trigger mutiny / desertion in Step 9.
     pub morale: f32,
+    /// Flag this ship sails under. For shipyard-built hulls this is the
+    /// owner port's faction at launch. Can change at runtime (e.g., when
+    /// a ship is captured as a prize in Step 8 it takes on the
+    /// capturer's faction). Test/scaffolding ships built via
+    /// `Ship::new` default to `Faction::Free`.
+    pub faction: Faction,
 }
 
 impl Ship {
@@ -160,6 +167,20 @@ impl Ship {
             crew_alive: stats.crew_typical(),
             wages_owed_pesos: 0.0,
             morale: 1.0,
+            faction: Faction::Free,
+        }
+    }
+
+    /// Construct a ship seeded into the world at a specific home port
+    /// (the typical entry point for the starter fleet in `bench_trade`
+    /// and headless scenarios). Unlike `freshly_built`, this ship is
+    /// fully crewed and ready to sail — there's no shipyard `Hiring`
+    /// phase. The ship inherits the port's faction and silver default.
+    pub fn seeded_at_port(position: Position, owner_port: usize, faction: Faction) -> Self {
+        Self {
+            faction,
+            owner_port: Some(owner_port),
+            ..Self::new(position, ShipState::Docked)
         }
     }
 
@@ -173,6 +194,7 @@ impl Ship {
         starting_silver: f32,
         ship_type: crate::shiptype::ShipTypeId,
         stats: &ShipStats,
+        faction: Faction,
     ) -> Self {
         Self {
             position,
@@ -193,6 +215,7 @@ impl Ship {
             crew_alive: 0,
             wages_owed_pesos: 0.0,
             morale: 1.0,
+            faction,
         }
     }
 
@@ -605,6 +628,7 @@ mod tests {
             1000.0,
             crate::shiptype::ids::SLOOP,
             &stats,
+            Faction::Free,
         );
         assert_eq!(built.morale, 1.0);
     }
@@ -672,6 +696,7 @@ mod tests {
             1000.0,
             crate::shiptype::ids::SLOOP,
             &stats,
+            Faction::Free,
         );
         assert_eq!(built.wages_owed_pesos, 0.0);
     }
