@@ -231,12 +231,18 @@ impl World {
         self.last_market_month = month;
     }
 
-    /// Daily hiring tick. For every ship in `Hiring` state at its
-    /// owner port, draw up to `HIRE_PER_DAY` sailors from the local
-    /// `PortDemographics` (seasoned-first). When a ship reaches its
-    /// `crew_min`, it transitions to `Docked` and the AI takes over.
-    /// Sign-on bounties, faction multipliers, and demand pressure
-    /// land in Step 3.c per `planning/crewing-plan.md §5`.
+    /// Daily hiring tick. Both `Hiring` (newly-built / refitting) and
+    /// `Docked` ships at port can draw sailors from the local
+    /// `PortDemographics` (seasoned-first), up to `crew_typical`.
+    /// `Hiring` ships use `owner_port`; `Docked` ships use their
+    /// current `docked_at_port` — sailors are not faction-loyal, and
+    /// any port that has a crew available will sell their time. A
+    /// `Hiring` hull transitions to `Docked` once it reaches `crew_min`
+    /// (it can put to sea undermanned), but daily top-ups continue
+    /// from then on until the design complement is reached. This
+    /// matches user direction: "hiring sailors, especially unseasoned
+    /// sailors in Europe or decently prosperous Caribbean ports,
+    /// should basically always be possible."
     fn tick_daily_hiring(&mut self) {
         let today = self.date.day_of_year;
         if today == self.last_hire_day {
@@ -245,7 +251,10 @@ impl World {
         const HIRE_PER_DAY: u16 = 5;
         let ids: Vec<ShipId> = self.ships.keys().collect();
         for id in ids {
-            let (port_idx, want, ship_type, ship_silver) = match self.ships.get(id) {
+            // Resolve the port we're hiring at: owner_port while Hiring,
+            // docked_at_port (from AI nav) while Docked. Anything else
+            // (Sailing/Anchored) skips this tick.
+            let (port_idx, want, ship_type, ship_silver, is_hiring) = match self.ships.get(id) {
                 Some(s) if s.state == ShipState::Hiring => {
                     let port = match s.owner_port {
                         Some(p) => p,
@@ -254,16 +263,25 @@ impl World {
                     let stats = self.ship_types.get(s.ship_type).stats.clone();
                     let typical = stats.crew_typical();
                     if s.crew_alive >= typical {
-                        (port, 0u16, s.ship_type, s.silver)
-                    } else {
-                        (port, typical - s.crew_alive, s.ship_type, s.silver)
+                        continue;
                     }
+                    (port, typical - s.crew_alive, s.ship_type, s.silver, true)
+                }
+                Some(s) if s.state == ShipState::Docked => {
+                    let stats = self.ship_types.get(s.ship_type).stats.clone();
+                    let typical = stats.crew_typical();
+                    if s.crew_alive >= typical {
+                        continue;
+                    }
+                    let port = match self.ship_ais.get(id).and_then(|a| a.nav.docked_at_port) {
+                        Some(p) => p,
+                        None => continue,
+                    };
+                    (port, typical - s.crew_alive, s.ship_type, s.silver, false)
                 }
                 _ => continue,
             };
             let stats = &self.ship_types.get(ship_type).stats;
-            // Morale 0.4–0.7 band: -10% recruitment rate (word gets
-            // around about the captain). Crewing-plan §8.2.
             let morale = self.ships.get(id).map(|s| s.morale).unwrap_or(1.0);
             let rate_mult = if (0.4..0.7).contains(&morale) {
                 0.9
@@ -272,9 +290,6 @@ impl World {
             };
             let per_day_cap = ((HIRE_PER_DAY as f32) * rate_mult).floor() as u16;
             let cap = want.min(per_day_cap.max(1));
-            // Sign-on bounty cap: each sailor costs SIGN_ON_BOUNTY_PESOS,
-            // debited from ship.silver (crewing-plan §6.2). If the ship
-            // can't afford the full draw, hire fewer this day.
             let affordable = (ship_silver / crate::ship::SIGN_ON_BOUNTY_PESOS)
                 .floor()
                 .max(0.0) as u16;
@@ -283,7 +298,6 @@ impl World {
                 Some(d) => d,
                 None => continue,
             };
-            // Seasoned-first draw, then unseasoned.
             let from_seasoned = (demo.seasoned as u16).min(cap);
             let remaining = cap - from_seasoned;
             let from_unseasoned = (demo.unseasoned as u16).min(remaining);
@@ -294,12 +308,13 @@ impl World {
             if let Some(s) = self.ships.get_mut(id) {
                 s.crew_alive += drawn;
                 s.silver -= bounty;
-                if s.crew_alive >= stats.crew_min() {
+                // Hiring → Docked transition once we cross crew_min:
+                // the ship is now seaworthy, but further top-ups will
+                // continue while it stays at port.
+                if is_hiring && s.crew_alive >= stats.crew_min() {
                     s.state = ShipState::Docked;
                 }
             }
-            // Bounty flows into the port economy (sailors spend it
-            // immediately on grog and supplies).
             if let Some(market) = self.markets.get_mut(port_idx) {
                 market.silver += bounty;
             }

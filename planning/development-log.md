@@ -321,3 +321,40 @@ Phases 1 & 2 were implemented prior to the creation of this log; you can now exp
 - `bench_trade`: 2 bankrupt (Phase-3 baseline preserved). Morale starts at 1.0; the bench's well-supplied seeded merchants don't dip into any effect band over 60 days. The recruitment penalty only fires on demoralized captains, none of which exist yet.
 
 **Next action:** Step 3.c is complete except for the calibration sweep (3.d). Options for the next slice: (a) the 3.d 1-year headless calibration run — confirm pools/morale are stable; (b) skip ahead to Step 4 (factions + spatial hash) since the crewing surface is wired and 3.d is a tuning exercise. User to decide.
+
+---
+
+## Step 3.d — Bench parameterization + crewing-loop & BT-reactivity fixes
+
+**Date:** 2026-05-22 (continuation of 3.c session)
+
+**Goal (per user direction):** Make 365-day and 730-day bench horizons standard alongside the 60-day smoke run; identify and fix any pathologies the longer horizons expose.
+
+**Changes:**
+
+1. **`bench_trade` accepts a CLI horizon.** `cargo run --release -p sim-core --example bench_trade -- 365` runs a one-year sim; argv defaults to `DEFAULT_SIM_DAYS = 60` if absent. `SIM_DAYS`/`SIM_HOURS` constants removed; local `sim_days`/`sim_hours` threaded through the bench's three loops and print statements.
+
+2. **Crewing loop now tops up `Docked` ships too.** Previously `tick_daily_hiring` only processed `Hiring` ships and transitioned them to `Docked` the instant `crew_alive >= crew_min` — locking shipyard-built ships at exactly the minimum crew (~40% complement → 60% effective speed) for the rest of their life. Per user direction ("hiring sailors, especially unseasoned sailors in Europe or decently prosperous Caribbean ports, should basically always be possible"), the loop now also processes `Docked` ships at their current `docked_at_port`, topping them up toward `crew_typical`. The Hiring→Docked transition still fires at `crew_min` (a ship can put to sea undermanned in an emergency), but daily top-ups continue while it stays at port — and continue at *whatever* port it visits next, since sailors aren't faction-loyal and any port will sell their time.
+
+3. **BT reactivity guard.** While `Hiring`, the AI's root Selector ran priority-3 (`COND_HAS_DESTINATION → ACT_SAIL`). `ACT_SAIL` calls `set_steering` and returns `Running` even though the world's physics phase refuses to move a non-`Sailing` ship. That `Running` status pinned the Selector's `running_child[0] = 2` cursor on priority-3, so when `tick_daily_hiring` externally flipped the state to `Docked`, the AI **never re-checked `COND_IS_DOCKED`** and never entered the dock cycle (SELL/RESUPPLY/BUY/UNDOCK). Added a defensive guard at the top of `ShipAI::tick`: if `ship.state == Docked` and `bt::state.running_child` is non-empty, reset the BT state so this tick re-evaluates from priority 1.
+
+**Pathology discovered (and confirmed by 730-day sweep):**
+- Pre-fix, all ten shipyard-built ships in a 365-day run ended at `state=Docked, cargo=empty, P/L = -bounty_only` (just the sign-on bounty deducted). Diagnostic traces showed `ACT_UNDOCK`, `ACT_RESUPPLY`, and `in_destination_harbor` were **never** called for any built ship despite the BT containing all five dock-tree leaves. Tracing `COND_IS_DOCKED` showed it firing only a handful of times — confirming the Selector cursor was stuck on priority-3.
+
+**Verification (post-fix, with both crewing top-up and BT reactivity guard):**
+- `cargo test --workspace`: **110 passed.**
+- `cargo clippy --workspace --all-targets -- -D warnings`: clean.
+- `cargo run --release -p sim-core --example bench_trade -- 60`: fleet P/L **+96k → +101k**, ships built 7. Bankruptcy ticked from 2 → 4 because built ships now actually trade (and accrue chandler debt while doing so).
+- `… -- 365`: fleet P/L **+222k → +667k pesos**, ships built 10 → 14. Eight of the ten formerly-stuck built ships are now sailing with cargo and either profitable or carrying tradeable inventory. Equilibrium deviation effectively unchanged (210% mean).
+- `… -- 730`: fleet P/L **+431k → +725k**, ships built 13 → 21, total debt 76k. Sailor pools: European hubs 24k→26.5k (+11%/yr healthy growth), Caribbean entrepots ~flat (drained by hiring at growth rate — healthy steady state), Small Colonial +18%, PirateHaven flat at 74 (category growth ≈ 0 — calibration question for §12).
+
+**Open pathologies (intentionally deferred):**
+- **Amsterdam fluyt route saturation.** Seven of the seven `Manufactures`-loaded Amsterdam fluyts go negative at 365 days: they all pick the same most-profitable destination, saturate it, and run out of silver before they can rotate. This is a trade-planner / home-bias issue (more route diversity, or better cargo selection after saturation), not a crewing issue. Belongs in Phase 4 economic rebalancing.
+- **Provisions stock unbounded** (~+612/mo net production over consumption with most ports not draining at the rate they produce) — pre-existing demand-side weakness, not crewing-related.
+- **Elmina/Cadiz/Nantes mispriced** vs LP equilibrium (60%–6800% deviation) — these ports are visited rarely; equilibrium gap is structural, not a regression.
+- **PirateHaven sailor growth ≈ 0** — confirms crewing-plan §12 calibration question. Pirate havens grow only when prizes arrive (Step 8/9 feedback).
+
+**Workflow:**
+- `copilot-instructions.md` updated implicitly: 365-day and 730-day bench runs are now part of every Step verification going forward (alongside 60-day smoke).
+
+**Next action:** Step 4 (Factions + spatial hash). The remaining "ships in the red" at 365/730 are Amsterdam fluyts saturating one destination — they're sailing, just not profitably. That's an economic-rebalancing topic for Phase 4, not Step 3 crewing.

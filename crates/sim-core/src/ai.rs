@@ -199,6 +199,20 @@ impl ShipAI {
         markets: Option<&mut [PortMarket]>,
         goods: Option<&GoodsRegistry>,
     ) {
+        // Reactivity guard: the root Selector resumes from its last
+        // Running child every tick, so higher-priority branches are
+        // skipped while a lower-priority branch is still ticking. If
+        // the ship has since become `Docked` (e.g., daily hiring just
+        // transitioned a freshly-built hull from Hiring → Docked, or
+        // the ship was force-docked outside the BT), reset the BT
+        // state so this tick re-evaluates from `COND_IS_DOCKED` at
+        // the top of the Selector. Without this, built ships sit at
+        // dock running ACT_SAIL forever and never enter the dock
+        // tree's SELL/RESUPPLY/BUY/UNDOCK cycle.
+        if ship.state == ShipState::Docked && !self.state.running_child.is_empty() {
+            self.state.reset();
+        }
+
         let mut ctx = ShipBtContext {
             ship,
             stats,

@@ -1,12 +1,20 @@
-//! Run a 60-day calibration demo: spawn a small trader fleet, tick the
-//! simulation hour-by-hour, and report each ship's profit-and-loss
-//! together with a sample of port stockpiles and prices.
+//! Run a calibration demo over a configurable horizon: spawn a small
+//! trader fleet, tick the simulation hour-by-hour, and report each
+//! ship's profit-and-loss together with a sample of port stockpiles
+//! and prices.
 //!
-//! Used during Phase 2 step 9 to tune prosperity, monthly outputs, and
-//! pricing constants. Look for: most ships in the black, 1–2 in the
-//! red (some volatility), prices that oscillate but don't explode.
+//! Used during Phase 2/3 calibration to tune prosperity, monthly
+//! outputs, pricing constants, sailor-pool dynamics, and morale.
+//! The 60-day run is the quick smoke; 365 / 730-day runs surface
+//! slow-burn pathologies (pool collapse, runaway wages, equilibrium
+//! drift). Look for: most ships in the black, 1–2 in the red (some
+//! volatility), prices that oscillate but don't explode, sailor pools
+//! that stay within a 2× band of seed values.
 //!
-//! Usage: `cargo run --release --example bench_trade`
+//! Usage:
+//!   cargo run --release --example bench_trade            # 60-day default
+//!   cargo run --release --example bench_trade -- 365     # 1-year sweep
+//!   cargo run --release --example bench_trade -- 730     # 2-year sweep
 
 use sim_core::ai::ShipAI;
 use sim_core::equilibrium::{self, EquilibriumScenario, FreightCostModel, PortSpec};
@@ -18,8 +26,7 @@ use sim_core::world::World;
 use std::collections::BTreeMap;
 use std::path::Path;
 
-const SIM_DAYS: u32 = 60;
-const SIM_HOURS: u32 = SIM_DAYS * 24;
+const DEFAULT_SIM_DAYS: u32 = 60;
 
 /// Snapshot total stockpile (summed across all ports) and total
 /// in-transit cargo (summed across all ships) for every good. Used
@@ -71,6 +78,12 @@ fn record_recipe_flow(
 }
 
 fn main() {
+    let sim_days: u32 = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_SIM_DAYS);
+    let sim_hours: u32 = sim_days * 24;
+
     let mut world = World::load(Path::new("data/"));
 
     // Starter fleet: 5 ships seeded across the map.
@@ -103,10 +116,7 @@ fn main() {
     }
 
     let n_ships = world.ships.len();
-    println!(
-        "Phase 2 calibration run: {} days, {} ships",
-        SIM_DAYS, n_ships
-    );
+    println!("Calibration run: {} days, {} ships", sim_days, n_ships);
     println!();
 
     // Sample a few ports each week so we can see prices oscillate.
@@ -153,7 +163,7 @@ fn main() {
     );
 
     // Simulate.
-    for h in 1..=SIM_HOURS {
+    for h in 1..=sim_hours {
         world.tick();
         // Track origin names for any newly-built ships so the report
         // can label them. Scan for ShipIds we haven't seen yet (SlotMap
@@ -198,7 +208,7 @@ fn main() {
     }
 
     println!();
-    println!("Per-ship P/L after {} days:", SIM_DAYS);
+    println!("Per-ship P/L after {} days:", sim_days);
     println!(
         "{:<3}  {:<14}  {:<10}  {:>10}  {:>10}  {:>10}  {:>8}  {:>10}  {:<10}  {:<24}",
         "#",
