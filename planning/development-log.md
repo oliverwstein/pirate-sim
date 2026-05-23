@@ -790,3 +790,52 @@ Discovered while designing the boarding range: with hourly ticks and ships movin
 - Captured prizes still hold their original merchant cargo — Step 9 territory (the prize crew presumably sells it at the next haven). Worth a separate look once mutiny lands.
 - Tortuga and Nassau pirates run their magazines down to 0.4 t over 730 days (started with 4 t each). No Caribbean powder production means they would starve out long-term. Step 10 calibration question: should boarders salvage powder/shot from prizes?
 - Equilibrium LP deviation (max 6,851% at Elmina Tobacco) unchanged from pre-Step-8 — still a structural pricing question separate from combat.
+
+## Step 9 — Bankruptcy → Piracy mutiny trigger (commit `c237181`)
+
+Closes the Phase 2 economic loop into Phase 3 violence: a chronically bankrupt merchant at sea whose crew has finally given up flips `policy = Pirate` mid-voyage. The captain doesn't get a vote.
+
+### Trigger condition
+
+`policy == Merchant && state == Sailing && (debt + wages_owed_pesos) > MUTINY_DEBT_THRESHOLD && morale < MUTINY_MORALE_THRESHOLD`
+
+- `MUTINY_DEBT_THRESHOLD = 1.5 × MAX_SHIP_DEBT = 7500 pesos`
+- `MUTINY_MORALE_THRESHOLD = 0.25` (deep in the "sullen / mutinous" speed-throttle band)
+
+The plan originally specified `debt > MAX_SHIP_DEBT * 1.5` only, but the chandler-credit system caps raw `debt` at `MAX_SHIP_DEBT = 5000`, so 7500 is unreachable from debt alone. Combining `debt + wages_owed_pesos` makes the threshold mean what it should: total financial distress the crew can feel. A bankrupt ship at the chandler ceiling needs another ~20 months of unpaid wages to cross over.
+
+### Mutiny effects
+
+- `policy = Pirate`. The new pirate captain re-plans next tick (NavGoal cleared, waypoints flushed).
+- `debt = 0`, `wages_owed_pesos = 0`. Mutineers torch the books — debt to chandlers ashore and obligations to officers they just murdered are no longer their problem.
+- `morale = MUTINY_POST_FLIP_MORALE = 0.55`. Not euphoria, just a reset.
+
+### New morale wiring (the missing modifiers from the plan)
+
+- **`MORALE_LOSS_DEBT_HEAVY = 0.0015/hr`** when `debt >= MAX_SHIP_DEBT`. Maxed-out chandler credit = crew knows the captain is sunk. Drops morale ~0.036/day at the cap.
+- **`MORALE_GAIN_PRIZE_TAKEN = 0.30` one-shot** applied to the boarding attacker on a successful capture (Step 8 wiring). The "rises with prize money" half of the plan.
+
+### Diagnostics
+
+New `World.mutinies_total: u32` cumulative counter. Bench Combat ledger split into `seeded + captured + mutinied`. Total pirates afloat = sum.
+
+### Bench impact (730d)
+
+- Fleet P/L: **+3.48M** (vs +3.41M pre-Step-9 — small lift from heavy-debt morale loss compounding slightly into trade behavior, plus 1 fewer capture in the deterministic-seed roll).
+- Bankrupt: **8** (vs 7 pre-Step-9 — heavy-debt morale loss now starts biting before bankruptcy lock-in).
+- **Mutinies: 0**. The trigger is conservatively sized; bankrupt fluyts stay above the 0.25 morale floor because they dock often enough that the rested-in-port morale gain offsets the bleed. This is the realistic outcome — historical mutinies were tail events, not routine — but Step 10 will revisit calibration once we can run year-on-year fleets and see whether the long-tail rate should be higher.
+
+### Tests (147 total, was 141)
+
+6 new in `ship.rs`:
+- `morale_drops_on_heavy_debt` — single-tick verification
+- `mutiny_flips_indebted_low_morale_merchant_at_sea` — happy path, asserts policy + cleared debt + new morale
+- `mutiny_does_not_trigger_when_docked` — state guard
+- `mutiny_does_not_trigger_below_thresholds` — both gates fail-closed
+- `mutiny_triggers_on_wages_pushing_total_over_threshold` — the debt+wages combination
+- `mutiny_ignores_already_pirate_ships` — policy guard
+
+### Known follow-up
+
+- 730d shows zero mutinies. Either the threshold is too high in practice or the morale system doesn't drop bankrupt crews fast enough. The hypothesis is that frequent port docking + the rested-in-port morale gain (0.001/hr) cancels out the at-sea bleed. Step 10 calibration question: should the rested-in-port gain be gated on the ship being in funds (already half-gated on `wages_owed <= 0`)?
+- Captured ships and mutinied ships both end up Pirate-policy, but with different starting conditions (captured: morale 0.8, fresh prize crew; mutinied: morale 0.55, full original crew minus officers — currently we don't model the officer kill). Eventually worth distinguishing.
