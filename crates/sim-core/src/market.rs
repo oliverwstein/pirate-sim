@@ -519,11 +519,18 @@ impl PortArchetype {
                 ],
             ),
             PortArchetype::TobaccoColony => (
-                &[(TOBACCO, 60.0), (PROVISIONS, 4.0)],
+                // Charleston represents the whole Chesapeake/Carolina
+                // tobacco region in this map (no separate Virginia
+                // port). Historical 1680-1720 Chesapeake exports ran
+                // 15-25k tons/yr by the early 18th century; 100 t/mo
+                // here is a deliberate compression but balances the
+                // European re-export demand of ~165 t/mo. Scaled up
+                // inputs to match the bigger plantation operation.
+                &[(TOBACCO, 100.0), (PROVISIONS, 6.0)],
                 &[
-                    (PROVISIONS, 6.0),
-                    (MANUFACTURES, 4.0),
-                    (ENSLAVED_PERSONS, 2.0),
+                    (PROVISIONS, 10.0),
+                    (MANUFACTURES, 6.0),
+                    (ENSLAVED_PERSONS, 3.0),
                 ],
             ),
             PortArchetype::NorthAmericanFarming => (
