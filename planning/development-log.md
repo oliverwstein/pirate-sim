@@ -1011,3 +1011,75 @@ The bankruptcy bump is the expected counterpart to the mutiny drop: ships that p
 - Added `mutiny_skips_when_roll_above_probability`: with all deterministic conditions met but a roll just above the probability gate, no flip occurs.
 
 158 tests pass.
+
+## 2025-XX-XX — Phase 3 post-mortem cleanup (A1/A2/A3)
+
+Three focused refactors against `planning/phase-3-postmortem.md`, batched into one cleanup pass before drafting `phase-4-plan.md`.
+
+### A1 — Read-Compute-Write split in `tick_hourly_ai_and_physics` (`world.rs`)
+
+**Problem (postmortem §1).** The hourly tick fused three concerns into one per-ship loop: (a) the ship's AI ran and pushed `ShipCommand`s, (b) those commands were drained and applied *for that ship only*, and (c) the ship's resource/morale/physics tick ran. Combat commands push tuples shaped `(me, cmd)` where `me` is the *issuing* ship — but the drain step's filter conflated "this loop's ship" with "this command's target", giving order-dependent first-strike privileges to whichever ship's index was iterated first.
+
+**Fix.** Lifted the drain *out* of the per-ship loop. The hourly tick is now three phases iterating the same `ids` snapshot:
+
+1. **AI Phase** — `ai.tick(...)` for each ship; pushes to `self.commands`. No cross-ship mutation.
+2. **Resolution Phase** — drain `self.commands` once. Each tuple's first element is the attacker (no filtering needed). Steer / FireBroadside / AttemptBoard arms unchanged in mechanics, just relocated. Renamed local from `target` to `attacker` to match the tuple's semantics; fixed two stale `let attacker_id = id` references that should have been `let attacker_id = attacker`.
+3. **Mutation/Physics Phase** — for each ship: tick_resources, tick_morale, try_mutiny, hazards, wages, swept-physics-with-land. Order matches the original loop.
+
+**Determinism preserved** because the `ids` snapshot is collected once and reused across all three phases, and the per-ship RNG mixers (mutiny rolls share `self.combat_rng_state`; hazards use `self.weather.hazards`) read in the same order as before.
+
+**Validation.** All tests pass (158 → still 158 here, A2's tests come next). `bench_trade 730` post-A1: bankrupt 99→90, lost pirates 18→11, attrition 13→10 storm sinkings. The improvement is consistent with eliminating the artificial first-strike — the previous "faster ship in the iteration always shoots first" effect was reliably winning trades for pirates that shouldn't have won them.
+
+### A2 — `crew_seasoned: u16` on `Ship` (`ship.rs`)
+
+**Problem (postmortem §2 / crewing-plan §7.3).** `crew_alive` tracked headcount only — there was no way to distinguish a freshly-hired greenhorn crew from one that had survived a season of boarding actions and storms. Combat doctrine (Phase 4 +) needs this as a multiplier on rate-of-fire and boarding effectiveness.
+
+**Implementation.** New `u16` field with the invariant `crew_seasoned ≤ crew_alive`. Initialization:
+
+- `Ship::new` and `seeded_at_port_typed` → fully seasoned (veteran crews seeded on world genesis).
+- `freshly_built` (shipyard output) → 0 seasoned (hull-only).
+
+New methods:
+
+- `seasoned_ratio() -> f32` — for future combat modifiers.
+- `apply_crew_losses(losses)` — integer pro-rata split between seasoned and unseasoned, rounds toward zero (slightly biases losses toward unseasoned; acceptable for v1 and avoids float-determinism concerns).
+- `detach_prize_crew(amount) -> (alive, seasoned)` — pro-rata transfer when forming a prize crew.
+
+Wired in:
+
+- `tick_daily_hiring`: the hire loop already draws seasoned-first from the port pool; we now track the seasoned slice of `drawn` and credit it to `s.crew_seasoned` alongside `s.crew_alive`.
+- Boarding casualty application: replaced raw `saturating_sub` with `apply_crew_losses`.
+- "Take prize" branch: uses `detach_prize_crew` so the prize inherits its share of veterans.
+
+Three new unit tests in `ship.rs`: ratio preservation under losses, saturation + invariant, prize-crew split. 158 → 161 tests pass.
+
+### A3 — Multi-hop trade planning (`trade.rs`)
+
+**Problem (postmortem §2 "Home Bias / Amsterdam Fluyt pathology").** `find_best_trade` greedily scored single legs `A → B` by `sell_price_B − buy_price_A − distance_cost`, with a `home_bias` bonus applied to the immediate destination. Result: Barbados sloops locked onto Barbados↔Martinique oscillations (high single-leg margin, no onward export at Martinique), and Amsterdam-bound fluyts saturated single corridors because every cash-laden ship saw "going home" as the best single leg.
+
+**Fix.** Two-hop horizon (rolling — the AI still re-plans at every port, but it *scores* with a one-hop lookahead):
+
+1. For each candidate first hop `A → B`, look up the best speculative onward leg `B → C` (excluding `C = A` to forbid immediate-bounce trades).
+2. Score = `profit_AB + ONWARD_LOOKAHEAD_WEIGHT * min(profit_BC, profit_AB) + home_bonus`. Cap on `profit_BC` is critical (see calibration below).
+3. `home_bonus` applies to the *circuit terminus* (either `dest_idx == home` OR `onward_terminus == home`) — not just the immediate first hop. This is what kills the "ship goes home for the home bonus" pathology: the bias now requires the ship to *end* the multi-leg circuit at home.
+4. If there is no profitable onward leg from `B`, charge a `DEAD_END_PENALTY_PESOS_PER_TON` against the score.
+
+API back-compat preserved — `TradePlan` still carries only the first hop. Reported `estimated_profit_per_ton` is the unbiased single-leg margin (score is internal; analytics want the raw number).
+
+**Calibration story (worth recording).**
+
+| Variant | bankrupt @ 730d | notes |
+|---|---:|---|
+| Pre-A3 (post-A1 baseline) | 90 | |
+| `ONWARD_WEIGHT=0.5`, no cap | **162** | drained downstream ports forecast 300+ pesos/ton phantom sells; ships chased phantom circuits and over-committed |
+| `ONWARD_WEIGHT=0.15`, cap onward ≤ first-leg profit | **86** | clamp prevents speculative future from out-voting the certain present |
+
+Final constants: `ONWARD_LOOKAHEAD_WEIGHT = 0.15`, `DEAD_END_PENALTY_PESOS_PER_TON = 1.5`, `onward_used = min(onward_raw, first_leg_profit)`. The cap is the key insight: the lookahead is *real but speculative*; we don't trust it to override the immediate margin, only to break ties between equally-attractive immediate destinations.
+
+New private helper `best_single_leg_excluding(origin, exclude, ...)` factored out so both `find_best_trade` (for the lookahead) and future callers (post-prize replan, scout/observer behaviors) can share the same single-leg scoring path. New test `prefers_working_circuit_over_dead_end` pins the dead-end-vs-circuit decision with explicit recipes (custom `ProductionRecipe` for full control, since archetype defaults had confounding cross-good stockpiles).
+
+**Validation.** 162 tests pass (was 161; one new). Clippy clean. `bench_trade 730`: bankrupt 90 → 86 (∼5% drop, within noise but consistent). Prize activity up: from 0 taken / 1 sold / 1 sunk → 0 taken / 3 sold / 3 sunk (more ships now reach more ports). `bench_pathfind` unchanged (1406/1406 routes).
+
+**Performance.** Multi-hop is O(N²M²) per `find_best_trade` call (60 ports × 11 goods → ~436k inner ops). Called only at port re-plan, not every tick — well within budget.
+
+**Limitations recorded for Phase 4+.** The lookahead doesn't account for cargo-capacity differences between the first and second leg, doesn't model congestion (multiple ships converging on the same circuit), and treats all onward goods as fungible from the planner's perspective even though the ship will need to actually unload at B before reloading. None of these matter at the current scale; revisit if convoy behavior becomes a goal.

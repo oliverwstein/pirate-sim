@@ -166,6 +166,16 @@ pub struct Ship {
     /// to sea; provisions burn and effective speed scale with this
     /// in Step 3.c. See `planning/crewing-plan.md`.
     pub crew_alive: u16,
+    /// Of `crew_alive`, how many are seasoned (low-mortality, fully
+    /// proficient) hands — invariant: `crew_seasoned <= crew_alive`.
+    /// Tracked here (vs. derived) because the seasoned/unseasoned split
+    /// shifts asymmetrically through the ship's lifecycle: hiring draws
+    /// seasoned-first from the port pool, casualties take pro-rata
+    /// losses, and prize-crew transfers split pro-rata. Reserved as the
+    /// hook for combat modifiers (`seasoned_ratio()`); not yet wired
+    /// into the gunnery/boarding math. See `planning/crewing-plan.md
+    /// §7.3` and `planning/phase-3-postmortem.md §2`.
+    pub crew_seasoned: u16,
     /// Wages accrued to the crew but not yet paid. Accrues while at
     /// sea at `crew_alive * WAGE_PESOS_PER_MAN_MONTH / (30 * 24)`
     /// per hour; paid out of `Ship.silver` into the destination
@@ -252,8 +262,11 @@ impl Ship {
             lifetime_dock_count: 0,
             debt: 0.0,
             // Test / seed-fleet ships start fully crewed; the Hiring
-            // loop is for shipyard-built hulls only.
+            // loop is for shipyard-built hulls only. Seeded ships are
+            // veteran crews (100% seasoned) — bench fleets represent
+            // established merchant captains.
             crew_alive: stats.crew_typical(),
+            crew_seasoned: stats.crew_typical(),
             wages_owed_pesos: 0.0,
             morale: 1.0,
             faction: Faction::Free,
@@ -308,8 +321,10 @@ impl Ship {
             lifetime_dividends: 0.0,
             lifetime_dock_count: 0,
             debt: 0.0,
-            // Seed-fleet ships are fully crewed (no Hiring loop).
+            // Seed-fleet ships are fully crewed (no Hiring loop) and
+            // are assumed to be veteran crews — see `Ship::new` rationale.
             crew_alive: stats.crew_typical(),
+            crew_seasoned: stats.crew_typical(),
             wages_owed_pesos: 0.0,
             morale: 1.0,
             faction,
@@ -353,6 +368,7 @@ impl Ship {
             lifetime_dock_count: 0,
             debt: 0.0,
             crew_alive: 0,
+            crew_seasoned: 0,
             wages_owed_pesos: 0.0,
             morale: 1.0,
             faction,
@@ -447,6 +463,67 @@ impl Ship {
     /// `crew_alive`. See `planning/crewing-plan.md §7.2`.
     pub fn daily_provision_burn(&self) -> f32 {
         self.crew_alive as f32 * 0.0018
+    }
+
+    /// Fraction of the live crew that are seasoned hands, in `[0, 1]`.
+    /// Returns 0.0 when there is no crew (so the ratio is well-defined
+    /// at edge cases). Reserved as the input to combat modifiers
+    /// (gunnery rate, boarding power) — see `planning/crewing-plan.md
+    /// §7.3`. Wired now via `apply_crew_losses` and `detach_prize_crew`
+    /// so the value is meaningful before the modifiers land.
+    pub fn seasoned_ratio(&self) -> f32 {
+        if self.crew_alive == 0 {
+            return 0.0;
+        }
+        (self.crew_seasoned as f32 / self.crew_alive as f32).clamp(0.0, 1.0)
+    }
+
+    /// Apply `losses` to the crew, splitting them pro-rata between
+    /// seasoned and unseasoned. Losses larger than `crew_alive`
+    /// saturate. Preserves the `crew_seasoned <= crew_alive` invariant.
+    ///
+    /// Pro-rata is the right v1 model for boarding casualties: a
+    /// pike-thrust through a pressed landsman is as fatal as one
+    /// through a Spanish *maestre*, and the historical accounts
+    /// (Earle, Rediker) don't suggest officers/seasoned hands were
+    /// systematically spared during boardings. When v2 introduces
+    /// melee command (officers leading from the front), this can
+    /// shift to "seasoned slightly over-represented in losses."
+    pub fn apply_crew_losses(&mut self, losses: u16) {
+        if losses == 0 || self.crew_alive == 0 {
+            return;
+        }
+        let losses = losses.min(self.crew_alive);
+        // Integer pro-rata: rounds toward zero, which (slightly) biases
+        // losses toward unseasoned. Acceptable for v1 and avoids any
+        // floating-point determinism concern.
+        let seasoned_loss =
+            ((self.crew_seasoned as u32 * losses as u32) / (self.crew_alive as u32).max(1)) as u16;
+        self.crew_alive -= losses;
+        self.crew_seasoned = self
+            .crew_seasoned
+            .saturating_sub(seasoned_loss)
+            .min(self.crew_alive);
+    }
+
+    /// Detach `amount` crew from this ship, pro-rata over seasoned.
+    /// Returns `(detached_alive, detached_seasoned)` so the caller can
+    /// credit the recipient ship (prize crew transfer). Saturates at
+    /// `crew_alive`. Preserves the invariant on both ships when the
+    /// caller mirrors the (alive, seasoned) pair on the recipient.
+    pub fn detach_prize_crew(&mut self, amount: u16) -> (u16, u16) {
+        if amount == 0 || self.crew_alive == 0 {
+            return (0, 0);
+        }
+        let detached = amount.min(self.crew_alive);
+        let detached_seasoned = ((self.crew_seasoned as u32 * detached as u32)
+            / (self.crew_alive as u32).max(1)) as u16;
+        self.crew_alive -= detached;
+        self.crew_seasoned = self
+            .crew_seasoned
+            .saturating_sub(detached_seasoned)
+            .min(self.crew_alive);
+        (detached, detached_seasoned)
     }
 
     /// Crew-driven speed multiplier in `[0.0, 1.0]`. See
@@ -994,6 +1071,51 @@ mod tests {
         ship.debt = MUTINY_DEBT_THRESHOLD * 10.0;
         ship.morale = 0.0;
         assert!(!ship.try_mutiny(0.0));
+    }
+
+    /// Postmortem §2 / crewing-plan §7.3: pro-rata casualty splits keep
+    /// the seasoned ratio sensible across attrition. A ship that starts
+    /// half-seasoned and loses a quarter of its crew should still be
+    /// roughly half-seasoned (within integer rounding).
+    #[test]
+    fn apply_crew_losses_keeps_seasoned_ratio() {
+        let mut ship = Ship::new(Position::ZERO, ShipState::Sailing);
+        ship.crew_alive = 40;
+        ship.crew_seasoned = 20;
+        let ratio_before = ship.seasoned_ratio();
+        ship.apply_crew_losses(10);
+        assert_eq!(ship.crew_alive, 30);
+        // 20 * 10 / 40 = 5 seasoned lost -> 15 seasoned remain.
+        assert_eq!(ship.crew_seasoned, 15);
+        // Ratio held to within 1 head (integer rounding).
+        assert!((ship.seasoned_ratio() - ratio_before).abs() < 1.0 / 30.0);
+    }
+
+    /// Saturating losses must not violate the invariant
+    /// `crew_seasoned <= crew_alive`.
+    #[test]
+    fn apply_crew_losses_saturates_and_preserves_invariant() {
+        let mut ship = Ship::new(Position::ZERO, ShipState::Sailing);
+        ship.crew_alive = 5;
+        ship.crew_seasoned = 5;
+        ship.apply_crew_losses(100);
+        assert_eq!(ship.crew_alive, 0);
+        assert_eq!(ship.crew_seasoned, 0);
+    }
+
+    /// Prize-crew detachment splits seasoned pro-rata; the caller can
+    /// then credit the recipient with the same `(alive, seasoned)`
+    /// pair and the invariant holds on both ships.
+    #[test]
+    fn detach_prize_crew_splits_seasoned_pro_rata() {
+        let mut ship = Ship::new(Position::ZERO, ShipState::Sailing);
+        ship.crew_alive = 20;
+        ship.crew_seasoned = 10;
+        let (alive, seasoned) = ship.detach_prize_crew(8);
+        // 10 * 8 / 20 = 4 seasoned in the prize crew.
+        assert_eq!((alive, seasoned), (8, 4));
+        assert_eq!(ship.crew_alive, 12);
+        assert_eq!(ship.crew_seasoned, 6);
     }
 
     /// Step 11.b: the per-hour probability gate suppresses mutinies
