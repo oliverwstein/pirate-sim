@@ -17,8 +17,8 @@ fn main() {
     let build_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
     let edges: usize = nm.adj.iter().map(|v| v.len()).sum::<usize>() / 2;
-    let avg_deg = nm.adj.iter().map(|v| v.len()).sum::<usize>() as f32
-        / nm.nodes.len().max(1) as f32;
+    let avg_deg =
+        nm.adj.iter().map(|v| v.len()).sum::<usize>() as f32 / nm.nodes.len().max(1) as f32;
 
     println!("navmesh built in {:.1} ms", build_ms);
     println!("  nodes: {}", nm.nodes.len());
@@ -69,10 +69,30 @@ fn main() {
         ("Trinidad", "Bridgetown"),
     ];
     for (a, b) in routes {
-        let ai = match world.ports.iter().position(|p| p.name == *a) { Some(i) => i, None => { println!("  {} -> {}: missing", a, b); continue; } };
-        let bi = match world.ports.iter().position(|p| p.name == *b) { Some(i) => i, None => { println!("  {} -> {}: missing", a, b); continue; } };
-        let pa = world.harbors.for_port(ai).map(|h| h.anchor).unwrap_or(world.ports[ai].position);
-        let pb = world.harbors.for_port(bi).map(|h| h.anchor).unwrap_or(world.ports[bi].position);
+        let ai = match world.ports.iter().position(|p| p.name == *a) {
+            Some(i) => i,
+            None => {
+                println!("  {} -> {}: missing", a, b);
+                continue;
+            }
+        };
+        let bi = match world.ports.iter().position(|p| p.name == *b) {
+            Some(i) => i,
+            None => {
+                println!("  {} -> {}: missing", a, b);
+                continue;
+            }
+        };
+        let pa = world
+            .harbors
+            .for_port(ai)
+            .map(|h| h.anchor)
+            .unwrap_or(world.ports[ai].position);
+        let pb = world
+            .harbors
+            .for_port(bi)
+            .map(|h| h.anchor)
+            .unwrap_or(world.ports[bi].position);
         let starts = nm.visible_from(&world.map.land, pa, 120.0, 16, 0.0);
         let goals = nm.visible_from(&world.map.land, pb, 120.0, 16, 0.0);
         let t = Instant::now();

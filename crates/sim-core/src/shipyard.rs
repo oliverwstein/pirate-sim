@@ -109,7 +109,8 @@ pub fn starting_silver(ty: &ShipType, market: &PortMarket, goods: &GoodsRegistry
         ty.stats.cargo_capacity_tons * avg_export_price
     };
     let cap = market.silver * STARTING_SILVER_PORT_FRACTION_CAP;
-    raw.max(STARTING_SILVER_FLOOR).min(cap.max(STARTING_SILVER_FLOOR))
+    raw.max(STARTING_SILVER_FLOOR)
+        .min(cap.max(STARTING_SILVER_FLOOR))
 }
 
 /// Why one specific type was rejected (or accepted) at a yard.
@@ -148,7 +149,7 @@ pub fn try_build(
     types: &ShipTypeRegistry,
     avg_monthly_profit: f32,
 ) -> (BuildOutcome, Option<Ship>) {
-    let allowed = match port.shipyard {
+    let allowed = match &port.shipyard {
         Some(list) if !list.is_empty() => list,
         _ => return (BuildOutcome::NotAShipyard, None),
     };
@@ -224,7 +225,14 @@ pub fn try_build(
     }
 
     let start_silver = starting_silver(ty, market, goods);
-    let ship = Ship::freshly_built(port.position, port_idx, start_silver, chosen, &ty.stats);
+    let ship = Ship::freshly_built(
+        port.position,
+        port_idx,
+        start_silver,
+        chosen,
+        &ty.stats,
+        port.faction,
+    );
 
     (
         BuildOutcome::Built {
@@ -245,29 +253,32 @@ mod tests {
     use crate::shiptype::{ids as st_ids, ShipTypeRegistry};
     use crate::types::Position;
 
-    fn yard_port(name: &'static str, allowed: &'static [ShipTypeId]) -> Port {
+    fn yard_port(name: &str, allowed: &[ShipTypeId]) -> Port {
         Port {
-            name,
+            name: name.to_string(),
             position: Position::new(0.0, 0.0),
             faction: Faction::England,
             harbor_radius_nm: 20.0,
-            shipyard: Some(allowed),
+            shipyard: Some(allowed.to_vec()),
+            category: crate::pop::PortCategory::SmallColonial,
         }
     }
 
     fn nonyard() -> Port {
         Port {
-            name: "Bridgetown",
+            name: "Bridgetown".to_string(),
             position: Position::new(0.0, 0.0),
             faction: Faction::England,
             harbor_radius_nm: 8.0,
             shipyard: None,
+            category: crate::pop::PortCategory::SmallColonial,
         }
     }
 
     fn well_stocked_market() -> PortMarket {
         let goods = GoodsRegistry::starter();
-        let mut market = PortMarket::with_recipe(&goods, PortArchetype::NorthAmericanFarming.recipe());
+        let mut market =
+            PortMarket::with_recipe(&goods, PortArchetype::NorthAmericanFarming.recipe());
         market.stockpile.add(ids::NAVAL_STORES, 200.0);
         market.stockpile.add(ids::MANUFACTURES, 200.0);
         market.stockpile.add(ids::PROVISIONS, 200.0);
@@ -340,6 +351,21 @@ mod tests {
         assert!(matches!(outcome, BuildOutcome::Built { .. }));
         let sloop = types.get(st_ids::SLOOP);
         assert!((silver_before - market.silver - sloop.build_silver).abs() < 1e-2);
-        assert!(ns_before - market.stockpile.get(ids::NAVAL_STORES) >= sloop.build_naval_stores - 1e-3);
+        assert!(
+            ns_before - market.stockpile.get(ids::NAVAL_STORES) >= sloop.build_naval_stores - 1e-3
+        );
+    }
+
+    #[test]
+    fn freshly_built_ship_starts_hiring_with_no_crew() {
+        let goods = GoodsRegistry::starter();
+        let mut market = well_stocked_market();
+        let types = ShipTypeRegistry::starter();
+        let port = yard_port("Boston", &[st_ids::SLOOP]);
+        let (outcome, ship) = try_build(&port, 0, &mut market, &goods, &types, 2000.0);
+        assert!(matches!(outcome, BuildOutcome::Built { .. }));
+        let ship = ship.expect("ship");
+        assert_eq!(ship.state, crate::ship::ShipState::Hiring);
+        assert_eq!(ship.crew_alive, 0);
     }
 }

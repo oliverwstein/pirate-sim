@@ -13,7 +13,7 @@ use std::collections::VecDeque;
 
 use crate::map::land::LandMap;
 use crate::ship::{angle_diff, normalize_angle, speed_at_heading, ShipStats};
-use crate::types::{Position, WindVector};
+use crate::types::{Position, ShipId, WindVector};
 
 /// A steering command: the heading to set on the ship and the speed it
 /// should make good toward its target this tick (pre-fouling).
@@ -39,100 +39,274 @@ const DEFLECT_LOOKAHEAD_NM: f32 = 14.0;
 /// long voyages from grinding to literal zero in light winds.
 const MIN_UPWIND_VMG: f32 = 0.5;
 
-/// Navigation state for a ship (owned by AI, not by Ship itself).
-pub struct NavState {
+// --- Period-correct navigation (Nav-1/2/3) ---
+
+/// Per-hour latitude DR error standard deviation (NM) under normal
+/// cruising. Latitude is resettable via noon sight; this is what
+/// accumulates between sights.
+pub const DR_ERROR_LAT_NM_PER_HOUR: f32 = 0.05;
+/// Per-hour longitude DR error standard deviation (NM). Longitude has
+/// no equivalent to the noon sight in 1680 (the chronometer doesn't
+/// arrive until ~1761), so this accumulates unbounded until a
+/// landmark fix.
+pub const DR_ERROR_LON_NM_PER_HOUR: f32 = 0.15;
+/// Range (NM) at which a captain can recognize a known port / landfall
+/// well enough to fix his position. Sized so Caribbean islands at
+/// typical inter-port spacing (~150–300 NM) regularly provide fixes
+/// without two ports' sight-circles overlapping ambiguously.
+pub const LANDMARK_SIGHT_NM: f32 = 20.0;
+/// Latitude noise (NM) introduced by a noon sight (sextant ≈ 1' arc ≈
+/// 1 NM at best; we model 0.5 NM stddev as good-conditions accuracy).
+const NOON_SIGHT_NOISE_NM: f32 = 0.5;
+/// Position noise (NM) introduced by a landmark fix. Recognizing the
+/// silhouette of an island puts you within a mile or so of where you
+/// think you are — far better than a noon sight in both axes.
+const LANDMARK_FIX_NOISE_NM: f32 = 1.0;
+
+/// xorshift64 — same generator the AI already uses; mutates `state`.
+fn xorshift64(state: &mut u64) -> u64 {
+    let mut x = *state;
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    *state = x;
+    x
+}
+
+/// Uniform in (0, 1].
+fn uniform01(state: &mut u64) -> f32 {
+    // Mask to 53 bits, divide by 2^53 — gives [0, 1). Add epsilon so
+    // the Box-Muller log doesn't blow up on 0.
+    let bits = xorshift64(state) >> 11;
+    (bits as f32 / (1u64 << 53) as f32).max(1e-7)
+}
+
+/// One sample of N(0, 1) via Box-Muller. Cheap (two uniforms, one log,
+/// one cos) and deterministic given the RNG state.
+fn gaussian(state: &mut u64) -> f32 {
+    let u1 = uniform01(state);
+    let u2 = uniform01(state);
+    (-2.0 * u1.ln()).sqrt() * (2.0 * std::f32::consts::PI * u2).cos()
+}
+
+/// Walk the dead-reckoning estimate by one hour. Error scales with the
+/// commanded speed — a ship hove-to at zero kt doesn't drift. The
+/// `error_multiplier` is reserved for the storm step (Nav-5+); pass 1.0
+/// in normal conditions.
+pub fn apply_dr_error(
+    estimate: &mut Position,
+    speed_kt: f32,
+    error_multiplier: f32,
+    rng_state: &mut u64,
+) {
+    let scale = (speed_kt.max(0.0) / 6.0) * error_multiplier; // 6 kt ≈ typical sloop cruise
+    estimate.x += gaussian(rng_state) * DR_ERROR_LON_NM_PER_HOUR * scale;
+    estimate.y += gaussian(rng_state) * DR_ERROR_LAT_NM_PER_HOUR * scale;
+}
+
+/// Attempt a noon sight: at most once per simulated day. Returns `true`
+/// on success. Snaps the estimate's **latitude** to truth.y plus
+/// small Gaussian noise. Longitude is unchanged — there was no way to
+/// measure it from a sextant alone in 1680.
+pub fn try_noon_sight(
+    estimate: &mut Position,
+    truth: Position,
+    day_of_year: u16,
+    last_sight_day: &mut u16,
+    rng_state: &mut u64,
+) -> bool {
+    if day_of_year == 0 || day_of_year == *last_sight_day {
+        return false;
+    }
+    estimate.y = truth.y + gaussian(rng_state) * NOON_SIGHT_NOISE_NM;
+    *last_sight_day = day_of_year;
+    true
+}
+
+/// Attempt a landmark fix: if any port is within `LANDMARK_SIGHT_NM` of
+/// the ship's true position, snap the estimate to truth plus small
+/// Gaussian noise. Returns the port index on success.
+///
+/// Caller-side LoS gating (e.g., requiring an unobstructed line through
+/// the navmesh land grid) can be added later by passing a pre-filtered
+/// `ports` slice or wrapping this call. For Nav-3 we accept that, at
+/// 20 NM, line-of-sight to a Caribbean island is essentially always
+/// available.
+pub fn try_landmark_fix(
+    estimate: &mut Position,
+    truth: Position,
+    ports: &[crate::port::Port],
+    rng_state: &mut u64,
+) -> Option<usize> {
+    for (idx, port) in ports.iter().enumerate() {
+        if truth.distance(port.position) <= LANDMARK_SIGHT_NM {
+            estimate.x = truth.x + gaussian(rng_state) * LANDMARK_FIX_NOISE_NM;
+            estimate.y = truth.y + gaussian(rng_state) * LANDMARK_FIX_NOISE_NM;
+            return Some(idx);
+        }
+    }
+    None
+}
+
+/// The captain's long-term intent. Owned by `ShipAI` (the captain) — when
+/// the captain is replaced, the goal is replaced too. Phase-3 split: this
+/// is the "where I want to go" half of the legacy `NavState`.
+///
+/// As of Nav-1/2/3, also owns the captain's *belief* about where the
+/// ship is (`estimated_position`). Plans, arrival checks, and BT
+/// conditions evaluate against this estimate; the gap between
+/// `estimated_position` and `ship.position` (truth) is what creates the
+/// period-realistic getting-lost / landmark-fix behaviors.
+#[derive(Debug, Clone, Default)]
+pub struct NavGoal {
     /// Final goal — once cleared, the ship has arrived.
     pub destination: Option<Position>,
     /// Index of the destination port, when the destination is one. Enables
     /// harbor-zone arrival in the AI layer; geometric arrival is still used
     /// for free-form destinations (None).
     pub dest_port: Option<usize>,
-    /// Index of the port the ship is currently docked at, if any. Set when
-    /// `ACT_SAIL` transitions into Docked, cleared on undock. Lets dock-time
-    /// behaviors (resupply, careen, trade) find the right port market.
-    pub docked_at_port: Option<usize>,
-    /// Ordered intermediate waypoints (front = next target). The final
-    /// element should equal `destination` when a path was planned.
-    pub waypoints: VecDeque<Position>,
+    /// Captain's dead-reckoning estimate of the ship's position. `None`
+    /// until the AI's first tick, when it's lazily initialized to the
+    /// true position (perfect noon-sight at launch). After that it walks
+    /// via DR error and snaps on noon sights / landmark fixes.
+    pub estimated_position: Option<Position>,
+    /// `SimDate::day_of_year` on which we last took a noon sight (snapped
+    /// the latitude). 0 means "never". Used to throttle noon sights to
+    /// once per day per ship.
+    pub last_noon_sight_day: u16,
+    /// Step 6: a Pirate ship's current quarry. Set/cleared by the
+    /// `see_prey` condition; consumed by `act_pursue`. `None` means
+    /// "not currently chasing anything". Survives across ticks for
+    /// chase coherence (hysteresis: a pirate keeps chasing past the
+    /// initial detection range as long as the target stays in a
+    /// slightly wider band — see `ai::PURSUE_BREAKOFF_NM`).
+    pub pursue_target: Option<ShipId>,
+    /// Step 6: a Merchant ship's current threat. Set/cleared by the
+    /// `see_threat` condition; consumed by `act_flee`. Same hysteresis
+    /// as `pursue_target` — once seen, the merchant keeps fleeing
+    /// until the threat falls outside the breakoff range.
+    pub flee_from: Option<ShipId>,
 }
 
-impl NavState {
+impl NavGoal {
     pub fn new() -> Self {
-        Self {
-            destination: None,
-            dest_port: None,
-            docked_at_port: None,
-            waypoints: VecDeque::new(),
-        }
+        Self::default()
     }
 
     pub fn with_destination(dest: Position) -> Self {
         Self {
             destination: Some(dest),
             dest_port: None,
-            docked_at_port: None,
-            waypoints: VecDeque::new(),
+            estimated_position: None,
+            last_noon_sight_day: 0,
+            pursue_target: None,
+            flee_from: None,
         }
     }
 
-    /// Replace the current waypoint queue with a planned path. The final
-    /// waypoint is taken to be the destination.
+    pub fn clear(&mut self) {
+        self.destination = None;
+        self.dest_port = None;
+    }
+}
+
+/// The ship's in-flight navigation tracking — what waypoints it's currently
+/// following and what port (if any) it's moored at. Owned by `Ship` because
+/// it's a property of the hull's commitments to the world, not the captain.
+/// If the captain is swapped (Phase 4 player/scripted/scripted captains),
+/// the ship still has the same waypoints queued and the same mooring.
+#[derive(Debug, Clone, Default)]
+pub struct NavTrack {
+    /// Index of the port the ship is currently docked at, if any. Set when
+    /// `ACT_SAIL` transitions into Docked, cleared on undock. Lets dock-time
+    /// behaviors (resupply, careen, trade) find the right port market.
+    pub docked_at_port: Option<usize>,
+    /// Ordered intermediate waypoints (front = next target). The final
+    /// element should equal the captain's `NavGoal.destination` when a path
+    /// was planned.
+    pub waypoints: VecDeque<Position>,
+}
+
+impl NavTrack {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Replace the current waypoint queue with a planned path. Caller is
+    /// responsible for keeping the captain's `NavGoal.destination` in sync
+    /// with the path's final waypoint (typically they already match because
+    /// the path was planned *to* the destination).
     pub fn set_path(&mut self, waypoints: Vec<Position>) {
-        if let Some(last) = waypoints.last().copied() {
-            self.destination = Some(last);
-        }
         self.waypoints = waypoints.into();
     }
 
-    /// Clear any planned path (keeps `destination` in place).
+    /// Clear any planned path (keeps `goal.destination` in place).
     pub fn clear_path(&mut self) {
         self.waypoints.clear();
     }
 
-    /// The current heading target: front waypoint if any, else destination.
-    fn current_target(&self) -> Option<Position> {
-        self.waypoints.front().copied().or(self.destination)
+    /// The current heading target: front waypoint if any, else goal destination.
+    fn current_target(&self, goal: &NavGoal) -> Option<Position> {
+        self.waypoints.front().copied().or(goal.destination)
     }
 
     /// Compute steering (heading + commanded speed) given current position,
     /// wind, and destination. Returns None if no destination is set or the
-    /// ship has arrived.
+    /// ship has arrived. Mutates self (waypoint advancement) and goal
+    /// (destination cleared on final arrival).
     ///
     /// The returned heading is always direct toward the next waypoint /
     /// destination. When that bearing lies inside the no-go zone, the
     /// returned `speed` reflects the velocity-made-good of an optimal
     /// (instantaneous) tack, so coastal voyages don't drift sideways.
     ///
+    /// `pos_estimate` is the captain's belief about where the ship is —
+    /// used to plot bearings and advance waypoints (the captain crosses
+    /// a waypoint when he thinks he has). `pos_truth` is the actual
+    /// position — used **only** to decide that the voyage is complete
+    /// and clear `goal.destination`. (A real captain doesn't declare
+    /// arrival; the lookout shouts "land ho!" when truth reaches port.
+    /// The landmark fix is what then collapses estimate onto truth.)
+    ///
     /// `land` is optional; when provided, the heading is reactively deflected
     /// to clear nearby coastline (a safety net for when wind / drift pushes
     /// the ship close to land between planner waypoints).
+    #[allow(clippy::too_many_arguments)]
     pub fn compute_steering(
         &mut self,
-        pos: Position,
+        goal: &mut NavGoal,
+        pos_estimate: Position,
+        pos_truth: Position,
         stats: &ShipStats,
         wind: &WindVector,
         land: Option<&LandMap>,
     ) -> Option<Steering> {
-        // Advance through waypoints we've already reached.
+        // Advance through waypoints we've already reached (per the
+        // captain's belief — he checks them off as he passes them).
+        // This is honest: a real captain looks at his chart and his
+        // DR plot, not at a GPS truth. The minor "corner cutting"
+        // this causes when estimate is biased is bounded by DR
+        // noise (a NM or two) — well under WAYPOINT_REACHED_NM.
         while let Some(&wp) = self.waypoints.front() {
-            if pos.distance(wp) < WAYPOINT_REACHED_NM {
+            if pos_estimate.distance(wp) < WAYPOINT_REACHED_NM {
                 self.waypoints.pop_front();
             } else {
                 break;
             }
         }
 
-        let dest = self.destination?;
+        let dest = goal.destination?;
 
-        // Final arrival check (only when no intermediate waypoints remain).
-        if self.waypoints.is_empty() && pos.distance(dest) < ARRIVAL_NM {
-            self.destination = None;
+        // Final arrival check uses TRUTH: a ship has arrived when its
+        // hull is at the harbor, not when its captain thinks it has.
+        if self.waypoints.is_empty() && pos_truth.distance(dest) < ARRIVAL_NM {
+            goal.destination = None;
             return None;
         }
 
-        let target = self.current_target()?;
+        let target = self.current_target(goal)?;
 
-        let delta = target - pos;
+        let delta = target - pos_estimate;
         let bearing_to_target = normalize_angle(delta.x.atan2(delta.y).to_degrees());
         let wind_from = wind.direction_from();
 
@@ -146,15 +320,29 @@ impl NavState {
             // optimal tack. We pick whichever side gives better progress.
             let port_h = normalize_angle(wind_from - stats.no_go_half_angle);
             let stbd_h = normalize_angle(wind_from + stats.no_go_half_angle);
-            let port_vmg = vmg(port_h, bearing_to_target, speed_at_heading(port_h, stats, wind));
-            let stbd_vmg = vmg(stbd_h, bearing_to_target, speed_at_heading(stbd_h, stats, wind));
+            let port_vmg = vmg(
+                port_h,
+                bearing_to_target,
+                speed_at_heading(port_h, stats, wind),
+            );
+            let stbd_vmg = vmg(
+                stbd_h,
+                bearing_to_target,
+                speed_at_heading(stbd_h, stats, wind),
+            );
             port_vmg.max(stbd_vmg).max(MIN_UPWIND_VMG)
         };
 
         // Reactive land deflection (optional). Keeps the ship from sailing
         // into a coast between planner waypoints (e.g., when blown sideways).
+        // Uses TRUTH, not estimate: this represents the lookout/crew seeing
+        // breakers ahead of the actual hull. Without this, DR error could
+        // put the captain's mental ship safely offshore while the real hull
+        // grounds on a reef the lookouts could plainly see.
         let heading = match land {
-            Some(land) => deflect_for_land(pos, bearing_to_target, land, DEFLECT_LOOKAHEAD_NM),
+            Some(land) => {
+                deflect_for_land(pos_truth, bearing_to_target, land, DEFLECT_LOOKAHEAD_NM)
+            }
             None => bearing_to_target,
         };
 
@@ -219,10 +407,20 @@ mod tests {
 
     #[test]
     fn test_direct_heading() {
-        let mut nav = NavState::with_destination(Position::new(100.0, 0.0));
+        let mut goal = NavGoal::with_destination(Position::new(100.0, 0.0));
+        let mut nav = NavTrack::new();
         let stats = ShipStats::sloop();
         let wind = WindVector { u: 0.0, v: 15.0 }; // from south
-        let s = nav.compute_steering(Position::ZERO, &stats, &wind, None).unwrap();
+        let s = nav
+            .compute_steering(
+                &mut goal,
+                Position::ZERO,
+                Position::ZERO,
+                &stats,
+                &wind,
+                None,
+            )
+            .unwrap();
         assert!((s.heading - 90.0).abs() < 1.0);
         assert!(s.speed > 5.0, "beam reach should be fast");
     }
@@ -231,25 +429,46 @@ mod tests {
     fn test_upwind_uses_vmg_speed() {
         // Heading is direct toward target even when in the no-go zone, but
         // commanded speed is the VMG of an optimal tack.
-        let mut nav = NavState::with_destination(Position::new(0.0, 100.0));
+        let mut goal = NavGoal::with_destination(Position::new(0.0, 100.0));
+        let mut nav = NavTrack::new();
         let stats = ShipStats::sloop();
         let wind = WindVector { u: 0.0, v: -15.0 }; // from north
-        let s = nav.compute_steering(Position::ZERO, &stats, &wind, None).unwrap();
+        let s = nav
+            .compute_steering(
+                &mut goal,
+                Position::ZERO,
+                Position::ZERO,
+                &stats,
+                &wind,
+                None,
+            )
+            .unwrap();
         // Heading is direct (north).
         assert!(angle_diff(s.heading, 0.0).abs() < 1.0);
         // Speed is reduced (VMG, not full hull speed).
-        assert!(s.speed < stats.speed_typical, "upwind VMG should be slower than typical");
+        assert!(
+            s.speed < stats.speed_typical,
+            "upwind VMG should be slower than typical"
+        );
         assert!(s.speed > MIN_UPWIND_VMG, "should still make some progress");
     }
 
     #[test]
     fn test_arrival_clears_destination() {
-        let mut nav = NavState::with_destination(Position::new(3.0, 0.0));
+        let mut goal = NavGoal::with_destination(Position::new(3.0, 0.0));
+        let mut nav = NavTrack::new();
         let stats = ShipStats::sloop();
         let wind = WindVector { u: 0.0, v: 15.0 };
-        let result = nav.compute_steering(Position::ZERO, &stats, &wind, None);
+        let result = nav.compute_steering(
+            &mut goal,
+            Position::ZERO,
+            Position::ZERO,
+            &stats,
+            &wind,
+            None,
+        );
         assert!(result.is_none()); // within ARRIVAL_NM
-        assert!(nav.destination.is_none());
+        assert!(goal.destination.is_none());
     }
 
     #[test]

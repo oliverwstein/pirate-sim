@@ -1,5 +1,7 @@
 # Pirate Sim: System Architecture (Draft)
 
+## Note: this is a pre-code document, which may become outdated with time. Note when that happens. 
+
 ## Core Principles
 
 1. **Headless-first:** `sim-core` is a pure library with zero rendering/UI/windowing dependencies. Any program can drive the simulation (visualizer, CLI, test harness, AI trainer).

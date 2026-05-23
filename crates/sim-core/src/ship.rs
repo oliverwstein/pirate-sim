@@ -1,16 +1,30 @@
 use crate::cargo::Cargo;
+use crate::nav::NavTrack;
+use crate::port::Faction;
 use crate::types::{Position, WindVector};
+use serde::Deserialize;
 
 /// Ship performance characteristics.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct ShipStats {
-    pub speed_typical: f32,    // knots in moderate trade winds
-    pub speed_max: f32,        // absolute maximum
-    pub windward_ability: f32, // 0.0-1.0 (how well it sails upwind)
-    pub no_go_half_angle: f32, // degrees from wind that ship cannot sail into
-    pub crew: u32,             // crew complement (determines provision consumption)
-    pub provision_capacity: f32, // max tons of provisions (separate from trade hold)
+    pub speed_typical: f32,       // knots in moderate trade winds
+    pub speed_max: f32,           // absolute maximum
+    pub windward_ability: f32,    // 0.0-1.0 (how well it sails upwind)
+    pub no_go_half_angle: f32,    // degrees from wind that ship cannot sail into
+    pub crew: u32,                // crew complement (determines provision consumption)
+    pub provision_capacity: f32,  // max tons of provisions (separate from trade hold)
     pub cargo_capacity_tons: f32, // max tons of trade cargo
+    /// Step 7: number of broadside-firing cannons (one broadside fires
+    /// `cannons` guns per tick when in range and supplied). Static per
+    /// ship type for now; a later step may promote cannons to a Good.
+    pub cannons: u16,
+    /// Step 7: maximum hull integrity (HP). Damage saturates at 0; for
+    /// Step 7 a hulled ship stays afloat (sinking lands in Step 8).
+    pub hull_integrity_max: f32,
+    /// Step 7: maximum rigging integrity. Effective speed scales with
+    /// `rigging_integrity / rigging_integrity_max` — knocking a chaser's
+    /// rigging down is how a slower merchant can break contact.
+    pub rigging_integrity_max: f32,
 }
 
 impl ShipStats {
@@ -23,13 +37,32 @@ impl ShipStats {
             crew: 25,
             provision_capacity: 6.0, // ~130 days of food for 25 crew — historical 17C ocean-going ships carried 3–4 months of provisions for transatlantic crossings
             cargo_capacity_tons: 60.0, // typical sloop trade hold (Phase 2 starter)
+            cannons: 8,
+            hull_integrity_max: 100.0,
+            rigging_integrity_max: 80.0,
         }
     }
 
-    /// Daily provision consumption in tons (based on crew size).
-    /// Historical: ~4 lbs/man/day total food = 0.0018 tons/man/day.
+    /// Daily provision consumption in tons for a ship of design
+    /// crew complement. Historical: ~4 lbs/man/day total food =
+    /// 0.0018 tons/man/day. Use `Ship::daily_provision_burn` for
+    /// the *actual* current burn rate (scales with `crew_alive`).
     pub fn daily_provision_consumption(&self) -> f32 {
         self.crew as f32 * 0.0018
+    }
+
+    /// Minimum crew to safely put to sea. Derived as 40% of the
+    /// design complement until per-type minimums land in the RON.
+    /// See `planning/crewing-plan.md §2`.
+    pub fn crew_min(&self) -> u16 {
+        let m = (self.crew as f32 * 0.4).ceil() as u16;
+        m.max(2)
+    }
+
+    /// Design complement (`stats.crew` rendered as u16 for crew
+    /// arithmetic). Will become its own RON field in a later step.
+    pub fn crew_typical(&self) -> u16 {
+        self.crew as u16
     }
 
     /// Estimated voyage time in days for a great-circle distance, used
@@ -48,6 +81,17 @@ pub enum ShipState {
     Sailing,
     Docked,
     Anchored,
+    /// Freshly-built or freshly-discharged hull awaiting a crew.
+    /// World ticks daily and draws sailors from the home port's
+    /// `PortDemographics`; transitions to `Docked` when
+    /// `crew_alive >= stats.crew_min()`. See `planning/crewing-plan.md §3`.
+    Hiring,
+    /// Step 8: ship has been sunk this tick (hull integrity at 0, or
+    /// boarded and burned by a pirate too short-crewed to take a prize).
+    /// Sunk ships are skipped by the rest of the hourly loop and removed
+    /// from the world by the Cleanup Phase at end-of-tick. The id then
+    /// becomes permanently invalid (SlotMap generation bumps).
+    Sunk,
 }
 
 /// Default starting silver (pesos) for a freshly-spawned merchant ship.
@@ -55,15 +99,34 @@ pub enum ShipState {
 /// and to buy a partial speculative cargo of sugar at base price.
 pub const STARTING_SILVER_PESOS: f32 = 5000.0;
 
+/// What a ship is "doing" at the strategic level — drives BT branch
+/// selection in Step 6 (pursue vs flee vs trade). Distinct from
+/// `ShipState` (Docked/Sailing/Hiring/Anchored), which is the
+/// physical/operational state of the hull. Defaults to `Merchant`.
+///
+/// Step 6 keeps the enum small: only `Merchant` and `Pirate`. Future
+/// steps will extend with `Privateer { against: FactionSet }` and
+/// `Navy`. Per-ship rather than per-faction because piracy/privateering
+/// is a contract held by a captain, not a property of his flag (a Free
+/// ship can be merchant; an English ship can be privateer).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ShipPolicy {
+    /// Default: trade, avoid pirates, run for friendly port if threatened.
+    #[default]
+    Merchant,
+    /// Hunt richer/slower merchant prey within visual range.
+    Pirate,
+}
+
 /// A ship: purely physical entity. Heading is set externally by AI/player.
 pub struct Ship {
     pub position: Position,
-    pub heading: f32,          // degrees (0=N, 90=E, clockwise)
-    pub speed: f32,            // current speed in knots
+    pub heading: f32, // degrees (0=N, 90=E, clockwise)
+    pub speed: f32,   // current speed in knots
     pub state: ShipState,
-    pub provisions: f32,       // tons of food remaining (separate from trade hold)
-    pub cargo: Cargo,          // trade goods (subject to cargo_capacity_tons)
-    pub hull_fouling: f32,     // 0 = clean, 100 = fully encrusted
+    pub provisions: f32,   // tons of food remaining (separate from trade hold)
+    pub cargo: Cargo,      // trade goods (subject to cargo_capacity_tons)
+    pub hull_fouling: f32, // 0 = clean, 100 = fully encrusted
     /// Pesos in the ship's strongbox. Spent at port markets to buy
     /// provisions and trade goods; earned by selling cargo.
     pub silver: f32,
@@ -88,6 +151,8 @@ pub struct Ship {
     /// into the port treasury and added here. True lifetime P/L for a
     /// home-ported ship is `(silver - starting_silver) + lifetime_dividends`.
     pub lifetime_dividends: f32,
+    /// Total dock events across the ship's life (instrumentation).
+    pub lifetime_dock_count: u32,
     /// Outstanding credit drawn from port chandlers/factors —
     /// either provisions taken on tick when broke, or freight cargo
     /// (tramping) advanced against the next sale. Repaid out of any
@@ -96,6 +161,76 @@ pub struct Ship {
     /// is what bills of exchange between merchant correspondents
     /// enabled.
     pub debt: f32,
+    /// Live head-count. Distinct from `stats.crew_typical()` (the
+    /// design complement). Ships need `>= stats.crew_min()` to put
+    /// to sea; provisions burn and effective speed scale with this
+    /// in Step 3.c. See `planning/crewing-plan.md`.
+    pub crew_alive: u16,
+    /// Wages accrued to the crew but not yet paid. Accrues while at
+    /// sea at `crew_alive * WAGE_PESOS_PER_MAN_MONTH / (30 * 24)`
+    /// per hour; paid out of `Ship.silver` into the destination
+    /// port's market silver on each dock visit. See
+    /// `planning/crewing-plan.md §6`.
+    pub wages_owed_pesos: f32,
+    /// Crew morale in `[0.0, 1.0]`. 1.0 = content, 0.0 = mutinous.
+    /// Ticks hourly per `planning/crewing-plan.md §8`: drops with
+    /// low provisions, unpaid wages, damage (Step 7), and rises
+    /// with rest in port and prize money (Step 8). Effect bands
+    /// throttle recruitment (0.4–0.7) and speed (0.25–0.4); deeper
+    /// bands trigger mutiny / desertion in Step 9.
+    pub morale: f32,
+    /// Flag this ship sails under. For shipyard-built hulls this is the
+    /// owner port's faction at launch. Can change at runtime (e.g., when
+    /// a ship is captured as a prize in Step 8 it takes on the
+    /// capturer's faction). Test/scaffolding ships built via
+    /// `Ship::new` default to `Faction::Free`.
+    pub faction: Faction,
+    /// Strategic policy — Merchant (default), Pirate, etc. Drives the
+    /// high-priority pursue/flee branches in the BT (Step 6). Distinct
+    /// from `faction`: a Pirate ship can fly any flag. Captured prizes
+    /// (Step 8) and bankrupt merchants turning to piracy (Step 9) will
+    /// flip this at runtime.
+    pub policy: ShipPolicy,
+    /// In-flight navigation tracking — which port the ship is currently
+    /// moored at (if any) and the waypoint queue it's following.
+    /// Distinct from the captain's `NavGoal` (which lives on `ShipAI`):
+    /// these are the ship's commitments to the world that persist across
+    /// captain swaps. See `planning/development-log.md` Step 5.b.
+    pub nav: NavTrack,
+    /// What the ship is doing while docked (Resupplying, Careening, or
+    /// Idle). Drives display + dock-tree action selection. Moved off
+    /// `ShipAI` in Step 5.b because a careen in progress is a property
+    /// of the hull (paint scraped, ship beached), not the captain.
+    pub dock_action: DockAction,
+    /// Step 7: current hull integrity in `[0, stats.hull_integrity_max]`.
+    /// Decremented by broadside hits in the Resolution Phase. A hulled
+    /// ship still floats and still fights for Step 7; sinking thresholds
+    /// arrive with Step 8 (boarding & sinking).
+    pub hull_integrity: f32,
+    /// Step 7: current rigging integrity. Multiplies `effective_speed`
+    /// by `rigging_integrity / stats.rigging_integrity_max` — a fully-
+    /// dismasted ship is dead in the water and easy prize for boarders.
+    pub rigging_integrity: f32,
+    /// Step 10.b: structural worm damage in `[0, 100]`. Distinct from
+    /// `hull_fouling` (which is barnacles/weed and only hurts speed):
+    /// teredo eats the planking and drives the foundering hazard roll
+    /// in `weather::hazards`. Accumulates fastest in tropical water
+    /// and is reduced by careening. See
+    /// `planning/research/ship-attrition-economics-1650-1720.md §1.3`.
+    pub teredo_damage: f32,
+    /// Step 10.b: age in days since seeding/build. Multiplies the
+    /// foundering hazard rate so older hulls fail more readily, and
+    /// will eventually drive economic obsolescence in later steps.
+    pub age_days: u32,
+}
+
+/// What the ship is doing while docked. Used by the docking sequence in
+/// the AI's BT, and by the viz to show port activity.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DockAction {
+    Idle,
+    Resupplying,
+    Careening,
 }
 
 impl Ship {
@@ -114,20 +249,49 @@ impl Ship {
             ship_type: crate::shiptype::ids::SLOOP,
             starting_silver: STARTING_SILVER_PESOS,
             lifetime_dividends: 0.0,
+            lifetime_dock_count: 0,
             debt: 0.0,
+            // Test / seed-fleet ships start fully crewed; the Hiring
+            // loop is for shipyard-built hulls only.
+            crew_alive: stats.crew_typical(),
+            wages_owed_pesos: 0.0,
+            morale: 1.0,
+            faction: Faction::Free,
+            policy: ShipPolicy::Merchant,
+            nav: NavTrack::new(),
+            dock_action: DockAction::Idle,
+            hull_integrity: stats.hull_integrity_max,
+            rigging_integrity: stats.rigging_integrity_max,
+            teredo_damage: 0.0,
+            age_days: 0,
         }
     }
 
-    /// Construct a ship freshly built at a specific shipyard port, with
-    /// a custom amount of starting silver (sized at build time to be
-    /// roughly enough to buy one hold of cargo at the home port). The
-    /// ship's `owner_port` is set so future remittance logic can find it.
-    pub fn freshly_built(
+    /// Construct a ship seeded into the world at a specific home port
+    /// (the typical entry point for the starter fleet in `bench_trade`
+    /// and headless scenarios). Unlike `freshly_built`, this ship is
+    /// fully crewed and ready to sail — there's no shipyard `Hiring`
+    /// phase. The ship inherits the port's faction and silver default.
+    pub fn seeded_at_port(position: Position, owner_port: usize, faction: Faction) -> Self {
+        Self {
+            faction,
+            owner_port: Some(owner_port),
+            ..Self::new(position, ShipState::Docked)
+        }
+    }
+
+    /// Typed variant of `seeded_at_port` — same idea, but lets the
+    /// caller pick the ship type and supply per-type stats so the
+    /// hull/provisions/crew are sized correctly. Starting silver is
+    /// caller-supplied (sized to a hold's worth of cargo at the home
+    /// port; the historical-fleet seeder calibrates per-type).
+    pub fn seeded_at_port_typed(
         position: Position,
         owner_port: usize,
-        starting_silver: f32,
+        faction: Faction,
         ship_type: crate::shiptype::ShipTypeId,
         stats: &ShipStats,
+        starting_silver: f32,
     ) -> Self {
         Self {
             position,
@@ -142,7 +306,63 @@ impl Ship {
             ship_type,
             starting_silver,
             lifetime_dividends: 0.0,
+            lifetime_dock_count: 0,
             debt: 0.0,
+            // Seed-fleet ships are fully crewed (no Hiring loop).
+            crew_alive: stats.crew_typical(),
+            wages_owed_pesos: 0.0,
+            morale: 1.0,
+            faction,
+            policy: ShipPolicy::Merchant,
+            nav: NavTrack::new(),
+            dock_action: DockAction::Idle,
+            hull_integrity: stats.hull_integrity_max,
+            rigging_integrity: stats.rigging_integrity_max,
+            teredo_damage: 0.0,
+            age_days: 0,
+        }
+    }
+
+    /// Construct a ship freshly built at a specific shipyard port, with
+    /// a custom amount of starting silver (sized at build time to be
+    /// roughly enough to buy one hold of cargo at the home port). The
+    /// ship's `owner_port` is set so future remittance logic can find it.
+    pub fn freshly_built(
+        position: Position,
+        owner_port: usize,
+        starting_silver: f32,
+        ship_type: crate::shiptype::ShipTypeId,
+        stats: &ShipStats,
+        faction: Faction,
+    ) -> Self {
+        Self {
+            position,
+            heading: 0.0,
+            speed: 0.0,
+            // Built hulls start in Hiring — they need a crew before
+            // the AI's dock tree can do anything with them.
+            state: ShipState::Hiring,
+            provisions: stats.provision_capacity,
+            cargo: Cargo::new(),
+            hull_fouling: 0.0,
+            silver: starting_silver,
+            owner_port: Some(owner_port),
+            ship_type,
+            starting_silver,
+            lifetime_dividends: 0.0,
+            lifetime_dock_count: 0,
+            debt: 0.0,
+            crew_alive: 0,
+            wages_owed_pesos: 0.0,
+            morale: 1.0,
+            faction,
+            policy: ShipPolicy::Merchant,
+            nav: NavTrack::new(),
+            dock_action: DockAction::Idle,
+            hull_integrity: stats.hull_integrity_max,
+            rigging_integrity: stats.rigging_integrity_max,
+            teredo_damage: 0.0,
+            age_days: 0,
         }
     }
 
@@ -164,6 +384,7 @@ impl Ship {
     pub fn dock(&mut self) {
         self.state = ShipState::Docked;
         self.speed = 0.0;
+        self.lifetime_dock_count = self.lifetime_dock_count.saturating_add(1);
     }
 
     /// Anchor at current position.
@@ -172,15 +393,39 @@ impl Ship {
         self.speed = 0.0;
     }
 
+    /// Velocity vector in NM/hr (= knots), derived from current
+    /// `(heading, speed)`. Used by the Resolution Phase to compute
+    /// closest-approach distance between ships over the hour-long tick
+    /// — see `combat::min_distance_over_tick`. Returns `(vx, vy)` in
+    /// the same axes as `position` (x = East, y = North).
+    pub fn velocity(&self) -> (f32, f32) {
+        // heading is degrees CW from North: 0=N, 90=E.
+        // So vx (east) = speed * sin(heading), vy (north) = speed * cos(heading).
+        let h = self.heading.to_radians();
+        (self.speed * h.sin(), self.speed * h.cos())
+    }
+
     /// Calculate effective speed: the commanded speed (set by the navigator)
     /// reduced by hull fouling (up to 30% penalty at full fouling).
     ///
     /// `_stats` and `_wind` are kept in the signature for API compatibility
     /// and future use (e.g., gust gusts overriding command), but the speed
     /// model is now driven by the navigator via `set_steering`.
-    pub fn effective_speed(&self, _stats: &ShipStats, _wind: &WindVector) -> f32 {
+    pub fn effective_speed(&self, stats: &ShipStats, _wind: &WindVector) -> f32 {
         let fouling_penalty = 1.0 - self.hull_fouling * 0.003;
-        self.speed * fouling_penalty
+        let crew_mult = self.crew_speed_multiplier(stats);
+        // Morale band 0.25–0.4: sullen crew, -20% speed (crewing-plan §8.2).
+        // Above 0.4 = no effect; below 0.25 the ship is heading for
+        // mutiny (Step 9) but for now still moves at the sullen rate.
+        let morale_mult = if self.morale >= 0.4 { 1.0 } else { 0.8 };
+        // Step 7: rigging damage proportionally caps speed. A ship with
+        // half its rigging shot away makes half its rigged speed.
+        let rigging_mult = if stats.rigging_integrity_max > 0.0 {
+            (self.rigging_integrity / stats.rigging_integrity_max).clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        self.speed * fouling_penalty * crew_mult * morale_mult * rigging_mult
     }
 
     /// Advance position by one time step. Returns new position (doesn't apply it).
@@ -198,12 +443,135 @@ impl Ship {
         self.position + Position::new(dx, dy)
     }
 
+    /// Actual current daily provision burn in tons, scaled by
+    /// `crew_alive`. See `planning/crewing-plan.md §7.2`.
+    pub fn daily_provision_burn(&self) -> f32 {
+        self.crew_alive as f32 * 0.0018
+    }
+
+    /// Crew-driven speed multiplier in `[0.0, 1.0]`. See
+    /// `planning/crewing-plan.md §7.1`. Piecewise: below `crew_min`
+    /// the ship cannot sail (0.0); at `crew_min` it sails at 60% of
+    /// rigged speed; at 60% of `crew_typical` it reaches 84%; at
+    /// `crew_typical` it reaches 100%; overcrewing does not boost
+    /// speed (capped at 1.0).
+    ///
+    /// Note: the spec text in §7.1 had an internal inconsistency
+    /// between the formula (which yielded 1.0 at ratio=0.6) and the
+    /// "60% → 84%" annotation. We implement the annotation; calibration
+    /// in 3.d can revisit.
+    pub fn crew_speed_multiplier(&self, stats: &ShipStats) -> f32 {
+        let typical = stats.crew_typical().max(1) as f32;
+        let min = stats.crew_min();
+        if self.crew_alive < min {
+            return 0.0;
+        }
+        let ratio = (self.crew_alive as f32 / typical).min(1.0);
+        let min_ratio = min as f32 / typical;
+        if ratio <= 0.6 {
+            // Lerp 0.60 → 0.84 over [min_ratio, 0.6].
+            let span = (0.6 - min_ratio).max(1e-6);
+            let t = (ratio - min_ratio) / span;
+            0.60 + 0.24 * t
+        } else {
+            // Lerp 0.84 → 1.00 over [0.6, 1.0].
+            let t = (ratio - 0.6) / 0.4;
+            0.84 + 0.16 * t
+        }
+    }
+
+    /// Tick morale by one hour per `planning/crewing-plan.md §8.1`.
+    /// Modifiers wired now: low/critical provisions, overdue wages,
+    /// rested-in-port recovery. Instant deltas from prize money
+    /// (Step 8) and damage events (Step 7) are stubbed.
+    ///
+    /// Note: `_stats` is accepted for API consistency; current
+    /// modifiers read only from `self`.
+    pub fn tick_morale(&mut self, _stats: &ShipStats) {
+        let days_left = self.daily_provision_burn().recip() * self.provisions;
+        let mut delta = 0.0_f32;
+
+        // Provisions effects (critical replaces low — not additive).
+        if days_left < MORALE_PROVISIONS_CRITICAL_DAYS {
+            delta -= MORALE_LOSS_PROVISIONS_CRITICAL;
+        } else if days_left < MORALE_PROVISIONS_LOW_DAYS {
+            delta -= MORALE_LOSS_PROVISIONS_LOW;
+        }
+
+        // Wages overdue: > 2x current monthly wage bill.
+        let monthly_bill = self.crew_alive as f32 * WAGE_PESOS_PER_MAN_MONTH;
+        if monthly_bill > 0.0 && self.wages_owed_pesos > 2.0 * monthly_bill {
+            delta -= MORALE_LOSS_WAGES_OVERDUE;
+        }
+
+        // Heavy debt: chandler credit blown past (or sitting at) the ceiling.
+        if self.debt >= MAX_SHIP_DEBT {
+            delta -= MORALE_LOSS_DEBT_HEAVY;
+        }
+
+        // Rested in port: docked, full belly, no wage debt.
+        if self.state == ShipState::Docked
+            && days_left >= MORALE_PROVISIONS_LOW_DAYS
+            && self.wages_owed_pesos <= 0.0
+        {
+            delta += MORALE_GAIN_RESTED_IN_PORT;
+        }
+
+        self.morale = (self.morale + delta).clamp(0.0, 1.0);
+    }
+
+    /// Check the mutiny trigger (Step 9, retuned in Step 11.b): a
+    /// Merchant ship currently at sea, whose combined chandler debt +
+    /// overdue wages exceeds `MUTINY_DEBT_THRESHOLD`, with morale
+    /// below `MUTINY_MORALE_THRESHOLD`, gets one stochastic roll per
+    /// hour with probability `MUTINY_PROBABILITY_PER_HOUR`. Returns
+    /// `true` if the policy flipped this tick. The caller is
+    /// responsible for clearing any merchant-route NavGoal on the
+    /// ShipAI so the new pirate captain re-plans next tick.
+    ///
+    /// Combining `debt` and `wages_owed_pesos` matters because the
+    /// chandler caps `debt` at `MAX_SHIP_DEBT`: a captain who maxes
+    /// out chandler credit AND stops paying his crew is the realistic
+    /// distress profile, not raw debt alone.
+    ///
+    /// `mutiny_roll` must be a uniform sample in `[0, 1)` drawn from
+    /// the world's combat RNG; pass `combat_rng_step(&mut state)` at
+    /// the call site so the result is deterministic.
+    ///
+    /// Privateers / already-Pirate ships and any non-Sailing state are
+    /// ignored.
+    pub fn try_mutiny(&mut self, mutiny_roll: f32) -> bool {
+        if self.policy != ShipPolicy::Merchant {
+            return false;
+        }
+        if self.state != ShipState::Sailing {
+            return false;
+        }
+        let financial_distress = self.debt + self.wages_owed_pesos.max(0.0);
+        if financial_distress <= MUTINY_DEBT_THRESHOLD {
+            return false;
+        }
+        if self.morale >= MUTINY_MORALE_THRESHOLD {
+            return false;
+        }
+        if mutiny_roll >= MUTINY_PROBABILITY_PER_HOUR {
+            return false;
+        }
+        self.policy = ShipPolicy::Pirate;
+        // The new pirate crew torches the ship's books — debt to the
+        // chandler ashore and unpaid wages are no longer their problem.
+        self.debt = 0.0;
+        self.wages_owed_pesos = 0.0;
+        self.morale = MUTINY_POST_FLIP_MORALE;
+        true
+    }
+
     /// Consume provisions and accumulate fouling for one hour.
     /// Called by world tick. Returns true if provisions are exhausted.
-    pub fn tick_resources(&mut self, stats: &ShipStats) -> bool {
+    pub fn tick_resources(&mut self, _stats: &ShipStats) -> bool {
         // TODO: provisions should only be consumed while sailing. Likewise, a ship should not accumulate fouling while careened, and should accumulate more while docked or anchored than while sailing.
-        // Provision consumption: per hour = daily / 24
-        let hourly_consumption = stats.daily_provision_consumption() / 24.0;
+        // Provision consumption: per hour = daily / 24, scaled by crew_alive.
+        let hourly_consumption = self.daily_provision_burn() / 24.0;
         self.provisions = (self.provisions - hourly_consumption).max(0.0);
 
         // Hull fouling: accumulates ~1 point per 5 days in tropics
@@ -254,12 +622,20 @@ impl Ship {
         // for a multi-hour top-up.
         if self.silver < unit_price * RESUPPLY_RATE_PER_HOUR && self.debt < MAX_SHIP_DEBT {
             let target_advance = unit_price * RESUPPLY_RATE_PER_HOUR;
-            market.extend_credit(self, target_advance, CHANDLER_PORT_FRACTION_CAP, MAX_SHIP_DEBT);
+            market.extend_credit(
+                self,
+                target_advance,
+                CHANDLER_PORT_FRACTION_CAP,
+                MAX_SHIP_DEBT,
+            );
         }
 
         let affordable = self.silver / unit_price;
 
-        let desired = RESUPPLY_RATE_PER_HOUR.min(space).min(stockpile).min(affordable);
+        let desired = RESUPPLY_RATE_PER_HOUR
+            .min(space)
+            .min(stockpile)
+            .min(affordable);
         if desired <= 0.0 {
             return true;
         }
@@ -280,16 +656,26 @@ impl Ship {
     }
 
     /// Careen the hull for one hour at a port. Returns `true` once the
-    /// hull is fully clean.
+    /// hull is fully clean. Reduces both fouling (barnacles/weed) and
+    /// teredo damage (worm-eaten planking) — the latter at half the
+    /// rate, since structural plank replacement is slower work than
+    /// scraping the bottom. See
+    /// `planning/research/ship-attrition-economics-1650-1720.md §1.3`.
     pub fn tick_careen(&mut self) -> bool {
         self.hull_fouling = (self.hull_fouling - CAREEN_RATE_PER_HOUR).max(0.0);
+        self.teredo_damage = (self.teredo_damage - CAREEN_RATE_PER_HOUR * 0.5).max(0.0);
         self.hull_fouling <= 0.0
     }
 
-    /// Days of provisions remaining at current consumption rate.
-    pub fn provisions_days_remaining(&self, stats: &ShipStats) -> f32 {
-        let daily = stats.daily_provision_consumption();
-        if daily > 0.0 { self.provisions / daily } else { f32::INFINITY }
+    /// Days of provisions remaining at current consumption rate
+    /// (scaled by `crew_alive`).
+    pub fn provisions_days_remaining(&self, _stats: &ShipStats) -> f32 {
+        let daily = self.daily_provision_burn();
+        if daily > 0.0 {
+            self.provisions / daily
+        } else {
+            f32::INFINITY
+        }
     }
 }
 
@@ -299,10 +685,82 @@ const RESUPPLY_RATE_PER_HOUR: f32 = 0.5;
 /// Fouling points removed per hour while careening at a port.
 const CAREEN_RATE_PER_HOUR: f32 = 3.0;
 
+/// Monthly wage per crewman, pesos. Historical reference: an ordinary
+/// English seaman c. 1670–1680 earned ~15–25 shillings/month, with a
+/// peso worth ~4–5 shillings — giving a baseline of roughly 3 pesos/
+/// month. We use 3.0 as the peacetime baseline and add a ~30% Caribbean
+/// tropical premium (yellow-fever, hurricane, scurvy risk) for ~4.0
+/// pesos/man/month. Dutch and Spanish merchant rates were in the same
+/// order of magnitude (2–3 and 4–8 pesos respectively). See
+/// `planning/crewing-plan.md §6.1`; calibration in 3.d may revisit.
+/// Faction-conditional rates (privateer/pirate share systems, Navy
+/// back-pay) land in 3.c.3 or 3.d.
+pub const WAGE_PESOS_PER_MAN_MONTH: f32 = 4.0;
+
+/// Sign-on bounty paid per recruit at hire, in pesos. One month's
+/// wage per crewing-plan §6.2 — historical contracts paid a month
+/// up front to seal the enlistment.
+pub const SIGN_ON_BOUNTY_PESOS: f32 = WAGE_PESOS_PER_MAN_MONTH;
+
+// --- Morale (crewing-plan §8) -------------------------------------------------
+
+/// Provisions days remaining below which morale starts to drop at
+/// the low rate (§8.1).
+pub const MORALE_PROVISIONS_LOW_DAYS: f32 = 14.0;
+/// Provisions days remaining below which morale drops at the high rate.
+pub const MORALE_PROVISIONS_CRITICAL_DAYS: f32 = 7.0;
+/// Hourly morale loss when provisions are merely low (< 14 days).
+pub const MORALE_LOSS_PROVISIONS_LOW: f32 = 0.001;
+/// Hourly morale loss when provisions are critical (< 7 days). Replaces
+/// (does not stack with) the low-provisions rate.
+pub const MORALE_LOSS_PROVISIONS_CRITICAL: f32 = 0.005;
+/// Hourly morale loss when wages owed exceed 2× the ship's current
+/// monthly wage bill.
+pub const MORALE_LOSS_WAGES_OVERDUE: f32 = 0.001;
+/// Hourly morale gain while docked with provisions fully topped up
+/// and no outstanding wage debt (the "rested in port" recovery).
+pub const MORALE_GAIN_RESTED_IN_PORT: f32 = 0.001;
+/// Hourly morale loss while the ship is carrying chandler debt above
+/// `MAX_SHIP_DEBT` (i.e., the captain has run out of legitimate credit
+/// and is shipping freight on tramping terms). Sized to push a chronically
+/// indebted crew toward the mutiny threshold over weeks, not hours.
+pub const MORALE_LOSS_DEBT_HEAVY: f32 = 0.0015;
+/// One-shot morale boost applied to a boarding attacker when they
+/// successfully take a prize (Step 8). Models the lift from prize-share
+/// distribution. Applied in the AttemptBoard Resolution arm.
+pub const MORALE_GAIN_PRIZE_TAKEN: f32 = 0.30;
+
 /// Maximum outstanding chandler/factor debt a single ship can
 /// accumulate before further credit is refused. Sized to cover a
 /// few hold-fillings of cheap cargo plus a season's provisions.
 pub const MAX_SHIP_DEBT: f32 = 5000.0;
+
+/// Debt threshold above which an at-sea Merchant crew may mutiny
+/// (§9). Step 11.b: raised from 1.5× to 3× `MAX_SHIP_DEBT` to match
+/// the historical record where significant mutinies (Royal James,
+/// Anstis, Phillips) were rare events at the *end* of a long string
+/// of failures, not first-sign-of-trouble flips. With the chandler
+/// debt cap at MAX_SHIP_DEBT, the only way to reach this threshold
+/// is to also be carrying ~10000 pesos in unpaid wages — roughly a
+/// year's wages for a small merchant crew.
+pub const MUTINY_DEBT_THRESHOLD: f32 = MAX_SHIP_DEBT * 3.0;
+/// Morale ceiling below which an at-sea Merchant with crushing debt
+/// flips to Pirate.
+pub const MUTINY_MORALE_THRESHOLD: f32 = 0.25;
+/// Morale baseline assigned to a fresh pirate crew after a mutiny —
+/// they're not euphoric (they just murdered their officers) but the
+/// immediate grievances are gone.
+pub const MUTINY_POST_FLIP_MORALE: f32 = 0.55;
+
+/// Step 11.b: per-hour probability that a qualifying crew (debt +
+/// wages over threshold, morale below threshold, at sea) actually
+/// mutinies. At ~0.0002/hr a ship that stays in the mutiny zone for
+/// a full year has a ~1 − exp(−24 × 365 × 0.0002) ≈ 83% chance of
+/// flipping; over a typical week-or-two distress window the
+/// per-incident chance is more like 3-7%. Models the "everyone's
+/// grumbling but it takes weeks of conspiring" dynamic seen in
+/// Rediker's accounts.
+pub const MUTINY_PROBABILITY_PER_HOUR: f32 = 0.0002;
 
 /// Fraction of a port's silver that any single chandler-credit
 /// advance may consume. Keeps a string of broke ships from
@@ -335,15 +793,23 @@ fn sail_efficiency(relative_angle: f32, windward_ability: f32) -> f32 {
 /// Signed angle difference in degrees, normalized to [-180, 180].
 pub fn angle_diff(a: f32, b: f32) -> f32 {
     let mut diff = a - b;
-    while diff > 180.0 { diff -= 360.0; }
-    while diff < -180.0 { diff += 360.0; }
+    while diff > 180.0 {
+        diff -= 360.0;
+    }
+    while diff < -180.0 {
+        diff += 360.0;
+    }
     diff
 }
 
 /// Normalize angle to [0, 360).
 pub fn normalize_angle(mut a: f32) -> f32 {
-    while a < 0.0 { a += 360.0; }
-    while a >= 360.0 { a -= 360.0; }
+    while a < 0.0 {
+        a += 360.0;
+    }
+    while a >= 360.0 {
+        a -= 360.0;
+    }
     a
 }
 
@@ -367,7 +833,7 @@ mod tests {
         ship.heading = 0.0; // heading north
         let stats = ShipStats::sloop();
         let wind = WindVector { u: 0.0, v: -15.0 }; // from north
-        // Simulate navigator commanding the raw upwind hull speed (slow).
+                                                    // Simulate navigator commanding the raw upwind hull speed (slow).
         ship.speed = speed_at_heading(ship.heading, &stats, &wind);
         assert!(ship.effective_speed(&stats, &wind) < 5.0);
     }
@@ -402,8 +868,220 @@ mod tests {
 
         let consumed = initial - ship.provisions;
         let expected_daily = stats.daily_provision_consumption();
-        assert!((consumed - expected_daily).abs() < 0.001,
-            "Expected ~{:.4} tons consumed in a day, got {:.4}", expected_daily, consumed);
+        assert!(
+            (consumed - expected_daily).abs() < 0.001,
+            "Expected ~{:.4} tons consumed in a day, got {:.4}",
+            expected_daily,
+            consumed
+        );
+    }
+
+    #[test]
+    fn fresh_ship_has_full_morale() {
+        let ship = Ship::new(Position::ZERO, ShipState::Sailing);
+        assert_eq!(ship.morale, 1.0);
+        let stats = ShipStats::sloop();
+        let built = Ship::freshly_built(
+            Position::ZERO,
+            0,
+            1000.0,
+            crate::shiptype::ids::SLOOP,
+            &stats,
+            Faction::Free,
+        );
+        assert_eq!(built.morale, 1.0);
+    }
+
+    #[test]
+    fn morale_drops_on_critical_provisions() {
+        let stats = ShipStats::sloop();
+        let mut ship = Ship::new(Position::ZERO, ShipState::Sailing);
+        // Force critical: < 7 days at current burn.
+        ship.provisions = ship.daily_provision_burn() * 5.0;
+        let before = ship.morale;
+        ship.tick_morale(&stats);
+        assert!((before - ship.morale - MORALE_LOSS_PROVISIONS_CRITICAL).abs() < 1e-5);
+    }
+
+    #[test]
+    fn morale_drops_on_overdue_wages() {
+        let stats = ShipStats::sloop();
+        let mut ship = Ship::new(Position::ZERO, ShipState::Sailing);
+        // Plenty of provisions so only the wages branch fires.
+        ship.provisions = stats.provision_capacity;
+        let monthly = ship.crew_alive as f32 * WAGE_PESOS_PER_MAN_MONTH;
+        ship.wages_owed_pesos = 3.0 * monthly;
+        let before = ship.morale;
+        ship.tick_morale(&stats);
+        assert!((before - ship.morale - MORALE_LOSS_WAGES_OVERDUE).abs() < 1e-5);
+    }
+
+    #[test]
+    fn morale_recovers_in_port_when_fed_and_paid() {
+        let stats = ShipStats::sloop();
+        let mut ship = Ship::new(Position::ZERO, ShipState::Docked);
+        ship.provisions = stats.provision_capacity;
+        ship.wages_owed_pesos = 0.0;
+        ship.morale = 0.5;
+        ship.tick_morale(&stats);
+        assert!((ship.morale - (0.5 + MORALE_GAIN_RESTED_IN_PORT)).abs() < 1e-5);
+    }
+
+    #[test]
+    fn morale_drops_on_heavy_debt() {
+        let stats = ShipStats::sloop();
+        let mut ship = Ship::new(Position::ZERO, ShipState::Sailing);
+        ship.provisions = stats.provision_capacity;
+        ship.wages_owed_pesos = 0.0;
+        ship.debt = MAX_SHIP_DEBT;
+        let before = ship.morale;
+        ship.tick_morale(&stats);
+        assert!((before - ship.morale - MORALE_LOSS_DEBT_HEAVY).abs() < 1e-5);
+    }
+
+    #[test]
+    fn mutiny_flips_indebted_low_morale_merchant_at_sea() {
+        let mut ship = Ship::new(Position::ZERO, ShipState::Sailing);
+        ship.policy = ShipPolicy::Merchant;
+        ship.debt = MUTINY_DEBT_THRESHOLD + 1.0;
+        ship.morale = MUTINY_MORALE_THRESHOLD - 0.01;
+        ship.wages_owed_pesos = 999.0;
+        // Pass a roll guaranteed to fall under the probability gate.
+        assert!(ship.try_mutiny(0.0));
+        assert_eq!(ship.policy, ShipPolicy::Pirate);
+        assert_eq!(ship.debt, 0.0);
+        assert_eq!(ship.wages_owed_pesos, 0.0);
+        assert!((ship.morale - MUTINY_POST_FLIP_MORALE).abs() < 1e-5);
+    }
+
+    #[test]
+    fn mutiny_does_not_trigger_when_docked() {
+        let mut ship = Ship::new(Position::ZERO, ShipState::Docked);
+        ship.debt = MUTINY_DEBT_THRESHOLD + 1000.0;
+        ship.morale = 0.0;
+        assert!(!ship.try_mutiny(0.0));
+        assert_eq!(ship.policy, ShipPolicy::Merchant);
+    }
+
+    #[test]
+    fn mutiny_does_not_trigger_below_thresholds() {
+        let mut ship = Ship::new(Position::ZERO, ShipState::Sailing);
+        ship.debt = MUTINY_DEBT_THRESHOLD - 1.0;
+        ship.wages_owed_pesos = 0.0;
+        ship.morale = 0.05;
+        assert!(!ship.try_mutiny(0.0), "below distress threshold");
+        ship.debt = MUTINY_DEBT_THRESHOLD + 1.0;
+        ship.morale = MUTINY_MORALE_THRESHOLD + 0.01;
+        assert!(!ship.try_mutiny(0.0), "above morale threshold");
+    }
+
+    #[test]
+    fn mutiny_triggers_on_wages_pushing_total_over_threshold() {
+        let mut ship = Ship::new(Position::ZERO, ShipState::Sailing);
+        // Maxed out chandler credit + heavy unpaid wages combine to
+        // push the crew over the edge.
+        ship.debt = MAX_SHIP_DEBT;
+        ship.wages_owed_pesos = MUTINY_DEBT_THRESHOLD - MAX_SHIP_DEBT + 1.0;
+        ship.morale = 0.1;
+        assert!(ship.try_mutiny(0.0));
+        assert_eq!(ship.policy, ShipPolicy::Pirate);
+    }
+
+    #[test]
+    fn mutiny_ignores_already_pirate_ships() {
+        let mut ship = Ship::new(Position::ZERO, ShipState::Sailing);
+        ship.policy = ShipPolicy::Pirate;
+        ship.debt = MUTINY_DEBT_THRESHOLD * 10.0;
+        ship.morale = 0.0;
+        assert!(!ship.try_mutiny(0.0));
+    }
+
+    /// Step 11.b: the per-hour probability gate suppresses mutinies
+    /// when the random roll is above the configured threshold, even
+    /// when every other condition is met. This is what keeps the
+    /// long-run mutiny rate sane.
+    #[test]
+    fn mutiny_skips_when_roll_above_probability() {
+        let mut ship = Ship::new(Position::ZERO, ShipState::Sailing);
+        ship.policy = ShipPolicy::Merchant;
+        ship.debt = MUTINY_DEBT_THRESHOLD + 1.0;
+        ship.morale = 0.0;
+        // Just above the probability gate -> no flip.
+        assert!(!ship.try_mutiny(MUTINY_PROBABILITY_PER_HOUR + 1e-6));
+        assert_eq!(ship.policy, ShipPolicy::Merchant);
+    }
+
+    #[test]
+    fn morale_band_throttles_speed() {
+        let stats = ShipStats::sloop();
+        let wind = WindVector { u: 0.0, v: 15.0 };
+        let mut ship = Ship::new(Position::ZERO, ShipState::Sailing);
+        ship.speed = 10.0;
+
+        ship.morale = 0.8;
+        let happy = ship.effective_speed(&stats, &wind);
+        ship.morale = 0.3;
+        let sullen = ship.effective_speed(&stats, &wind);
+        assert!(
+            (sullen - happy * 0.8).abs() < 1e-3,
+            "happy={happy} sullen={sullen}"
+        );
+    }
+
+    #[test]
+    fn fresh_ship_has_zero_wages_owed() {
+        let ship = Ship::new(Position::ZERO, ShipState::Sailing);
+        assert_eq!(ship.wages_owed_pesos, 0.0);
+        let stats = ShipStats::sloop();
+        let built = Ship::freshly_built(
+            Position::ZERO,
+            0,
+            1000.0,
+            crate::shiptype::ids::SLOOP,
+            &stats,
+            Faction::Free,
+        );
+        assert_eq!(built.wages_owed_pesos, 0.0);
+    }
+
+    #[test]
+    fn crew_speed_multiplier_piecewise() {
+        let stats = ShipStats::sloop();
+        let typical = stats.crew_typical(); // 25
+        let min = stats.crew_min(); // 10
+        let mut ship = Ship::new(Position::ZERO, ShipState::Sailing);
+
+        // Below min: zero.
+        ship.crew_alive = min - 1;
+        assert_eq!(ship.crew_speed_multiplier(&stats), 0.0);
+
+        // At min: 60%.
+        ship.crew_alive = min;
+        assert!((ship.crew_speed_multiplier(&stats) - 0.60).abs() < 1e-3);
+
+        // At 60% of typical: 84%.
+        ship.crew_alive = (typical as f32 * 0.6) as u16;
+        assert!((ship.crew_speed_multiplier(&stats) - 0.84).abs() < 1e-2);
+
+        // At typical: 100%.
+        ship.crew_alive = typical;
+        assert!((ship.crew_speed_multiplier(&stats) - 1.00).abs() < 1e-3);
+
+        // Overcrew: still 100%.
+        ship.crew_alive = typical + 20;
+        assert!((ship.crew_speed_multiplier(&stats) - 1.00).abs() < 1e-3);
+    }
+
+    #[test]
+    fn provision_burn_scales_with_crew_alive() {
+        let mut ship = Ship::new(Position::ZERO, ShipState::Sailing);
+        ship.crew_alive = 20;
+        let full = ship.daily_provision_burn();
+        ship.crew_alive = 10;
+        let half = ship.daily_provision_burn();
+        assert!((half * 2.0 - full).abs() < 1e-3);
+        ship.crew_alive = 0;
+        assert_eq!(ship.daily_provision_burn(), 0.0);
     }
 
     #[test]
@@ -429,7 +1107,11 @@ mod tests {
         let stats = ShipStats::sloop();
         let days = ship.provisions_days_remaining(&stats);
         // 6.0 tons / (25 * 0.0018 tons/day) = ~133 days
-        assert!(days > 120.0 && days < 140.0, "Expected ~133 days, got {}", days);
+        assert!(
+            days > 120.0 && days < 140.0,
+            "Expected ~133 days, got {}",
+            days
+        );
     }
 
     #[test]
@@ -446,8 +1128,10 @@ mod tests {
         // provisioned ship has its entire trade hold still available.
         assert!(stats.cargo_capacity_tons > 0.0);
         assert!(stats.provision_capacity > 0.0);
-        assert!(stats.cargo_capacity_tons > stats.provision_capacity,
-            "Trade hold should dwarf the provisions hold for a merchant ship");
+        assert!(
+            stats.cargo_capacity_tons > stats.provision_capacity,
+            "Trade hold should dwarf the provisions hold for a merchant ship"
+        );
     }
 
     #[test]
@@ -458,11 +1142,12 @@ mod tests {
 
     #[test]
     fn test_market_resupply_consumes_silver_and_stockpile() {
-        use crate::goods::{GoodsRegistry, ids};
+        use crate::goods::{ids, GoodsRegistry};
         use crate::market::{PortArchetype, PortMarket};
 
         let goods = GoodsRegistry::starter();
-        let mut market = PortMarket::with_recipe(&goods, PortArchetype::NorthAmericanFarming.recipe());
+        let mut market =
+            PortMarket::with_recipe(&goods, PortArchetype::NorthAmericanFarming.recipe());
         let stats = ShipStats::sloop();
         let mut ship = Ship::new(Position::ZERO, ShipState::Docked);
         ship.provisions = 0.0; // Empty hold.
@@ -478,27 +1163,41 @@ mod tests {
         }
 
         // Hold should be at (or very near) capacity.
-        assert!(ship.provisions > stats.provision_capacity * 0.99,
-            "expected near-full provisions, got {}", ship.provisions);
+        assert!(
+            ship.provisions > stats.provision_capacity * 0.99,
+            "expected near-full provisions, got {}",
+            ship.provisions
+        );
         // Silver moved from ship to port.
-        assert!(ship.silver < ship_silver_before, "ship should have spent silver");
-        assert!(market.silver > port_silver_before, "port should have earned silver");
+        assert!(
+            ship.silver < ship_silver_before,
+            "ship should have spent silver"
+        );
+        assert!(
+            market.silver > port_silver_before,
+            "port should have earned silver"
+        );
         // Spent ≈ earned (no leakage; small float drift over many ticks).
         let spent = ship_silver_before - ship.silver;
         let earned = market.silver - port_silver_before;
-        assert!((spent - earned).abs() < 0.5,
-            "spent {} vs earned {}", spent, earned);
+        assert!(
+            (spent - earned).abs() < 0.5,
+            "spent {} vs earned {}",
+            spent,
+            earned
+        );
         // Stockpile dropped by ≈ amount loaded.
         assert!(market.stockpile.get(ids::PROVISIONS) < stockpile_before);
     }
 
     #[test]
     fn test_market_resupply_halts_when_market_dry() {
-        use crate::goods::{GoodsRegistry, ids};
+        use crate::goods::{ids, GoodsRegistry};
         use crate::market::{PortArchetype, PortMarket};
 
         let goods = GoodsRegistry::starter();
-        let mut market = PortMarket::with_recipe(&goods, PortArchetype::NorthAmericanFarming.recipe());
+        let mut market =
+            PortMarket::with_recipe(&goods, PortArchetype::NorthAmericanFarming.recipe());
         // Drain the market.
         let stockpile = market.stockpile.get(ids::PROVISIONS);
         market.stockpile.remove(ids::PROVISIONS, stockpile);
@@ -510,6 +1209,9 @@ mod tests {
         // Single tick should flag done immediately.
         let done = ship.tick_resupply_at_market(&stats, &mut market, &goods);
         assert!(done);
-        assert_eq!(ship.provisions, provisions_before, "no provisions should load when market is dry");
+        assert_eq!(
+            ship.provisions, provisions_before,
+            "no provisions should load when market is dry"
+        );
     }
 }

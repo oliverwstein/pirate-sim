@@ -108,7 +108,16 @@ impl LandMap {
             if d > max_radius {
                 continue;
             }
-            for (dc, dr) in &[(-1i32, 0i32), (1, 0), (0, -1), (0, 1), (-1, -1), (1, -1), (-1, 1), (1, 1)] {
+            for (dc, dr) in &[
+                (-1i32, 0i32),
+                (1, 0),
+                (0, -1),
+                (0, 1),
+                (-1, -1),
+                (1, -1),
+                (-1, 1),
+                (1, 1),
+            ] {
                 let nc = c as i32 + dc;
                 let nr = r as i32 + dr;
                 if nc < 0 || nr < 0 || nc >= self.width as i32 || nr >= self.height as i32 {
@@ -204,10 +213,14 @@ impl LandMap {
         let d = margin_nm;
         let s = margin_nm * std::f32::consts::FRAC_1_SQRT_2;
         for off in [
-            Position::new(d, 0.0), Position::new(-d, 0.0),
-            Position::new(0.0, d), Position::new(0.0, -d),
-            Position::new(s, s), Position::new(s, -s),
-            Position::new(-s, s), Position::new(-s, -s),
+            Position::new(d, 0.0),
+            Position::new(-d, 0.0),
+            Position::new(0.0, d),
+            Position::new(0.0, -d),
+            Position::new(s, s),
+            Position::new(s, -s),
+            Position::new(-s, s),
+            Position::new(-s, -s),
         ] {
             if self.is_land(pos + off) {
                 return false;
@@ -260,10 +273,23 @@ impl LandMap {
     }
 
     /// Construct a LandMap from raw components (used by tests / synthetic maps).
-    pub fn from_raw(data: Vec<u8>, width: u32, height: u32, origin: Position, cell_size_nm: f32) -> Self {
+    pub fn from_raw(
+        data: Vec<u8>,
+        width: u32,
+        height: u32,
+        origin: Position,
+        cell_size_nm: f32,
+    ) -> Self {
         assert_eq!(data.len(), (width * height) as usize, "data size mismatch");
         let dist_to_land = compute_distance_to_land(&data, width, height);
-        Self { data, width, height, origin, cell_size_nm, dist_to_land }
+        Self {
+            data,
+            width,
+            height,
+            origin,
+            cell_size_nm,
+            dist_to_land,
+        }
     }
 }
 
@@ -276,7 +302,10 @@ fn compute_distance_to_land(data: &[u8], width: u32, height: u32) -> Vec<u8> {
     let h = height as usize;
     // Use u16 internally to avoid wraparound during accumulation; clamp to
     // u8 at the end. Initial sea cells get a large value, land = 0.
-    let mut dist: Vec<u16> = data.iter().map(|&v| if v == 255 { 0 } else { u16::MAX }).collect();
+    let mut dist: Vec<u16> = data
+        .iter()
+        .map(|&v| if v == 255 { 0 } else { u16::MAX })
+        .collect();
     // Forward pass: top-to-bottom, left-to-right. Borders are treated as
     // out-of-bounds (effectively land) so coastline cells at the edge get
     // dist=1, ensuring `has_cell_clearance` rejects them safely.
@@ -292,10 +321,18 @@ fn compute_distance_to_land(data: &[u8], width: u32, height: u32) -> Vec<u8> {
             if r == 0 || c == 0 || c + 1 == w {
                 m = 1;
             } else {
-                if dist[idx - w - 1] < m { m = dist[idx - w - 1]; }
-                if dist[idx - w] < m { m = dist[idx - w]; }
-                if dist[idx - w + 1] < m { m = dist[idx - w + 1]; }
-                if dist[idx - 1] < m { m = dist[idx - 1]; }
+                if dist[idx - w - 1] < m {
+                    m = dist[idx - w - 1];
+                }
+                if dist[idx - w] < m {
+                    m = dist[idx - w];
+                }
+                if dist[idx - w + 1] < m {
+                    m = dist[idx - w + 1];
+                }
+                if dist[idx - 1] < m {
+                    m = dist[idx - 1];
+                }
             }
             let cand = m.saturating_add(1);
             if cand < dist[idx] {
@@ -314,10 +351,18 @@ fn compute_distance_to_land(data: &[u8], width: u32, height: u32) -> Vec<u8> {
             if r + 1 == h || c == 0 || c + 1 == w {
                 m = 1;
             } else {
-                if dist[idx + 1] < m { m = dist[idx + 1]; }
-                if dist[idx + w - 1] < m { m = dist[idx + w - 1]; }
-                if dist[idx + w] < m { m = dist[idx + w]; }
-                if dist[idx + w + 1] < m { m = dist[idx + w + 1]; }
+                if dist[idx + 1] < m {
+                    m = dist[idx + 1];
+                }
+                if dist[idx + w - 1] < m {
+                    m = dist[idx + w - 1];
+                }
+                if dist[idx + w] < m {
+                    m = dist[idx + w];
+                }
+                if dist[idx + w + 1] < m {
+                    m = dist[idx + w + 1];
+                }
             }
             let cand = m.saturating_add(1);
             if cand < dist[idx] {

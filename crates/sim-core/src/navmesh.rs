@@ -126,8 +126,8 @@ impl Navmesh {
         // block. This auto-discovers narrow straits, river mouths and
         // similar passages that the open-water grid is too sparse for.
         let stride = CHANNEL_STRIDE;
-        let cw = (w + stride - 1) / stride;
-        let ch = (h + stride - 1) / stride;
+        let cw = w.div_ceil(stride);
+        let ch = h.div_ceil(stride);
         for cr in 0..ch {
             for cc in 0..cw {
                 let r0 = cr * stride;
@@ -161,10 +161,15 @@ impl Navmesh {
                             continue;
                         }
                         let d = cell_clearance_nm(land, col, rr);
-                        if d < MIN_CHANNEL_NM {
+                        // MIN_CHANNEL_NM is currently 0 (a tunable); the
+                        // comparison is intentionally a no-op until a
+                        // non-zero floor is set.
+                        #[allow(clippy::absurd_extreme_comparisons)]
+                        let too_narrow = d < MIN_CHANNEL_NM;
+                        if too_narrow {
                             continue;
                         }
-                        if best.map_or(true, |(_, _, bd)| d > bd) {
+                        if best.is_none_or(|(_, _, bd)| d > bd) {
                             best = Some((col, rr, d));
                         }
                     }
@@ -202,7 +207,10 @@ impl Navmesh {
                             }
                             if land.corridor_is_clear(n.pos, m.pos, EDGE_MARGIN_NM) {
                                 adj[i].push(Edge { to: j, dist_nm: d });
-                                adj[j as usize].push(Edge { to: i as u32, dist_nm: d });
+                                adj[j as usize].push(Edge {
+                                    to: i as u32,
+                                    dist_nm: d,
+                                });
                             }
                         }
                     }
@@ -234,7 +242,10 @@ impl Navmesh {
                 if nj < 0 {
                     continue;
                 }
-                new_adj[ni as usize].push(Edge { to: nj as u32, dist_nm: e.dist_nm });
+                new_adj[ni as usize].push(Edge {
+                    to: nj as u32,
+                    dist_nm: e.dist_nm,
+                });
             }
         }
 
@@ -254,7 +265,12 @@ impl Navmesh {
         // unused now but keep for future caller reuse
         let _ = keep;
 
-        Self { nodes: new_nodes, adj: new_adj, buckets, bucket_size_nm: BUCKET_NM }
+        Self {
+            nodes: new_nodes,
+            adj: new_adj,
+            buckets,
+            bucket_size_nm: BUCKET_NM,
+        }
     }
 
     /// Indices of nodes within `radius_nm` of `pos`, regardless of visibility.
@@ -280,8 +296,16 @@ impl Navmesh {
     /// distance ascending. Used at the boundary of a route plan.
     /// `margin_nm` should be small (e.g. 0.5) for harbor-to-mesh hops since
     /// port anchors sit right at the coast.
-    pub fn visible_from(&self, land: &LandMap, pos: Position, max_radius_nm: f32, max_count: usize, margin_nm: f32) -> Vec<u32> {
-        let mut candidates: Vec<(u32, f32)> = self.nodes_within(pos, max_radius_nm)
+    pub fn visible_from(
+        &self,
+        land: &LandMap,
+        pos: Position,
+        max_radius_nm: f32,
+        max_count: usize,
+        margin_nm: f32,
+    ) -> Vec<u32> {
+        let mut candidates: Vec<(u32, f32)> = self
+            .nodes_within(pos, max_radius_nm)
             .into_iter()
             .map(|i| (i, self.nodes[i as usize].pos.distance(pos)))
             .collect();
@@ -304,22 +328,35 @@ impl Navmesh {
         if start_set.is_empty() || goal_set.is_empty() {
             return None;
         }
-        let goal_pos: Vec<Position> = goal_set.iter().map(|&g| self.nodes[g as usize].pos).collect();
+        let goal_pos: Vec<Position> = goal_set
+            .iter()
+            .map(|&g| self.nodes[g as usize].pos)
+            .collect();
         let h = |i: u32| -> f32 {
             let p = self.nodes[i as usize].pos;
-            goal_pos.iter().map(|gp| p.distance(*gp)).fold(f32::INFINITY, f32::min)
+            goal_pos
+                .iter()
+                .map(|gp| p.distance(*gp))
+                .fold(f32::INFINITY, f32::min)
         };
         let goal_lookup: std::collections::HashSet<u32> = goal_set.iter().copied().collect();
 
         #[derive(Copy, Clone, PartialEq)]
-        struct N { f: f32, idx: u32 }
+        struct N {
+            f: f32,
+            idx: u32,
+        }
         impl Eq for N {}
         impl Ord for N {
             fn cmp(&self, other: &Self) -> Ordering {
                 other.f.partial_cmp(&self.f).unwrap_or(Ordering::Equal)
             }
         }
-        impl PartialOrd for N { fn partial_cmp(&self, o: &Self) -> Option<Ordering> { Some(self.cmp(o)) } }
+        impl PartialOrd for N {
+            fn partial_cmp(&self, o: &Self) -> Option<Ordering> {
+                Some(self.cmp(o))
+            }
+        }
 
         let mut g_score: HashMap<u32, f32> = HashMap::new();
         let mut came_from: HashMap<u32, u32> = HashMap::new();
@@ -347,7 +384,10 @@ impl Navmesh {
                 if tentative < prev {
                     g_score.insert(e.to, tentative);
                     came_from.insert(e.to, cur);
-                    open.push(N { f: tentative + h(e.to), idx: e.to });
+                    open.push(N {
+                        f: tentative + h(e.to),
+                        idx: e.to,
+                    });
                 }
             }
         }
@@ -360,18 +400,23 @@ fn cell_clearance_nm(land: &LandMap, col: u32, row: u32) -> u32 {
     if !land.is_sea_cell(col, row) {
         return 0;
     }
-    let d = land.dist_to_land[(row * land.width + col) as usize] as u32;
-    d // already in cells; for cell_size_nm = 1 NM, cells == NM.
+
+    land.dist_to_land[(row * land.width + col) as usize] as u32 // already in cells; for cell_size_nm = 1 NM, cells == NM.
 }
 
 fn pos_to_bucket(pos: Position, bucket_nm: f32) -> (i32, i32) {
-    ((pos.x / bucket_nm).floor() as i32, (pos.y / bucket_nm).floor() as i32)
+    (
+        (pos.x / bucket_nm).floor() as i32,
+        (pos.y / bucket_nm).floor() as i32,
+    )
 }
 
 fn build_buckets(nodes: &[Node], bucket_nm: f32) -> HashMap<(i32, i32), Vec<u32>> {
     let mut m: HashMap<(i32, i32), Vec<u32>> = HashMap::new();
     for (i, n) in nodes.iter().enumerate() {
-        m.entry(pos_to_bucket(n.pos, bucket_nm)).or_default().push(i as u32);
+        m.entry(pos_to_bucket(n.pos, bucket_nm))
+            .or_default()
+            .push(i as u32);
     }
     m
 }
@@ -406,5 +451,9 @@ fn largest_component(comp: &[i32]) -> i32 {
     for &c in comp {
         *counts.entry(c).or_insert(0) += 1;
     }
-    counts.into_iter().max_by_key(|&(_, n)| n).map(|(id, _)| id).unwrap_or(0)
+    counts
+        .into_iter()
+        .max_by_key(|&(_, n)| n)
+        .map(|(id, _)| id)
+        .unwrap_or(0)
 }

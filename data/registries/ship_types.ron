@@ -1,0 +1,109 @@
+// Ship type catalog. Position in this list determines `ShipTypeId` —
+// re-ordering breaks the `ids::*` constants and `ids_match_indices` test.
+//
+// Numbers are mid-range values from `planning/research/ship-types.md`.
+// Warships (frigates, SOL, galleon, slave ship, East Indiaman) are out
+// of scope for v1; they arrive with the combat/piracy systems.
+
+[
+    (
+        name: "sloop",
+        stats: (
+            speed_typical: 9.0,
+            speed_max: 12.0,
+            windward_ability: 0.8,
+            no_go_half_angle: 40.0,
+            crew: 25,
+            provision_capacity: 6.0,
+            cargo_capacity_tons: 60.0,
+            cannons: 8,
+            hull_integrity_max: 100.0,
+            rigging_integrity_max: 80.0,
+        ),
+        build_silver: 4000.0,
+        build_naval_stores: 8.0,
+        build_manufactures: 5.0,
+        build_provisions: 6.0,
+        expected_lifetime_months: 84.0, // 7 yr median (Caribbean tropical service)
+    ),
+    (
+        name: "brigantine",
+        stats: (
+            speed_typical: 8.0,
+            speed_max: 11.0,
+            windward_ability: 0.7,
+            no_go_half_angle: 45.0,
+            crew: 40,
+            provision_capacity: 10.0,
+            cargo_capacity_tons: 100.0,
+            cannons: 12,
+            hull_integrity_max: 130.0,
+            rigging_integrity_max: 100.0,
+        ),
+        build_silver: 7000.0,
+        build_naval_stores: 14.0,
+        build_manufactures: 9.0,
+        build_provisions: 10.0,
+        expected_lifetime_months: 144.0, // 12 yr
+    ),
+    (
+        name: "bark",
+        stats: (
+            speed_typical: 6.0,
+            speed_max: 9.0,
+            windward_ability: 0.5,
+            no_go_half_angle: 55.0,
+            crew: 35,
+            provision_capacity: 12.0,
+            cargo_capacity_tons: 160.0,
+            cannons: 14,
+            hull_integrity_max: 160.0,
+            rigging_integrity_max: 120.0,
+        ),
+        build_silver: 10000.0,
+        build_naval_stores: 20.0,
+        build_manufactures: 14.0,
+        build_provisions: 14.0,
+        expected_lifetime_months: 180.0, // 15 yr
+    ),
+    (
+        name: "fluyt",
+        stats: (
+            speed_typical: 5.0,
+            speed_max: 8.0,
+            windward_ability: 0.4,
+            no_go_half_angle: 60.0,
+            crew: 25, // characteristic small crew
+            provision_capacity: 16.0,
+            cargo_capacity_tons: 250.0,
+            cannons: 12,
+            hull_integrity_max: 180.0,
+            rigging_integrity_max: 130.0,
+        ),
+        build_silver: 9000.0, // cheaper than Ship despite larger hold
+        build_naval_stores: 24.0,
+        build_manufactures: 14.0,
+        build_provisions: 16.0,
+        expected_lifetime_months: 200.0, // ~17 yr (good Dutch maintenance)
+    ),
+    (
+        name: "ship",
+        stats: (
+            speed_typical: 6.0,
+            speed_max: 10.0,
+            windward_ability: 0.4,
+            no_go_half_angle: 60.0,
+            crew: 60,
+            provision_capacity: 20.0,
+            cargo_capacity_tons: 300.0,
+            cannons: 24,
+            hull_integrity_max: 400.0,
+            rigging_integrity_max: 200.0,
+        ),
+        build_silver: 18000.0,
+        build_naval_stores: 32.0,
+        build_manufactures: 22.0,
+        build_provisions: 22.0,
+        expected_lifetime_months: 240.0, // 20 yr (well-maintained)
+    ),
+]

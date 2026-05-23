@@ -38,7 +38,13 @@ impl<'a> PathfindContext<'a> {
         month: u8,
         navmesh: &'a Navmesh,
     ) -> Self {
-        Self { land, wind, stats, month, navmesh }
+        Self {
+            land,
+            wind,
+            stats,
+            month,
+            navmesh,
+        }
     }
 }
 
@@ -118,7 +124,13 @@ fn navmesh_path(
     goal_anchors: &[Position],
     terminal: Position,
 ) -> Option<Vec<Position>> {
-    let starts = nm.visible_from(land, start, ENTRY_RADIUS_NM, ENTRY_CANDIDATES, ENTRY_MARGIN_NM);
+    let starts = nm.visible_from(
+        land,
+        start,
+        ENTRY_RADIUS_NM,
+        ENTRY_CANDIDATES,
+        ENTRY_MARGIN_NM,
+    );
     if starts.is_empty() {
         return None;
     }
@@ -196,7 +208,13 @@ mod tests {
 
     fn open_sea_land(width: u32, height: u32) -> LandMap {
         let data = vec![0u8; (width * height) as usize];
-        LandMap::from_raw(data, width, height, Position::new(0.0, height as f32 * 10.0), 10.0)
+        LandMap::from_raw(
+            data,
+            width,
+            height,
+            Position::new(0.0, height as f32 * 10.0),
+            10.0,
+        )
     }
 
     #[test]

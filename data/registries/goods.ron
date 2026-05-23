@@ -1,0 +1,114 @@
+// Trade-good registry. Each entry's position in this list determines its
+// `GoodId` — order is the contract. Re-ordering will break the `ids::*`
+// constants and the test `ids_resolve_to_expected_goods` will catch it.
+//
+// Fields:
+//   name                — display name (case-insensitive lookup via `by_name`)
+//   category            — Staple | Cash | Manufactured | Currency | Naval
+//                          | Provision | Person
+//   tons_per_unit       — tons per nominal trade unit (hogshead, barrel, etc.)
+//   base_price_pesos    — reference Caribbean price, pesos per ton
+//   europe_price_pesos  — London/European price; 0.0 if not Europe-bound
+//   perishability       — Indefinite | Months(u8) | Days(u16)
+
+[
+    (
+        name: "Provisions",
+        category: Provision,
+        tons_per_unit: 1.0,
+        base_price_pesos: 18.0,
+        europe_price_pesos: 0.0,
+        perishability: Days(180),
+    ),
+    (
+        name: "Muscovado Sugar",
+        category: Staple,
+        tons_per_unit: 1.0,
+        base_price_pesos: 70.0,
+        europe_price_pesos: 130.0,
+        perishability: Months(12),
+    ),
+    (
+        name: "Molasses",
+        category: Staple,
+        tons_per_unit: 1.0,
+        base_price_pesos: 25.0,
+        europe_price_pesos: 35.0,
+        perishability: Indefinite,
+    ),
+    (
+        name: "Rum",
+        category: Cash,
+        tons_per_unit: 1.0,
+        base_price_pesos: 200.0,
+        europe_price_pesos: 280.0,
+        perishability: Indefinite,
+    ),
+    (
+        name: "Tobacco",
+        category: Staple,
+        tons_per_unit: 1.0,
+        base_price_pesos: 40.0,
+        europe_price_pesos: 90.0,
+        perishability: Months(24),
+    ),
+    (
+        name: "Manufactures",
+        category: Manufactured,
+        tons_per_unit: 1.0,
+        base_price_pesos: 250.0,
+        europe_price_pesos: 200.0,
+        perishability: Indefinite,
+    ),
+    (
+        name: "Naval Stores",
+        category: Naval,
+        tons_per_unit: 1.0,
+        base_price_pesos: 80.0,
+        europe_price_pesos: 110.0,
+        perishability: Months(24),
+    ),
+    (
+        name: "Spanish Silver",
+        category: Currency,
+        tons_per_unit: 0.5,
+        base_price_pesos: 1000.0,
+        europe_price_pesos: 1000.0,
+        perishability: Indefinite,
+    ),
+    (
+        name: "Enslaved Persons",
+        category: Person,
+        tons_per_unit: 0.5,
+        base_price_pesos: 600.0,
+        europe_price_pesos: 0.0,
+        perishability: Days(60),
+    ),
+    // Step 7: combat consumables. Period-correct goods produced in
+    // European powder mills and arsenals (London, Amsterdam, Cadiz).
+    // Ships burn them per broadside; the Caribbean has no native
+    // production, which models the historical dependence of
+    // colonial/pirate forces on European supply.
+    (
+        name: "Gunpowder",
+        category: Naval,
+        tons_per_unit: 1.0,
+        // 1690s English Board of Ordnance bought gunpowder at
+        // ~£3/cwt ≈ ~133 pesos/ton at the mill. Shipped out it ran
+        // 200–280 pesos in the Caribbean.
+        base_price_pesos: 280.0,
+        europe_price_pesos: 140.0,
+        perishability: Months(24),
+    ),
+    (
+        name: "Cannon Shot",
+        category: Naval,
+        tons_per_unit: 1.0,
+        // Cast-iron round shot from English/Swedish foundries
+        // ~£15/ton in Europe → ~70 pesos/ton; doubled in the
+        // colonies after freight, insurance, and the king's duty.
+        base_price_pesos: 140.0,
+        europe_price_pesos: 70.0,
+        perishability: Indefinite,
+    ),
+]

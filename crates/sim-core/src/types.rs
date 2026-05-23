@@ -4,6 +4,12 @@ use glam::Vec2;
 /// X = East (positive), Y = North (positive).
 pub type Position = Vec2;
 
+slotmap::new_key_type! {
+    /// Stable handle to a ship in `World::ships`. Generational, so a
+    /// sunken ship's slot can be reused without aliasing old references.
+    pub struct ShipId;
+}
+
 /// Wind vector in knots (meteorological: u=east component, v=north component).
 #[derive(Debug, Clone, Copy)]
 pub struct WindVector {
@@ -21,9 +27,13 @@ impl WindVector {
         // Wind vector points in direction wind is blowing TO.
         // Meteorological convention: direction wind comes FROM.
         let to_dir = self.v.atan2(self.u).to_degrees(); // angle of (u,v) from east
-        // Convert: atan2 gives angle from +x axis (east), we want from +y axis (north)
+                                                        // Convert: atan2 gives angle from +x axis (east), we want from +y axis (north)
         let from_dir = (270.0 - to_dir) % 360.0;
-        if from_dir < 0.0 { from_dir + 360.0 } else { from_dir }
+        if from_dir < 0.0 {
+            from_dir + 360.0
+        } else {
+            from_dir
+        }
     }
 
     /// Direction wind is blowing TO in degrees (0=N, 90=E).
@@ -43,7 +53,11 @@ pub struct SimDate {
 impl SimDate {
     pub fn new(year: u16, month: u8, day: u8) -> Self {
         let day_of_year = month_day_to_doy(month, day);
-        Self { year, day_of_year, hour: 0 }
+        Self {
+            year,
+            day_of_year,
+            hour: 0,
+        }
     }
 
     /// Month index 0-11.
@@ -96,7 +110,11 @@ mod tests {
 
     #[test]
     fn test_sim_date_year_wrap() {
-        let mut date = SimDate { year: 1680, day_of_year: 365, hour: 23 };
+        let mut date = SimDate {
+            year: 1680,
+            day_of_year: 365,
+            hour: 23,
+        };
         date.advance_hours(2);
         assert_eq!(date.year, 1681);
         assert_eq!(date.day_of_year, 1);

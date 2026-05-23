@@ -56,8 +56,8 @@ pub enum FreightCostModel {
     ShipBased {
         stats: ShipStats,
         /// Per-day operational cost in pesos: crew wages + maintenance
-        /// + insurance, exclusive of provisions (which are computed
-        /// separately from the ship's consumption rate).
+        ///   + insurance, exclusive of provisions (which are computed
+        ///     separately from the ship's consumption rate).
         day_rate_pesos: f32,
         /// Pesos per ton of provisions (used to value the food the
         /// crew eats during the leg). Typically ≈ provisions base
@@ -70,21 +70,17 @@ impl FreightCostModel {
     /// Pesos per delivered ton on the i→j leg.
     pub fn cost_per_ton(&self, distance_nm: f32) -> f32 {
         match self {
-            FreightCostModel::Linear { pesos_per_ton_nm } => {
-                distance_nm * *pesos_per_ton_nm
-            }
+            FreightCostModel::Linear { pesos_per_ton_nm } => distance_nm * *pesos_per_ton_nm,
             FreightCostModel::ShipBased {
                 stats,
                 day_rate_pesos,
                 provisions_price_per_ton,
             } => {
                 // One-way voyage time, derated for tacking/calms/weather.
-                let voyage_days =
-                    distance_nm / (stats.speed_typical * 0.55 * 24.0);
-                let provisions_tons =
-                    stats.daily_provision_consumption() * voyage_days;
-                let leg_cost = day_rate_pesos * voyage_days
-                    + provisions_tons * provisions_price_per_ton;
+                let voyage_days = distance_nm / (stats.speed_typical * 0.55 * 24.0);
+                let provisions_tons = stats.daily_provision_consumption() * voyage_days;
+                let leg_cost =
+                    day_rate_pesos * voyage_days + provisions_tons * provisions_price_per_ton;
                 // Round trip: ship comes back empty (or with backhaul,
                 // but in the worst case we amortize over the laden
                 // direction only). Per-ton = round-trip cost / cargo
@@ -105,7 +101,11 @@ pub struct PortSpec<'a> {
 
 impl<'a> PortSpec<'a> {
     pub fn from_world(port: &'a Port, recipe: ProductionRecipe) -> Self {
-        Self { name: port.name, position: port.position, recipe }
+        Self {
+            name: &port.name,
+            position: port.position,
+            recipe,
+        }
     }
 
     /// Effective monthly supply of `id` (output × prosperity).
@@ -207,8 +207,7 @@ pub fn solve(scenario: &EquilibriumScenario) -> EquilibriumSolution {
             if i == j {
                 continue;
             }
-            let d =
-                distance_nm(scenario.ports[i].position, scenario.ports[j].position);
+            let d = distance_nm(scenario.ports[i].position, scenario.ports[j].position);
             freight[i * n + j] = scenario.freight.cost_per_ton(d);
         }
     }
@@ -224,14 +223,11 @@ pub fn solve(scenario: &EquilibriumScenario) -> EquilibriumSolution {
 
     for &good in &goods {
         let v_per_ton = scenario.goods.get(good).base_price_pesos;
-        let supply: Vec<f32> =
-            scenario.ports.iter().map(|p| p.supply(good)).collect();
-        let demand: Vec<f32> =
-            scenario.ports.iter().map(|p| p.demand(good)).collect();
+        let supply: Vec<f32> = scenario.ports.iter().map(|p| p.supply(good)).collect();
+        let demand: Vec<f32> = scenario.ports.iter().map(|p| p.demand(good)).collect();
 
         // Skip goods nobody produces or nobody consumes — no flow.
-        if supply.iter().all(|&s| s <= 0.0) || demand.iter().all(|&d| d <= 0.0)
-        {
+        if supply.iter().all(|&s| s <= 0.0) || demand.iter().all(|&d| d <= 0.0) {
             continue;
         }
 
@@ -273,6 +269,7 @@ pub fn solve(scenario: &EquilibriumScenario) -> EquilibriumSolution {
 /// at port `i` (≈ FOB price). `demand_duals[j]` is the marginal value
 /// of an extra ton of demand at port `j` (≈ delivered price, capped
 /// at `v_per_ton`).
+#[allow(clippy::type_complexity)]
 fn solve_single_good(
     n: usize,
     supply: &[f32],
@@ -285,73 +282,72 @@ fn solve_single_good(
     // Build a fresh problem; returns objective and the supply/demand
     // delivered totals at each port. Used both for the base solve and
     // for the perturbation pass.
-    let solve_with =
-        |sup: &[f32], dem: &[f32]| -> Option<(f64, Vec<Vec<f64>>)> {
-            let mut p = Problem::new(OptimizationDirection::Maximize);
+    let solve_with = |sup: &[f32], dem: &[f32]| -> Option<(f64, Vec<Vec<f64>>)> {
+        let mut p = Problem::new(OptimizationDirection::Maximize);
 
-            // Variables: x[i][j] tons/month from i to j (i != j).
-            // Coefficient: V_j (delivered value at j) − c_{ij}.
-            let mut vars = vec![vec![None; n]; n];
-            for i in 0..n {
-                if sup[i] <= 0.0 {
-                    continue;
-                }
-                for j in 0..n {
-                    if i == j || dem[j] <= 0.0 {
-                        continue;
-                    }
-                    let coeff = (v_per_ton - freight[i * n + j]) as f64;
-                    if coeff <= 0.0 {
-                        // No incentive — hard-skip. Still create a var
-                        // at zero so downstream loops are uniform.
-                        vars[i][j] = Some(p.add_var(0.0, (0.0, 0.0)));
-                    } else {
-                        vars[i][j] =
-                            Some(p.add_var(coeff, (0.0, f64::INFINITY)));
-                    }
-                }
+        // Variables: x[i][j] tons/month from i to j (i != j).
+        // Coefficient: V_j (delivered value at j) − c_{ij}.
+        let mut vars = vec![vec![None; n]; n];
+        for i in 0..n {
+            if sup[i] <= 0.0 {
+                continue;
             }
-
-            // Per-source supply caps.
-            for i in 0..n {
-                let mut expr: Vec<(microlp::Variable, f64)> = Vec::new();
-                for j in 0..n {
-                    if let Some(v) = vars[i][j] {
-                        expr.push((v, 1.0));
-                    }
-                }
-                if expr.is_empty() {
-                    continue;
-                }
-                p.add_constraint(expr, ComparisonOp::Le, sup[i] as f64);
-            }
-
-            // Per-sink demand caps.
             for j in 0..n {
-                let mut expr: Vec<(microlp::Variable, f64)> = Vec::new();
-                for i in 0..n {
-                    if let Some(v) = vars[i][j] {
-                        expr.push((v, 1.0));
-                    }
-                }
-                if expr.is_empty() {
+                if i == j || dem[j] <= 0.0 {
                     continue;
                 }
-                p.add_constraint(expr, ComparisonOp::Le, dem[j] as f64);
-            }
-
-            let sol = p.solve().ok()?;
-            let obj = sol.objective();
-            let mut flows = vec![vec![0.0_f64; n]; n];
-            for i in 0..n {
-                for j in 0..n {
-                    if let Some(v) = vars[i][j] {
-                        flows[i][j] = sol[v];
-                    }
+                let coeff = (v_per_ton - freight[i * n + j]) as f64;
+                if coeff <= 0.0 {
+                    // No incentive — hard-skip. Still create a var
+                    // at zero so downstream loops are uniform.
+                    vars[i][j] = Some(p.add_var(0.0, (0.0, 0.0)));
+                } else {
+                    vars[i][j] = Some(p.add_var(coeff, (0.0, f64::INFINITY)));
                 }
             }
-            Some((obj, flows))
-        };
+        }
+
+        // Per-source supply caps.
+        for i in 0..n {
+            let mut expr: Vec<(microlp::Variable, f64)> = Vec::new();
+            for j in 0..n {
+                if let Some(v) = vars[i][j] {
+                    expr.push((v, 1.0));
+                }
+            }
+            if expr.is_empty() {
+                continue;
+            }
+            p.add_constraint(expr, ComparisonOp::Le, sup[i] as f64);
+        }
+
+        // Per-sink demand caps.
+        #[allow(clippy::needless_range_loop)]
+        for j in 0..n {
+            let mut expr: Vec<(microlp::Variable, f64)> = Vec::new();
+            for i in 0..n {
+                if let Some(v) = vars[i][j] {
+                    expr.push((v, 1.0));
+                }
+            }
+            if expr.is_empty() {
+                continue;
+            }
+            p.add_constraint(expr, ComparisonOp::Le, dem[j] as f64);
+        }
+
+        let sol = p.solve().ok()?;
+        let obj = sol.objective();
+        let mut flows = vec![vec![0.0_f64; n]; n];
+        for i in 0..n {
+            for j in 0..n {
+                if let Some(v) = vars[i][j] {
+                    flows[i][j] = sol[v];
+                }
+            }
+        }
+        Some((obj, flows))
+    };
 
     let (obj_base, flows_base) = match solve_with(supply, demand) {
         Some(x) => x,
@@ -368,8 +364,7 @@ fn solve_single_good(
         if supply[i] <= 0.0 {
             continue;
         }
-        let used: f32 =
-            (0..n).map(|j| flows_base[i][j]).sum::<f64>() as f32;
+        let used: f32 = (0..n).map(|j| flows_base[i][j]).sum::<f64>() as f32;
         if used + 1e-4 < supply[i] {
             // Cap not binding — dual is zero.
             continue;
@@ -386,8 +381,7 @@ fn solve_single_good(
         if demand[j] <= 0.0 {
             continue;
         }
-        let used: f32 =
-            (0..n).map(|i| flows_base[i][j]).sum::<f64>() as f32;
+        let used: f32 = (0..n).map(|i| flows_base[i][j]).sum::<f64>() as f32;
         if used + 1e-4 < demand[j] {
             continue;
         }
@@ -399,6 +393,7 @@ fn solve_single_good(
     }
 
     let mut flows_out = Vec::new();
+    #[allow(clippy::needless_range_loop)]
     for i in 0..n {
         for j in 0..n {
             let f = flows_base[i][j] as f32;
@@ -447,7 +442,9 @@ mod tests {
         let scenario = EquilibriumScenario {
             ports: vec![producer, consumer],
             goods: &goods,
-            freight: FreightCostModel::Linear { pesos_per_ton_nm: 0.1 },
+            freight: FreightCostModel::Linear {
+                pesos_per_ton_nm: 0.1,
+            },
         };
         let sol = solve(&scenario);
         let flow = sol.flows.iter().find(|f| f.good == ids::SUGAR);
@@ -455,13 +452,31 @@ mod tests {
         let f = flow.unwrap();
         assert_eq!(f.from, 0);
         assert_eq!(f.to, 1);
-        assert!((f.tons_per_month - 30.0).abs() < 1e-2,
-            "should ship up to demand cap");
-        let p_supply = sol.supply_prices.get(&(0, ids::SUGAR)).copied().unwrap_or(0.0);
-        let p_demand = sol.demand_prices.get(&(1, ids::SUGAR)).copied().unwrap_or(0.0);
+        assert!(
+            (f.tons_per_month - 30.0).abs() < 1e-2,
+            "should ship up to demand cap"
+        );
+        let p_supply = sol
+            .supply_prices
+            .get(&(0, ids::SUGAR))
+            .copied()
+            .unwrap_or(0.0);
+        let p_demand = sol
+            .demand_prices
+            .get(&(1, ids::SUGAR))
+            .copied()
+            .unwrap_or(0.0);
         // Demand cap is binding; supply cap (50) is not (only 30 ships) → supply dual = 0.
-        assert!(p_demand > 50.0, "demand-side dual ≈ 60 (=70-10), got {}", p_demand);
-        assert!(p_supply == 0.0, "supply cap not binding → dual is 0, got {}", p_supply);
+        assert!(
+            p_demand > 50.0,
+            "demand-side dual ≈ 60 (=70-10), got {}",
+            p_demand
+        );
+        assert!(
+            p_supply == 0.0,
+            "supply cap not binding → dual is 0, got {}",
+            p_supply
+        );
     }
 
     #[test]
@@ -481,10 +496,14 @@ mod tests {
         let scenario = EquilibriumScenario {
             ports: vec![producer, consumer],
             goods: &goods,
-            freight: FreightCostModel::Linear { pesos_per_ton_nm: 8.0 },
+            freight: FreightCostModel::Linear {
+                pesos_per_ton_nm: 8.0,
+            },
         };
         let sol = solve(&scenario);
-        assert!(sol.flows.iter().all(|f| f.tons_per_month < 1e-3),
-            "no profitable flow exists");
+        assert!(
+            sol.flows.iter().all(|f| f.tons_per_month < 1e-3),
+            "no profitable flow exists"
+        );
     }
 }

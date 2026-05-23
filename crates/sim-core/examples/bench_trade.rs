@@ -1,26 +1,31 @@
-//! Run a 60-day calibration demo: spawn a small trader fleet, tick the
-//! simulation hour-by-hour, and report each ship's profit-and-loss
-//! together with a sample of port stockpiles and prices.
+//! Run a calibration demo over a configurable horizon: spawn a small
+//! trader fleet, tick the simulation hour-by-hour, and report each
+//! ship's profit-and-loss together with a sample of port stockpiles
+//! and prices.
 //!
-//! Used during Phase 2 step 9 to tune prosperity, monthly outputs, and
-//! pricing constants. Look for: most ships in the black, 1–2 in the
-//! red (some volatility), prices that oscillate but don't explode.
+//! Used during Phase 2/3 calibration to tune prosperity, monthly
+//! outputs, pricing constants, sailor-pool dynamics, and morale.
+//! The 60-day run is the quick smoke; 365 / 730-day runs surface
+//! slow-burn pathologies (pool collapse, runaway wages, equilibrium
+//! drift). Look for: most ships in the black, 1–2 in the red (some
+//! volatility), prices that oscillate but don't explode, sailor pools
+//! that stay within a 2× band of seed values.
 //!
-//! Usage: `cargo run --release --example bench_trade`
+//! Usage:
+//!   cargo run --release --example bench_trade            # 60-day default
+//!   cargo run --release --example bench_trade -- 365     # 1-year sweep
+//!   cargo run --release --example bench_trade -- 730     # 2-year sweep
 
-use sim_core::ai::ShipAI;
-use sim_core::equilibrium::{
-    self, EquilibriumScenario, FreightCostModel, PortSpec,
-};
+use sim_core::equilibrium::{self, EquilibriumScenario, FreightCostModel, PortSpec};
 use sim_core::goods::{ids, GoodId};
 use sim_core::market::archetype_for;
-use sim_core::ship::{Ship, ShipState, ShipStats};
+use sim_core::ship::ShipStats;
+use sim_core::types::ShipId;
 use sim_core::world::World;
 use std::collections::BTreeMap;
 use std::path::Path;
 
-const SIM_DAYS: u32 = 60;
-const SIM_HOURS: u32 = SIM_DAYS * 24;
+const DEFAULT_SIM_DAYS: u32 = 60;
 
 /// Snapshot total stockpile (summed across all ports) and total
 /// in-transit cargo (summed across all ships) for every good. Used
@@ -37,7 +42,7 @@ fn snapshot_system(
         }
     }
     let mut tr: BTreeMap<u8, f32> = BTreeMap::new();
-    for s in &world.ships {
+    for (_, s) in &world.ships {
         for (gid, tons) in s.cargo.iter() {
             *tr.entry(gid.0).or_insert(0.0) += tons;
         }
@@ -72,37 +77,36 @@ fn record_recipe_flow(
 }
 
 fn main() {
+    let sim_days: u32 = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_SIM_DAYS);
+    let sim_hours: u32 = sim_days * 24;
+
     let mut world = World::load(Path::new("data/"));
 
-    // Starter fleet: 5 ships seeded across the map.
-    let starts: &[(&str, u64)] = &[
-        ("Bridgetown", 7),
-        ("Port Royal", 13),
-        ("Boston", 21),
-        ("Charleston", 33),
-        ("Cartagena", 41),
-        ("Havana", 53),
-        ("Fort-Royal", 67),
-        ("London", 79),
-        ("Amsterdam", 89),
-        ("Nantes", 97),
-    ];
-    let mut origin_names = Vec::new();
-    for (name, seed) in starts {
-        let Some(idx) = world.ports.iter().position(|p| p.name == *name) else {
-            println!("(skip) port {} not found", name);
-            continue;
-        };
-        let port_pos = world.ports[idx].position;
-        let ship = Ship::new(port_pos, ShipState::Docked);
-        let mut ai = ShipAI::with_seed(*seed);
-        ai.nav.docked_at_port = Some(idx);
-        origin_names.push(*name);
-        world.add_ship(ship, ai);
-    }
+    // Step 10: seed a historically-scaled starter fleet (~480 ships
+    // across all 38 ports — see `planning/research/atlantic-fleet-
+    // numbers-1650-1720.md`). Replaces the hand-picked 10-merchant +
+    // 3-pirate starter from Steps 6–9; that fleet was 1–2 orders of
+    // magnitude under the historical baseline of ~400–800 active
+    // hulls in the Caribbean basin c. 1680.
+    let ship_ids: Vec<ShipId> = world.seed_historical_fleet(0xCAFE_1680);
+    let mut ship_ids = ship_ids;
+    let mut origin_names: Vec<String> = ship_ids
+        .iter()
+        .map(|&id| {
+            let port_idx = world.ships[id].owner_port.unwrap_or(0);
+            world.ports[port_idx].name.clone()
+        })
+        .collect();
+    let n_seeded_pirates = ship_ids
+        .iter()
+        .filter(|&&id| world.ships[id].policy == sim_core::ship::ShipPolicy::Pirate)
+        .count();
 
     let n_ships = world.ships.len();
-    println!("Phase 2 calibration run: {} days, {} ships", SIM_DAYS, n_ships);
+    println!("Calibration run: {} days, {} ships", sim_days, n_ships);
     println!();
 
     // Sample a few ports each week so we can see prices oscillate.
@@ -142,26 +146,40 @@ fn main() {
     let mut in_transit_per_month: Vec<Vec<(GoodId, f32)>> = Vec::new();
     // Take an initial snapshot at month 0 (before any production).
     snapshot_system(&world, &mut stockpile_per_month, &mut in_transit_per_month);
-    record_recipe_flow(&world, &mut production_per_month, &mut consumption_per_month);
+    record_recipe_flow(
+        &world,
+        &mut production_per_month,
+        &mut consumption_per_month,
+    );
 
     // Simulate.
-    for h in 1..=SIM_HOURS {
+    for h in 1..=sim_hours {
         world.tick();
         // Track origin names for any newly-built ships so the report
-        // can label them. Their starting silver lives on the Ship
-        // itself (`ship.starting_silver`), so there's no race here.
-        while world.ships.len() > origin_names.len() {
-            let i = origin_names.len();
-            let owner_name = world.ships[i]
-                .owner_port
-                .and_then(|idx| world.ports.get(idx).map(|p| p.name))
-                .unwrap_or("?");
-            origin_names.push(owner_name);
+        // can label them. Scan for ShipIds we haven't seen yet (SlotMap
+        // iteration order is not specified, but newly-inserted keys
+        // simply aren't in our `ship_ids` Vec yet).
+        if world.ships.len() > ship_ids.len() {
+            let known: std::collections::HashSet<ShipId> = ship_ids.iter().copied().collect();
+            for (id, ship) in &world.ships {
+                if !known.contains(&id) {
+                    let owner_name = ship
+                        .owner_port
+                        .and_then(|idx| world.ports.get(idx).map(|p| p.name.clone()))
+                        .unwrap_or_else(|| "?".to_string());
+                    origin_names.push(owner_name);
+                    ship_ids.push(id);
+                }
+            }
         }
         // Detect month transition and snapshot at end of month.
         if world.date.month() != last_observed_month {
             snapshot_system(&world, &mut stockpile_per_month, &mut in_transit_per_month);
-            record_recipe_flow(&world, &mut production_per_month, &mut consumption_per_month);
+            record_recipe_flow(
+                &world,
+                &mut production_per_month,
+                &mut consumption_per_month,
+            );
             last_observed_month = world.date.month();
         }
         if h % (24 * 7) == 0 {
@@ -180,61 +198,224 @@ fn main() {
     }
 
     println!();
-    println!("Per-ship P/L after {} days:", SIM_DAYS);
-    println!(
-        "{:<3}  {:<14}  {:<10}  {:>10}  {:>10}  {:>10}  {:>8}  {:>10}  {:<10}  {:<24}",
-        "#", "from", "type", "silver_in", "silver_out", "dividends", "debt", "P/L", "state", "cargo"
-    );
+    println!("Fleet aggregate after {} days:", sim_days);
     let mut total_pl = 0.0f32;
     let mut total_debt = 0.0f32;
     let mut bankrupt = 0;
-    for (i, ship) in world.ships.iter().enumerate() {
-        // True lifetime P/L includes dividends paid back to the
-        // owner port (which may have settled silver out of the
-        // strongbox) and subtracts any outstanding chandler/freight
-        // debt the captain still owes the merchant network.
+    // Aggregate by (faction, ship-type) → (count, total_pl, total_debt,
+    // total_hull_pct, total_rig_pct, sailing/docked/anchored/hiring/sunk).
+    use sim_core::port::Faction;
+    use sim_core::ship::ShipPolicy;
+    #[derive(Default)]
+    struct Bucket {
+        n: u32,
+        pl: f32,
+        debt: f32,
+        hull_pct: f32,
+        rig_pct: f32,
+        n_pirate: u32,
+        n_bankrupt: u32,
+    }
+    let mut buckets: BTreeMap<(String, String), Bucket> = BTreeMap::new();
+    let mut top: Vec<(i64, ShipId)> = Vec::new();
+    for &id in &ship_ids {
+        let Some(ship) = world.ships.get(id) else {
+            continue;
+        };
         let pl = (ship.silver - ship.starting_silver) + ship.lifetime_dividends - ship.debt;
         total_pl += pl;
         total_debt += ship.debt;
-        if ship.silver < 50.0 && ship.lifetime_dividends < 1.0 {
+        let is_bankrupt = ship.silver < 50.0 && ship.lifetime_dividends < 1.0;
+        if is_bankrupt {
             bankrupt += 1;
         }
-        let state = match ship.state {
-            ShipState::Sailing => "sailing",
-            ShipState::Docked => "docked",
-            ShipState::Anchored => "anchored",
+        let stats = &world.ship_types.get(ship.ship_type).stats;
+        let hull_pct = if stats.hull_integrity_max > 0.0 {
+            100.0 * ship.hull_integrity / stats.hull_integrity_max
+        } else {
+            100.0
         };
-        let cargo: Vec<String> = ship.cargo.iter()
-            .filter(|(_, t)| *t > 0.01)
-            .map(|(id, t)| format!("{}:{:.1}", world.goods.get(id).name, t))
-            .collect();
-        let built_tag = if i >= n_ships { " (built)" } else { "" };
-        let type_name = world.ship_types.get(ship.ship_type).name;
+        let rig_pct = if stats.rigging_integrity_max > 0.0 {
+            100.0 * ship.rigging_integrity / stats.rigging_integrity_max
+        } else {
+            100.0
+        };
+        let faction_key = match ship.faction {
+            Faction::Spain => "Spain",
+            Faction::England => "England",
+            Faction::France => "France",
+            Faction::Netherlands => "Netherlands",
+            Faction::Free => "Free",
+        }
+        .to_string();
+        let type_key = world.ship_types.get(ship.ship_type).name.clone();
+        let b = buckets.entry((faction_key, type_key)).or_default();
+        b.n += 1;
+        b.pl += pl;
+        b.debt += ship.debt;
+        b.hull_pct += hull_pct;
+        b.rig_pct += rig_pct;
+        if ship.policy == ShipPolicy::Pirate {
+            b.n_pirate += 1;
+        }
+        if is_bankrupt {
+            b.n_bankrupt += 1;
+        }
+        top.push((pl as i64, id));
+    }
+    println!(
+        "{:<12}  {:<10}  {:>5}  {:>+12}  {:>10}  {:>6}  {:>6}  {:>6}  {:>6}",
+        "faction", "type", "n", "P/L total", "debt tot", "hull%", "rig%", "pirate", "broke"
+    );
+    for ((fac, ty), b) in &buckets {
+        if b.n == 0 {
+            continue;
+        }
         println!(
-            "{:<3}  {:<14}  {:<10}  {:>10.0}  {:>10.0}  {:>10.0}  {:>8.0}  {:>+10.0}  {:<10}  {:<24}{}",
-            i, origin_names[i], type_name, ship.starting_silver, ship.silver,
-            ship.lifetime_dividends, ship.debt, pl, state, cargo.join(","), built_tag
+            "{:<12}  {:<10}  {:>5}  {:>+12.0}  {:>10.0}  {:>6.0}  {:>6.0}  {:>6}  {:>6}",
+            fac,
+            ty,
+            b.n,
+            b.pl,
+            b.debt,
+            b.hull_pct / b.n as f32,
+            b.rig_pct / b.n as f32,
+            b.n_pirate,
+            b.n_bankrupt,
         );
     }
+    // Outliers: top 5 and bottom 5 by P/L.
+    top.sort_by(|a, b| b.0.cmp(&a.0));
     println!();
-    println!("Fleet total P/L: {:+.0} pesos   (outstanding debt: {:.0})", total_pl, total_debt);
+    println!("Top 5 earners:");
+    for (pl, id) in top.iter().take(5) {
+        let s = &world.ships[*id];
+        let port = s
+            .owner_port
+            .and_then(|i| world.ports.get(i).map(|p| p.name.as_str()))
+            .unwrap_or("?");
+        println!(
+            "  {:>+10}  {:<10} from {}",
+            pl,
+            world.ship_types.get(s.ship_type).name,
+            port
+        );
+    }
+    println!("Bottom 5:");
+    for (pl, id) in top.iter().rev().take(5) {
+        let s = &world.ships[*id];
+        let port = s
+            .owner_port
+            .and_then(|i| world.ports.get(i).map(|p| p.name.as_str()))
+            .unwrap_or("?");
+        println!(
+            "  {:>+10}  {:<10} from {}",
+            pl,
+            world.ship_types.get(s.ship_type).name,
+            port
+        );
+    }
+
+    println!();
+    println!(
+        "Fleet total P/L: {:+.0} pesos   (outstanding debt: {:.0})",
+        total_pl, total_debt
+    );
     println!("Bankrupt ships:  {}/{}", bankrupt, world.ships.len());
-    println!("Ships built by shipyards: {}  (last_month_avg_profit = {:+.0})",
-        world.ships_built, world.last_month_avg_profit);
+    println!(
+        "Ships built by shipyards: {}  (last_month_avg_profit = {:+.0})",
+        world.ships_built, world.last_month_avg_profit
+    );
+    // Step 8 / Step 9 diagnostics: counts of active pirates and of
+    // ships that were spawned/built over the run but no longer exist
+    // (sunk by broadside or burned after boarding).
+    {
+        let n_pirate = world
+            .ships
+            .iter()
+            .filter(|(_, s)| s.policy == ShipPolicy::Pirate)
+            .count();
+        let n_navy = world
+            .ships
+            .iter()
+            .filter(|(_, s)| s.policy != ShipPolicy::Pirate && s.policy != ShipPolicy::Merchant)
+            .count();
+        let n_mutinied = world.mutinies_total as usize;
+        // Step 11.a: "captured" now means prize-flips (rare path).
+        // The old derivation (n_pirate − seeded − mutinied) was a
+        // proxy that worked when every prize became a pirate; with
+        // the new outcome split, read it straight from the counter.
+        let n_captured = world.prizes_taken as usize;
+        let n_known = ship_ids.len();
+        let n_alive = world.ships.len();
+        let n_lost = n_known.saturating_sub(n_alive);
+        println!(
+            "Combat ledger: {} pirate(s) afloat ({} seeded + {} captured + {} mutinied), {} navy/privateer, {} lost (sunk or burned prize)",
+            n_pirate, n_seeded_pirates, n_captured, n_mutinied, n_navy, n_lost,
+        );
+        // Step 11.a: prize-outcome breakdown. Almost all successful
+        // boardings now result in cargo strip + hull dispatch (sink /
+        // sold / released); flipping the prize to pirate is rare.
+        println!(
+            "Prize outcomes: {} taken (flipped to pirate), {} sold at haven, {} sunk, {} released",
+            world.prizes_taken, world.prizes_sold, world.prizes_sunk, world.prizes_released,
+        );
+        // Step 10.b: non-combat attrition breakdown. Storm/foundering/
+        // fire counters are sinkings only; storm damage that didn't
+        // sink the hull lives in `weather.hazards.counters.storms_damaged`.
+        let hz = world.weather.hazards.counters;
+        println!(
+            "Attrition: {} storm sinkings ({} damage-only), {} foundered, {} fires ({} sunk)",
+            world.attrition_storms,
+            hz.storms_damaged,
+            world.attrition_foundered,
+            hz.fires,
+            world.attrition_fires,
+        );
+    }
+
+    // Sailor pool snapshot (Step 3.a diagnostic). Categories the
+    // calibration sweep will watch for collapse/explosion.
+    {
+        use sim_core::pop::PortCategory;
+        let mut sums: std::collections::BTreeMap<&str, (u32, u32, u32)> =
+            std::collections::BTreeMap::new();
+        for (port, d) in world.ports.iter().zip(world.demographics.iter()) {
+            let key = match d.category {
+                PortCategory::EuropeanHub => "EuropeanHub",
+                PortCategory::CaribbeanEntrepot => "CaribbeanEntrepot",
+                PortCategory::SmallColonial => "SmallColonial",
+                PortCategory::PirateHaven => "PirateHaven",
+            };
+            let e = sums.entry(key).or_insert((0, 0, 0));
+            e.0 += 1;
+            e.1 += d.seasoned;
+            e.2 += d.unseasoned;
+            // Silence unused warning if Display ever drops port.
+            let _ = port;
+        }
+        println!();
+        println!("Sailor pools by port category (Step 3.a):");
+        println!(
+            "  {:<20} {:>7} {:>12} {:>12} {:>12}",
+            "category", "ports", "seasoned", "unseasoned", "total"
+        );
+        for (cat, (n, s, u)) in &sums {
+            println!("  {:<20} {:>7} {:>12} {:>12} {:>12}", cat, n, s, u, s + u);
+        }
+    }
 
     // Builds-by-type summary: only count ships beyond the starter
     // fleet (those are the shipyard's actual output, not what we
     // seeded for the demo).
     if world.ships.len() > n_ships {
-        let mut counts: std::collections::BTreeMap<&'static str, u32> =
-            std::collections::BTreeMap::new();
-        for ship in world.ships.iter().skip(n_ships) {
-            let name = world.ship_types.get(ship.ship_type).name;
+        let mut counts: std::collections::BTreeMap<&str, u32> = std::collections::BTreeMap::new();
+        for &id in ship_ids.iter().skip(n_ships) {
+            let ship = &world.ships[id];
+            let name = world.ship_types.get(ship.ship_type).name.as_str();
             *counts.entry(name).or_insert(0) += 1;
         }
-        let parts: Vec<String> = counts.iter()
-            .map(|(n, c)| format!("{} {}", c, n))
-            .collect();
+        let parts: Vec<String> = counts.iter().map(|(n, c)| format!("{} {}", c, n)).collect();
         println!("  by type: {}", parts.join(", "));
     }
 
@@ -250,11 +431,15 @@ fn main() {
         "  {:<18} {:<7} {}",
         "good",
         "kind",
-        header_months.iter().map(|h| format!("{:>10}", h)).collect::<String>()
+        header_months
+            .iter()
+            .map(|h| format!("{:>10}", h))
+            .collect::<String>()
     );
     // Union of all goods that show up anywhere in any snapshot.
     let mut all_goods: std::collections::BTreeSet<u8> = std::collections::BTreeSet::new();
-    for snap in stockpile_per_month.iter()
+    for snap in stockpile_per_month
+        .iter()
         .chain(in_transit_per_month.iter())
         .chain(production_per_month.iter())
         .chain(consumption_per_month.iter())
@@ -264,7 +449,10 @@ fn main() {
         }
     }
     let lookup = |snap: &Vec<(GoodId, f32)>, gid: GoodId| -> f32 {
-        snap.iter().find(|(g, _)| *g == gid).map(|(_, v)| *v).unwrap_or(0.0)
+        snap.iter()
+            .find(|(g, _)| *g == gid)
+            .map(|(_, v)| *v)
+            .unwrap_or(0.0)
     };
     let series_line = |snaps: &Vec<Vec<(GoodId, f32)>>, gid: GoodId| -> String {
         (0..n_months)
@@ -302,13 +490,33 @@ fn main() {
     };
     for gid_raw in all_goods {
         let gid = GoodId(gid_raw);
-        let name = world.goods.get(gid).name;
-        println!("  {:<18} {:<7} {}", name, "prod",    series_line(&production_per_month,  gid));
-        println!("  {:<18} {:<7} {}", "",   "cons",    series_line(&consumption_per_month, gid));
-        println!("  {:<18} {:<7} {}", "",   "net",     net_line(gid));
-        println!("  {:<18} {:<7} {}", "",   "stock",   series_line(&stockpile_per_month,   gid));
-        println!("  {:<18} {:<7} {}", "",   "transit", series_line(&in_transit_per_month,  gid));
-        println!("  {:<18} {:<7} {}", "",   "Δtotal",  delta_total_line(gid));
+        let name = &world.goods.get(gid).name;
+        println!(
+            "  {:<18} {:<7} {}",
+            name,
+            "prod",
+            series_line(&production_per_month, gid)
+        );
+        println!(
+            "  {:<18} {:<7} {}",
+            "",
+            "cons",
+            series_line(&consumption_per_month, gid)
+        );
+        println!("  {:<18} {:<7} {}", "", "net", net_line(gid));
+        println!(
+            "  {:<18} {:<7} {}",
+            "",
+            "stock",
+            series_line(&stockpile_per_month, gid)
+        );
+        println!(
+            "  {:<18} {:<7} {}",
+            "",
+            "transit",
+            series_line(&in_transit_per_month, gid)
+        );
+        println!("  {:<18} {:<7} {}", "", "Δtotal", delta_total_line(gid));
     }
 
     // ── Annualized structural flow. Recipe × prosperity is steady-state
@@ -317,14 +525,19 @@ fn main() {
     //    can sustain the fleet's demand and a year of port consumption.
     println!();
     println!("Annualized structural flow (12 × steady-state month):");
-    println!("  {:<18} {:>10} {:>10} {:>10}", "good", "prod/yr", "cons/yr", "net/yr");
-    for gid_raw in stockpile_per_month[0].iter().map(|(g, _)| g.0)
+    println!(
+        "  {:<18} {:>10} {:>10} {:>10}",
+        "good", "prod/yr", "cons/yr", "net/yr"
+    );
+    for gid_raw in stockpile_per_month[0]
+        .iter()
+        .map(|(g, _)| g.0)
         .chain(production_per_month[0].iter().map(|(g, _)| g.0))
         .chain(consumption_per_month[0].iter().map(|(g, _)| g.0))
         .collect::<std::collections::BTreeSet<_>>()
     {
         let gid = GoodId(gid_raw);
-        let name = world.goods.get(gid).name;
+        let name = &world.goods.get(gid).name;
         let p = lookup(&production_per_month[0], gid) * 12.0;
         let c = lookup(&consumption_per_month[0], gid) * 12.0;
         println!("  {:<18} {:>10.0} {:>10.0} {:>+10.0}", name, p, c, p - c);
@@ -337,9 +550,10 @@ fn main() {
     //    to the equilibrium "delivered" price. Big numbers = the
     //    simulation is structurally far from where a frictionless
     //    trade-allocator would push it.
-    let port_specs: Vec<PortSpec> = world.ports
+    let port_specs: Vec<PortSpec> = world
+        .ports
         .iter()
-        .map(|p| PortSpec::from_world(p, archetype_for(p.name).recipe()))
+        .map(|p| PortSpec::from_world(p, archetype_for(&p.name).recipe()))
         .collect();
     let voyage_freight = FreightCostModel::ShipBased {
         stats: ShipStats::sloop(),
@@ -352,11 +566,14 @@ fn main() {
         freight: voyage_freight,
     });
 
-    let mut diffs: Vec<(String, &str, f32, f32, f32)> = Vec::new();
+    let mut diffs: Vec<(String, String, f32, f32, f32)> = Vec::new();
     for (port_idx, port) in world.ports.iter().enumerate() {
         let spec = &port_specs[port_idx];
         let mut seen = std::collections::HashSet::new();
-        for (good, _) in spec.recipe.monthly_outputs.iter()
+        for (good, _) in spec
+            .recipe
+            .monthly_outputs
+            .iter()
             .chain(spec.recipe.monthly_inputs.iter())
         {
             let good: GoodId = *good;
@@ -372,7 +589,7 @@ fn main() {
                 };
                 diffs.push((
                     port.name.to_string(),
-                    world.goods.get(good).name,
+                    world.goods.get(good).name.clone(),
                     p_sim,
                     p_eq,
                     pct,
@@ -403,7 +620,11 @@ fn main() {
         for d in sorted.iter().take(10) {
             println!(
                 "    {:<24} {:<18} {:>10.1} {:>10.1} {:>7.0}%",
-                d.0, d.1, d.2, d.3, d.4 * 100.0
+                d.0,
+                d.1,
+                d.2,
+                d.3,
+                d.4 * 100.0
             );
         }
     }
@@ -416,7 +637,9 @@ fn main() {
     // (geography matters).
     println!();
     println!("Calibration verdict:");
-    let losers = world.ships.iter()
+    let losers = world
+        .ships
+        .values()
         .filter(|s| (s.silver - s.starting_silver) + s.lifetime_dividends < 0.0)
         .count();
     if bankrupt > 0 {
@@ -429,10 +652,8 @@ fn main() {
             "  ⚠ {} ship(s) ended in the red — successful voyages should reliably profit",
             losers
         );
-    } else if total_pl < world.ships.iter().map(|s| s.starting_silver).sum::<f32>() * 0.5 {
-        println!(
-            "  ⚠ fleet barely profitable — trade margins or world prices may be too thin"
-        );
+    } else if total_pl < world.ships.values().map(|s| s.starting_silver).sum::<f32>() * 0.5 {
+        println!("  ⚠ fleet barely profitable — trade margins or world prices may be too thin");
     } else {
         println!("  ✓ every ship in the black with healthy variance");
     }

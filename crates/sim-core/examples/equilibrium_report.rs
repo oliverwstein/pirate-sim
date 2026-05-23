@@ -9,16 +9,16 @@
 //!
 //! Usage: `cargo run --release --example equilibrium_report`
 
-use sim_core::equilibrium::{
-    self, EquilibriumScenario, FreightCostModel, PortSpec,
-};
+use sim_core::equilibrium::{self, EquilibriumScenario, FreightCostModel, PortSpec};
+use sim_core::goods::GoodsRegistry;
 use sim_core::market::{archetype_for, PortMarket};
 use sim_core::port::all_ports;
-use sim_core::goods::GoodsRegistry;
 use sim_core::ship::ShipStats;
+use sim_core::shiptype::ShipTypeRegistry;
 
 fn main() {
-    let ports = all_ports();
+    let ship_types = ShipTypeRegistry::starter();
+    let ports = all_ports(&ship_types);
     let goods = GoodsRegistry::starter();
 
     // Build per-port specs from the same archetype recipes the
@@ -26,7 +26,7 @@ fn main() {
     let port_specs: Vec<PortSpec> = ports
         .iter()
         .map(|p| {
-            let recipe = archetype_for(p.name).recipe();
+            let recipe = archetype_for(&p.name).recipe();
             PortSpec::from_world(p, recipe)
         })
         .collect();
@@ -35,14 +35,16 @@ fn main() {
     // so this is a direct apples-to-apples baseline.
     let markets: Vec<PortMarket> = ports
         .iter()
-        .map(|p| PortMarket::with_recipe(&goods, archetype_for(p.name).recipe()))
+        .map(|p| PortMarket::with_recipe(&goods, archetype_for(&p.name).recipe()))
         .collect();
 
     // ── Cost model A: linear $0.05 / ton-NM. Tuneable; this is
     //    roughly what historical ocean freight rates worked out to
     //    when expressed per-ton-NM (a very rough order-of-magnitude
     //    fit, not a calibrated number).
-    let cost_simple = FreightCostModel::Linear { pesos_per_ton_nm: 0.05 };
+    let cost_simple = FreightCostModel::Linear {
+        pesos_per_ton_nm: 0.05,
+    };
 
     // ── Cost model B: voyage-based for a sloop. Day-rate is wages +
     //    maintenance + insurance for a 25-man crew, very loosely

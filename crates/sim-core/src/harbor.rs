@@ -55,7 +55,10 @@ impl HarborMap {
     /// An empty harbor map — useful for tests where no harbor zones are
     /// needed (the AI falls back to geometric arrival).
     pub fn empty() -> Self {
-        HarborMap { harbors: Vec::new(), cell_to_port: HashMap::new() }
+        HarborMap {
+            harbors: Vec::new(),
+            cell_to_port: HashMap::new(),
+        }
     }
 
     /// Build a harbor zone for each port by BFS through sea cells from the
@@ -111,7 +114,10 @@ impl HarborMap {
             });
         }
 
-        HarborMap { harbors, cell_to_port }
+        HarborMap {
+            harbors,
+            cell_to_port,
+        }
     }
 
     /// Look up a harbor by its port index. O(n) over harbors; n is small.
@@ -139,8 +145,14 @@ fn bfs_zone(
     let r2 = radius_nm * radius_nm;
 
     const NEIGHBORS: [(i32, i32); 8] = [
-        (1, 0), (-1, 0), (0, 1), (0, -1),
-        (1, 1), (1, -1), (-1, 1), (-1, -1),
+        (1, 0),
+        (-1, 0),
+        (0, 1),
+        (0, -1),
+        (1, 1),
+        (1, -1),
+        (-1, 1),
+        (-1, -1),
     ];
 
     while let Some(cell) = q.pop_front() {
@@ -181,24 +193,35 @@ mod tests {
 
     fn open_sea_land(width: u32, height: u32, cell: f32) -> LandMap {
         let data = vec![0u8; (width * height) as usize];
-        LandMap::from_raw(data, width, height, Position::new(0.0, height as f32 * cell), cell)
+        LandMap::from_raw(
+            data,
+            width,
+            height,
+            Position::new(0.0, height as f32 * cell),
+            cell,
+        )
     }
 
     #[test]
     fn harbor_zone_is_disk_in_open_sea() {
         let land = open_sea_land(40, 40, 1.0);
         let port = Port {
-            name: "Test",
+            name: "Test".to_string(),
             position: Position::new(20.0, 20.0),
-            faction: Faction::Pirate,
+            faction: Faction::Free,
             harbor_radius_nm: 5.0,
             shipyard: None,
+            category: crate::pop::PortCategory::SmallColonial,
         };
         let map = HarborMap::build(&land, std::slice::from_ref(&port));
         assert_eq!(map.harbors.len(), 1);
         let h = &map.harbors[0];
         // ~π·5² ≈ 78 cells (1 NM/cell)
-        assert!(h.cells.len() > 60 && h.cells.len() < 100, "got {}", h.cells.len());
+        assert!(
+            h.cells.len() > 60 && h.cells.len() < 100,
+            "got {}",
+            h.cells.len()
+        );
         assert!(h.contains_pos(&land, port.position));
         assert!(!h.contains_pos(&land, Position::new(20.0, 30.0))); // 10 NM away
     }
@@ -216,11 +239,12 @@ mod tests {
         }
         let land = LandMap::from_raw(data, w, h, Position::new(0.0, h as f32), 1.0);
         let port = Port {
-            name: "WestSide",
+            name: "WestSide".to_string(),
             position: Position::new(8.0, 10.0), // west of wall
-            faction: Faction::Pirate,
+            faction: Faction::Free,
             harbor_radius_nm: 8.0, // would cross wall if straight-line
             shipyard: None,
+            category: crate::pop::PortCategory::SmallColonial,
         };
         let map = HarborMap::build(&land, std::slice::from_ref(&port));
         let h0 = &map.harbors[0];
