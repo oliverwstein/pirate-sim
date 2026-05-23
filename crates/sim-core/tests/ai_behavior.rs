@@ -1,14 +1,16 @@
 //! Integration tests for the AI behavior tree (dock sequence, sailing, etc.)
 
 use rstest::rstest;
-use sim_core::ai::{ShipAI, ShipTickInputs};
+use sim_core::ai::{ShipAI, ShipSnapshot, ShipTickInputs};
 use sim_core::command::ShipCommand;
 use sim_core::goods::GoodsRegistry;
 use sim_core::harbor::HarborMap;
 use sim_core::market::PortMarket;
 use sim_core::port::{Port, DEFAULT_HARBOR_RADIUS_NM};
 use sim_core::ship::{DockAction, Ship, ShipState, ShipStats};
+use sim_core::spatial::SpatialHash;
 use sim_core::types::{Position, ShipId, WindVector};
+use slotmap::SecondaryMap;
 
 /// Helper: create a calm wind (so ship speed is predictable).
 fn calm_wind() -> WindVector {
@@ -47,6 +49,8 @@ fn tick_ai(ai: &mut ShipAI, ship: &mut Ship, stats: &ShipStats, wind: &WindVecto
     let mut markets: Vec<PortMarket> = Vec::new();
     let goods = GoodsRegistry::starter();
     let mut commands: Vec<(ShipId, ShipCommand)> = Vec::new();
+    let snapshots: SecondaryMap<ShipId, ShipSnapshot> = SecondaryMap::new();
+    let spatial = SpatialHash::new();
     let me = dummy_id();
     {
         let mut inputs = ShipTickInputs {
@@ -61,6 +65,8 @@ fn tick_ai(ai: &mut ShipAI, ship: &mut Ship, stats: &ShipStats, wind: &WindVecto
             goods: &goods,
             commands: &mut commands,
             day_of_year: 0,
+            snapshots: &snapshots,
+            spatial: &spatial,
         };
         ai.tick(&mut inputs);
     }
@@ -81,6 +87,8 @@ fn tick_ai_with_markets(
 ) {
     let harbors = HarborMap::empty();
     let mut commands: Vec<(ShipId, ShipCommand)> = Vec::new();
+    let snapshots: SecondaryMap<ShipId, ShipSnapshot> = SecondaryMap::new();
+    let spatial = SpatialHash::new();
     let me = dummy_id();
     {
         let mut inputs = ShipTickInputs {
@@ -95,6 +103,8 @@ fn tick_ai_with_markets(
             goods,
             commands: &mut commands,
             day_of_year: 0,
+            snapshots: &snapshots,
+            spatial: &spatial,
         };
         ai.tick(&mut inputs);
     }
@@ -779,4 +789,241 @@ fn ship_with_no_profitable_trade_still_undocks() {
     }
     assert!(undocked, "ship should still undock via random fallback");
     assert!(ship.cargo.is_empty(), "no cargo should have been loaded");
+}
+
+// ============================================================
+// Step 6: Pursue / Flee
+// ============================================================
+
+/// Helper: tick the AI with an explicit snapshot + spatial-hash
+/// pair. Used by the Step 6 pursue/flee tests where the AI under
+/// test needs to see another ship's position.
+#[allow(clippy::too_many_arguments)]
+fn tick_ai_with_snapshots(
+    ai: &mut ShipAI,
+    ship: &mut Ship,
+    stats: &ShipStats,
+    wind: &WindVector,
+    ports: &[Port],
+    snapshots: &SecondaryMap<ShipId, ShipSnapshot>,
+    spatial: &SpatialHash,
+    me: ShipId,
+) -> Vec<(ShipId, ShipCommand)> {
+    let harbors = HarborMap::empty();
+    let mut markets: Vec<PortMarket> = Vec::new();
+    let goods = GoodsRegistry::starter();
+    let mut commands: Vec<(ShipId, ShipCommand)> = Vec::new();
+    {
+        let mut inputs = ShipTickInputs {
+            me,
+            ship,
+            stats,
+            wind,
+            ports,
+            harbors: &harbors,
+            pathfind: None,
+            markets: &mut markets,
+            goods: &goods,
+            commands: &mut commands,
+            day_of_year: 0,
+            snapshots,
+            spatial,
+        };
+        ai.tick(&mut inputs);
+    }
+    apply_commands(ship, &commands);
+    commands
+}
+
+#[test]
+fn pirate_sees_and_pursues_merchant_in_range() {
+    use sim_core::ai::VISUAL_RANGE_NM;
+    use sim_core::ship::ShipPolicy;
+    use slotmap::SlotMap;
+
+    let stats = ShipStats::sloop();
+    let wind = calm_wind();
+    let ports = test_ports();
+
+    // Two real ShipIds from a temp SlotMap so the SecondaryMap
+    // keying works correctly.
+    let mut sm: SlotMap<ShipId, ()> = SlotMap::with_key();
+    let pirate_id = sm.insert(());
+    let merchant_id = sm.insert(());
+
+    // Pirate at origin; merchant 8 NM north (within 12 NM visual).
+    let mut pirate = Ship::new(Position { x: 0.0, y: 0.0 }, ShipState::Sailing);
+    pirate.policy = ShipPolicy::Pirate;
+    let merchant_pos = Position { x: 0.0, y: 8.0 };
+
+    // Snapshot has the merchant (with a *larger* cargo capacity so
+    // the prey filter fires — we fake it via a brig-sized number).
+    let mut snapshots: SecondaryMap<ShipId, ShipSnapshot> = SecondaryMap::new();
+    snapshots.insert(
+        merchant_id,
+        ShipSnapshot {
+            position: merchant_pos,
+            policy: ShipPolicy::Merchant,
+            faction: sim_core::port::Faction::England,
+            max_speed: stats.speed_max,
+            // Bigger than a sloop's hold to trip the "richer" branch.
+            cargo_capacity_tons: stats.cargo_capacity_tons + 50.0,
+        },
+    );
+    // Pirate also in the snapshot (matching the per-tick map shape).
+    snapshots.insert(
+        pirate_id,
+        ShipSnapshot {
+            position: pirate.position,
+            policy: ShipPolicy::Pirate,
+            faction: sim_core::port::Faction::Free,
+            max_speed: stats.speed_max,
+            cargo_capacity_tons: stats.cargo_capacity_tons,
+        },
+    );
+    let mut spatial = SpatialHash::new();
+    spatial.insert(pirate_id, pirate.position);
+    spatial.insert(merchant_id, merchant_pos);
+
+    let mut ai = ShipAI::with_seed(42);
+    let cmds = tick_ai_with_snapshots(
+        &mut ai,
+        &mut pirate,
+        &stats,
+        &wind,
+        &ports,
+        &snapshots,
+        &spatial,
+        pirate_id,
+    );
+
+    assert_eq!(
+        ai.goal.pursue_target,
+        Some(merchant_id),
+        "pirate should lock onto the merchant within {VISUAL_RANGE_NM} NM"
+    );
+    assert!(
+        !cmds.is_empty(),
+        "act_pursue should have emitted a Steer command"
+    );
+    // Heading roughly north (0°) since merchant is due north.
+    let ShipCommand::Steer { heading, .. } = cmds[0].1;
+    assert!(
+        (heading.abs() < 5.0) || ((heading - 360.0).abs() < 5.0),
+        "pirate should steer ~north toward merchant, got {heading}"
+    );
+}
+
+#[test]
+fn merchant_flees_when_pirate_in_range() {
+    use sim_core::ship::ShipPolicy;
+    use slotmap::SlotMap;
+
+    let stats = ShipStats::sloop();
+    let wind = calm_wind();
+    let ports = test_ports();
+
+    let mut sm: SlotMap<ShipId, ()> = SlotMap::with_key();
+    let merchant_id = sm.insert(());
+    let pirate_id = sm.insert(());
+
+    let mut merchant = Ship::new(Position { x: 50.0, y: 50.0 }, ShipState::Sailing);
+    let pirate_pos = Position { x: 50.0, y: 58.0 }; // 8 NM north
+
+    let mut snapshots: SecondaryMap<ShipId, ShipSnapshot> = SecondaryMap::new();
+    snapshots.insert(
+        pirate_id,
+        ShipSnapshot {
+            position: pirate_pos,
+            policy: ShipPolicy::Pirate,
+            faction: sim_core::port::Faction::Free,
+            max_speed: stats.speed_max,
+            cargo_capacity_tons: stats.cargo_capacity_tons,
+        },
+    );
+    snapshots.insert(
+        merchant_id,
+        ShipSnapshot {
+            position: merchant.position,
+            policy: ShipPolicy::Merchant,
+            faction: sim_core::port::Faction::England,
+            max_speed: stats.speed_max,
+            cargo_capacity_tons: stats.cargo_capacity_tons,
+        },
+    );
+    let mut spatial = SpatialHash::new();
+    spatial.insert(merchant_id, merchant.position);
+    spatial.insert(pirate_id, pirate_pos);
+
+    let mut ai = ShipAI::with_seed(7);
+    let cmds = tick_ai_with_snapshots(
+        &mut ai,
+        &mut merchant,
+        &stats,
+        &wind,
+        &ports,
+        &snapshots,
+        &spatial,
+        merchant_id,
+    );
+
+    assert_eq!(
+        ai.goal.flee_from,
+        Some(pirate_id),
+        "merchant should mark the pirate as a threat"
+    );
+    assert!(!cmds.is_empty(), "act_flee should emit a Steer command");
+}
+
+#[test]
+fn pirate_ignores_other_pirate() {
+    use sim_core::ship::ShipPolicy;
+    use slotmap::SlotMap;
+
+    let stats = ShipStats::sloop();
+    let wind = calm_wind();
+    let ports = test_ports();
+
+    let mut sm: SlotMap<ShipId, ()> = SlotMap::with_key();
+    let p1 = sm.insert(());
+    let p2 = sm.insert(());
+
+    let mut me = Ship::new(Position { x: 0.0, y: 0.0 }, ShipState::Sailing);
+    me.policy = ShipPolicy::Pirate;
+    let other_pos = Position { x: 0.0, y: 5.0 };
+
+    let mut snapshots: SecondaryMap<ShipId, ShipSnapshot> = SecondaryMap::new();
+    snapshots.insert(
+        p2,
+        ShipSnapshot {
+            position: other_pos,
+            policy: ShipPolicy::Pirate,
+            faction: sim_core::port::Faction::Free,
+            max_speed: stats.speed_max,
+            cargo_capacity_tons: stats.cargo_capacity_tons + 100.0,
+        },
+    );
+    snapshots.insert(
+        p1,
+        ShipSnapshot {
+            position: me.position,
+            policy: ShipPolicy::Pirate,
+            faction: sim_core::port::Faction::Free,
+            max_speed: stats.speed_max,
+            cargo_capacity_tons: stats.cargo_capacity_tons,
+        },
+    );
+    let mut spatial = SpatialHash::new();
+    spatial.insert(p1, me.position);
+    spatial.insert(p2, other_pos);
+
+    let mut ai = ShipAI::with_seed(13);
+    let _ = tick_ai_with_snapshots(
+        &mut ai, &mut me, &stats, &wind, &ports, &snapshots, &spatial, p1,
+    );
+
+    assert_eq!(
+        ai.goal.pursue_target, None,
+        "pirate should not pursue another pirate"
+    );
 }

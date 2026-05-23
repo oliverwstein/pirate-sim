@@ -21,9 +21,14 @@ use crate::harbor::HarborMap;
 use crate::market::PortMarket;
 use crate::nav::{self, NavGoal};
 use crate::pathfind::{self, PathfindContext};
-use crate::port::Port;
-use crate::ship::{DockAction, Ship, ShipState, ShipStats};
+use crate::port::{Faction, Port};
+use crate::ship::{
+    angle_diff, normalize_angle, speed_at_heading, DockAction, Ship, ShipPolicy, ShipState,
+    ShipStats,
+};
+use crate::spatial::SpatialHash;
 use crate::types::{Position, ShipId, WindVector};
+use slotmap::SecondaryMap;
 
 // --- Action IDs ---
 const ACT_SAIL: usize = 0;
@@ -34,11 +39,34 @@ const ACT_CHOOSE_DESTINATION: usize = 4;
 const ACT_DIVERT_TO_PORT: usize = 5;
 const ACT_SELL_ALL: usize = 6;
 const ACT_BUY_BEST: usize = 7;
+const ACT_PURSUE: usize = 8;
+const ACT_FLEE: usize = 9;
 
 // --- Condition IDs ---
 const COND_IS_DOCKED: usize = 0;
 const COND_HAS_DESTINATION: usize = 1;
 const COND_IS_LOW_PROVISIONS: usize = 2;
+const COND_IS_SAILING_PIRATE: usize = 3;
+const COND_IS_SAILING_MERCHANT: usize = 4;
+const COND_SEE_PREY: usize = 5;
+const COND_SEE_THREAT: usize = 6;
+
+/// Step 6: visual range (NM) at which a captain can identify another
+/// ship — her flag, her trim, her freeboard (loaded vs light). Sized
+/// at 12 NM, matching the period horizon for a sloop's masthead
+/// lookout in clear weather, and matching `nav::ARRIVAL_NM` so a ship
+/// is "in sight" exactly when it's also "in the same harbor zone"
+/// when stalking near a port.
+pub const VISUAL_RANGE_NM: f32 = 12.0;
+
+/// Step 6: once a pirate has locked onto a prey (or a merchant onto a
+/// threat), they keep chasing/fleeing until the target slips outside
+/// this range. Wider than `VISUAL_RANGE_NM` to give hysteresis — a
+/// target oscillating at the edge of detection shouldn't make the
+/// pursuer/fugitive thrash. Slightly larger than the per-tick max
+/// sloop travel (~12 NM) so a one-tick speed burst can't strand a
+/// pursuer.
+pub const PURSUE_BREAKOFF_NM: f32 = 24.0;
 
 /// Hard panic floor: if a sailing ship has fewer than this many days
 /// of provisions left and no destination set, divert to the nearest
@@ -97,9 +125,32 @@ fn build_ship_bt() -> Behavior {
     ]);
 
     Behavior::Selector(vec![
-        // Priority 1: If docked, do port activities
+        // Priority 1: If docked, do port activities. Docked ships do
+        // not pursue or flee — pirates loitering at Tortuga ignore
+        // passing merchants, and a merchant at the dock can't run.
         Behavior::Sequence(vec![Behavior::Condition(COND_IS_DOCKED), dock_tree]),
-        // Priority 2: If low on provisions, divert to nearest port and
+        // Priority 2 (Step 6): A sailing pirate that sees prey chases
+        // it. Side effect: `see_prey` records / refreshes the target
+        // id in `goal.pursue_target`; `act_pursue` reads truth-position
+        // from the per-tick snapshot. Above trade because hunting is
+        // the pirate's reason for being at sea — interrupts any active
+        // voyage. Below docked so a pirate at port stays at port.
+        Behavior::Sequence(vec![
+            Behavior::Condition(COND_IS_SAILING_PIRATE),
+            Behavior::Condition(COND_SEE_PREY),
+            Behavior::Action(ACT_PURSUE),
+        ]),
+        // Priority 3 (Step 6): A sailing merchant that sees a threat
+        // (any Pirate within visual range) flees toward the nearest
+        // port. As soon as the threat slips outside `PURSUE_BREAKOFF_NM`
+        // the condition fails and the merchant resumes its trade
+        // voyage (its `goal.destination` was never touched).
+        Behavior::Sequence(vec![
+            Behavior::Condition(COND_IS_SAILING_MERCHANT),
+            Behavior::Condition(COND_SEE_THREAT),
+            Behavior::Action(ACT_FLEE),
+        ]),
+        // Priority 4: If low on provisions, divert to nearest port and
         // continue steering toward it. The Sail action *must* run after
         // DivertToPort: DivertToPort only updates `nav.destination` and
         // re-plans, but doesn't compute_steering. Without Sail in the
@@ -111,12 +162,12 @@ fn build_ship_bt() -> Behavior {
             Behavior::Action(ACT_DIVERT_TO_PORT),
             Behavior::Action(ACT_SAIL),
         ]),
-        // Priority 3: If has destination, sail
+        // Priority 5: If has destination, sail
         Behavior::Sequence(vec![
             Behavior::Condition(COND_HAS_DESTINATION),
             Behavior::Action(ACT_SAIL),
         ]),
-        // Priority 4: Choose a new destination (random fallback)
+        // Priority 6: Choose a new destination (random fallback)
         Behavior::Action(ACT_CHOOSE_DESTINATION),
     ])
 }
@@ -262,6 +313,8 @@ impl ShipAI {
             markets: inputs.markets,
             goods: inputs.goods,
             commands: inputs.commands,
+            snapshots: inputs.snapshots,
+            spatial: inputs.spatial,
         };
 
         let status = bt::tick(&self.tree, &mut self.state, &mut ctx, 0);
@@ -302,6 +355,38 @@ pub struct ShipTickInputs<'a> {
     /// Current `SimDate::day_of_year` (1-365). Drives the noon-sight
     /// cadence in the captain's navigator pass.
     pub day_of_year: u16,
+    /// Step 6: read-only view of every Sailing ship's position +
+    /// identifying metadata, rebuilt each tick by the world. Lets the
+    /// AI inspect *other* ships without taking a second borrow on
+    /// `world.ships` (which is mutably borrowed for `me`). Empty for
+    /// tests that don't care about inter-ship interaction.
+    pub snapshots: &'a SecondaryMap<ShipId, ShipSnapshot>,
+    /// Step 6: spatial hash over Sailing ships. Used by `see_prey` /
+    /// `see_threat` to find neighbors within `VISUAL_RANGE_NM`
+    /// without an O(N) scan. Same per-tick lifetime as `snapshots`.
+    pub spatial: &'a SpatialHash,
+}
+
+/// Step 6: per-tick, read-only fingerprint of one Sailing ship —
+/// enough for any other ship's AI to identify it as friend / foe /
+/// prey without taking a borrow on `world.ships`. Built by the world
+/// at the top of each hourly tick (the same place the spatial hash
+/// is rebuilt) and discarded at tick end. All fields are by-value
+/// copies (positions, enums, scalars) — there's no aliasing issue.
+///
+/// Indexed by `ShipId`; matches the set of ships inserted into the
+/// `SpatialHash` (Sailing only, no docked/hiring/anchored).
+#[derive(Debug, Clone, Copy)]
+pub struct ShipSnapshot {
+    pub position: Position,
+    pub policy: ShipPolicy,
+    pub faction: Faction,
+    /// Maximum design speed (kt). Lets a pirate identify slower prey
+    /// without consulting the ship-type registry.
+    pub max_speed: f32,
+    /// Cargo hold capacity (tons). Lets a pirate identify richer
+    /// prey (bigger merchantmen) without consulting the registry.
+    pub cargo_capacity_tons: f32,
 }
 
 /// Simple xorshift64 RNG — deterministic and fast.
@@ -330,6 +415,8 @@ pub struct ShipBtContext<'a> {
     markets: &'a mut [PortMarket],
     goods: &'a GoodsRegistry,
     commands: &'a mut Vec<(ShipId, ShipCommand)>,
+    snapshots: &'a SecondaryMap<ShipId, ShipSnapshot>,
+    spatial: &'a SpatialHash,
 }
 
 impl<'a> ShipBtContext<'a> {
@@ -699,6 +786,226 @@ impl<'a> ShipBtContext<'a> {
         }
         Status::Success
     }
+
+    // ───────── Step 6: pursue / flee ─────────
+    //
+    // Both `act_pursue` and `act_flee` deliberately *do not* touch
+    // `goal.destination` / `goal.dest_port` — those describe the
+    // captain's *trade* plan. Pursue/flee is a momentary detour. As
+    // soon as the prey escapes (or the threat slips outside
+    // `PURSUE_BREAKOFF_NM`), the higher-priority pursue/flee branch
+    // fails its condition and the BT falls through to the existing
+    // sail-to-destination branch, which resumes the original voyage.
+
+    fn act_pursue(&mut self) -> Status {
+        // `goal.pursue_target` was set by `see_prey`; if it's somehow
+        // missing here (target sank between condition and action,
+        // tests calling act_pursue directly) bail out cleanly so the
+        // selector falls through to the next branch.
+        let Some(target_id) = self.goal.pursue_target else {
+            return Status::Failure;
+        };
+        let Some(target) = self.snapshots.get(target_id) else {
+            // Snapshot dropped: target left Sailing state (docked) or
+            // was removed from the world. Clear and let the selector
+            // re-evaluate next tick.
+            self.goal.pursue_target = None;
+            return Status::Failure;
+        };
+        // Steer at the target's truth position (lookouts see the real
+        // hull on the horizon, not the captain's dead-reckoning of
+        // where his own ship is). Commanded speed is whatever the
+        // ship's stats allow — the pirate runs all canvas.
+        let from = self.ship.position;
+        let dx = target.position.x - from.x;
+        let dy = target.position.y - from.y;
+        let heading = normalize_angle(dx.atan2(dy).to_degrees());
+        // Use the wind-adjusted top speed on this bearing so the
+        // emitted command matches what the physics step will actually
+        // deliver — no "commanded 12 kt, made good 4 kt" mismatch.
+        let speed = speed_at_heading(heading, self.stats, self.wind);
+        self.commands
+            .push((self.me, ShipCommand::Steer { heading, speed }));
+        Status::Running
+    }
+
+    fn act_flee(&mut self) -> Status {
+        let Some(threat_id) = self.goal.flee_from else {
+            return Status::Failure;
+        };
+        let Some(threat) = self.snapshots.get(threat_id) else {
+            self.goal.flee_from = None;
+            return Status::Failure;
+        };
+        // Find the nearest port (any port — friendly-faction filtering
+        // arrives with the relations matrix in Phase 4). Distance uses
+        // the captain's estimate so a lost merchant runs toward
+        // whatever port he *thinks* is closest, which can be subtly
+        // wrong but is still better than not running.
+        let est = self.estimated_position();
+        let nearest_port_pos = self
+            .ports
+            .iter()
+            .min_by(|a, b| {
+                let da = est.distance(a.position);
+                let db = est.distance(b.position);
+                da.partial_cmp(&db).unwrap()
+            })
+            .map(|p| p.position);
+
+        // Bearing to safety. If somehow there are no ports (test
+        // harness), fall back to straight downwind — anything that
+        // opens the range from the pirate is better than holding
+        // course.
+        let from = self.ship.position;
+        let heading = match nearest_port_pos {
+            Some(target) => {
+                let dx = target.x - from.x;
+                let dy = target.y - from.y;
+                normalize_angle(dx.atan2(dy).to_degrees())
+            }
+            None => {
+                // Downwind = direction the wind is blowing toward.
+                normalize_angle(self.wind.u.atan2(self.wind.v).to_degrees())
+            }
+        };
+        // If running directly toward the nearest port would steer us
+        // *toward* the threat (port is past the pirate from our
+        // perspective), bias the heading 90° away from the threat
+        // instead. Simple test: if angle to port is within 30° of
+        // angle to threat, sheer off perpendicular to the threat.
+        let to_threat = {
+            let dx = threat.position.x - from.x;
+            let dy = threat.position.y - from.y;
+            normalize_angle(dx.atan2(dy).to_degrees())
+        };
+        let heading = if angle_diff(heading, to_threat).abs() < 30.0 {
+            // Run perpendicular to threat-bearing, on whichever side
+            // is closer to the planned port heading.
+            let port_side = normalize_angle(to_threat + 90.0);
+            let starboard_side = normalize_angle(to_threat - 90.0);
+            if angle_diff(port_side, heading).abs() < angle_diff(starboard_side, heading).abs() {
+                port_side
+            } else {
+                starboard_side
+            }
+        } else {
+            heading
+        };
+        let speed = speed_at_heading(heading, self.stats, self.wind);
+        self.commands
+            .push((self.me, ShipCommand::Steer { heading, speed }));
+        Status::Running
+    }
+
+    // ───────── Step 6: see_prey / see_threat ─────────
+
+    /// Condition: this pirate ship currently has a viable prey within
+    /// detection range (or already-locked prey within breakoff range).
+    /// Side effect: writes/clears `goal.pursue_target`.
+    fn see_prey(&mut self) -> bool {
+        let me_pos = self.ship.position;
+        let me_id = self.me;
+
+        // First: if we already have a lock, keep it as long as the
+        // target is still Sailing (i.e., in the snapshot map) and
+        // within breakoff range. Hysteresis prevents thrash at the
+        // edge of `VISUAL_RANGE_NM`.
+        if let Some(target_id) = self.goal.pursue_target {
+            if let Some(t) = self.snapshots.get(target_id) {
+                if me_pos.distance(t.position) <= PURSUE_BREAKOFF_NM
+                    && t.policy != ShipPolicy::Pirate
+                {
+                    return true;
+                }
+            }
+            // Lock invalidated; fall through to a fresh search.
+            self.goal.pursue_target = None;
+        }
+
+        // Pirate quarry filter: any non-pirate ship within
+        // `VISUAL_RANGE_NM` that's either fatter (more cargo capacity)
+        // or slower than us. Sloops are the smallest hulls in the
+        // current registry, so "fatter" catches every brig / bark /
+        // ship / fluyt; "slower" is the corner case (a fully-laden
+        // sloop is still worth chasing).
+        let my_cargo = self.stats.cargo_capacity_tons;
+        let my_top_speed = self.stats.speed_max;
+        let mut best: Option<(ShipId, f32)> = None;
+        for nbr_id in self
+            .spatial
+            .neighbors(me_pos, VISUAL_RANGE_NM, |id| id != me_id)
+        {
+            let Some(snap) = self.snapshots.get(nbr_id) else {
+                continue;
+            };
+            if snap.policy == ShipPolicy::Pirate {
+                continue;
+            }
+            let richer = snap.cargo_capacity_tons > my_cargo;
+            let slower = snap.max_speed < my_top_speed;
+            if !(richer || slower) {
+                continue;
+            }
+            let d = me_pos.distance(snap.position);
+            match best {
+                None => best = Some((nbr_id, d)),
+                Some((_, bd)) if d < bd => best = Some((nbr_id, d)),
+                _ => {}
+            }
+        }
+        if let Some((id, _)) = best {
+            self.goal.pursue_target = Some(id);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Condition: this merchant ship currently has a Pirate within
+    /// detection range (or already-tracked threat within breakoff
+    /// range). Side effect: writes/clears `goal.flee_from`.
+    fn see_threat(&mut self) -> bool {
+        let me_pos = self.ship.position;
+        let me_id = self.me;
+
+        if let Some(threat_id) = self.goal.flee_from {
+            if let Some(t) = self.snapshots.get(threat_id) {
+                if me_pos.distance(t.position) <= PURSUE_BREAKOFF_NM
+                    && t.policy == ShipPolicy::Pirate
+                {
+                    return true;
+                }
+            }
+            self.goal.flee_from = None;
+        }
+
+        // Closest pirate within visual range, if any.
+        let mut best: Option<(ShipId, f32)> = None;
+        for nbr_id in self
+            .spatial
+            .neighbors(me_pos, VISUAL_RANGE_NM, |id| id != me_id)
+        {
+            let Some(snap) = self.snapshots.get(nbr_id) else {
+                continue;
+            };
+            if snap.policy != ShipPolicy::Pirate {
+                continue;
+            }
+            let d = me_pos.distance(snap.position);
+            match best {
+                None => best = Some((nbr_id, d)),
+                Some((_, bd)) if d < bd => best = Some((nbr_id, d)),
+                _ => {}
+            }
+        }
+        if let Some((id, _)) = best {
+            self.goal.flee_from = Some(id);
+            true
+        } else {
+            false
+        }
+    }
 }
 
 impl<'a> BtContext for ShipBtContext<'a> {
@@ -712,6 +1019,8 @@ impl<'a> BtContext for ShipBtContext<'a> {
             ACT_SELL_ALL => self.act_sell_all(),
             ACT_BUY_BEST => self.act_buy_best(),
             ACT_DIVERT_TO_PORT => self.act_divert_to_port(),
+            ACT_PURSUE => self.act_pursue(),
+            ACT_FLEE => self.act_flee(),
             _ => Status::Failure,
         }
     }
@@ -741,6 +1050,14 @@ impl<'a> BtContext for ShipBtContext<'a> {
                     }
                 }
             }
+            COND_IS_SAILING_PIRATE => {
+                self.ship.state == ShipState::Sailing && self.ship.policy == ShipPolicy::Pirate
+            }
+            COND_IS_SAILING_MERCHANT => {
+                self.ship.state == ShipState::Sailing && self.ship.policy == ShipPolicy::Merchant
+            }
+            COND_SEE_PREY => self.see_prey(),
+            COND_SEE_THREAT => self.see_threat(),
             _ => false,
         };
         if result {

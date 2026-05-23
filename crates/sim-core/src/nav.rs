@@ -13,7 +13,7 @@ use std::collections::VecDeque;
 
 use crate::map::land::LandMap;
 use crate::ship::{angle_diff, normalize_angle, speed_at_heading, ShipStats};
-use crate::types::{Position, WindVector};
+use crate::types::{Position, ShipId, WindVector};
 
 /// A steering command: the heading to set on the ship and the speed it
 /// should make good toward its target this tick (pre-fouling).
@@ -174,6 +174,18 @@ pub struct NavGoal {
     /// the latitude). 0 means "never". Used to throttle noon sights to
     /// once per day per ship.
     pub last_noon_sight_day: u16,
+    /// Step 6: a Pirate ship's current quarry. Set/cleared by the
+    /// `see_prey` condition; consumed by `act_pursue`. `None` means
+    /// "not currently chasing anything". Survives across ticks for
+    /// chase coherence (hysteresis: a pirate keeps chasing past the
+    /// initial detection range as long as the target stays in a
+    /// slightly wider band — see `ai::PURSUE_BREAKOFF_NM`).
+    pub pursue_target: Option<ShipId>,
+    /// Step 6: a Merchant ship's current threat. Set/cleared by the
+    /// `see_threat` condition; consumed by `act_flee`. Same hysteresis
+    /// as `pursue_target` — once seen, the merchant keeps fleeing
+    /// until the threat falls outside the breakoff range.
+    pub flee_from: Option<ShipId>,
 }
 
 impl NavGoal {
@@ -187,6 +199,8 @@ impl NavGoal {
             dest_port: None,
             estimated_position: None,
             last_noon_sight_day: 0,
+            pursue_target: None,
+            flee_from: None,
         }
     }
 

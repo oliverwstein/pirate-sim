@@ -2,7 +2,7 @@ use std::path::Path;
 
 use slotmap::{SecondaryMap, SlotMap};
 
-use crate::ai::ShipAI;
+use crate::ai::{ShipAI, ShipSnapshot};
 use crate::coastline::{CoastlineMap, LandMesh};
 use crate::goods::GoodsRegistry;
 use crate::harbor::HarborMap;
@@ -12,7 +12,7 @@ use crate::navmesh::Navmesh;
 use crate::pathfind::PathfindContext;
 use crate::pop::{self, PortDemographics};
 use crate::port::{all_ports, Port};
-use crate::ship::{Ship, ShipState, ShipStats};
+use crate::ship::{Ship, ShipPolicy, ShipState, ShipStats};
 use crate::shiptype::{self, ShipTypeRegistry};
 use crate::shipyard::{self, BuildOutcome};
 use crate::spatial::SpatialHash;
@@ -139,6 +139,25 @@ impl World {
         self.ship_ais.insert(id, ai);
         self.silver_at_month_start.insert(id, starting);
         id
+    }
+
+    /// Step 6: spawn a pirate sloop at the named port (case-sensitive
+    /// match against `Port.name`). Returns `Some(id)` on success or
+    /// `None` if the port doesn't exist. The ship starts `Docked` at
+    /// the port (matches the seed-fleet shape used by `bench_trade`
+    /// and viz `spawn_demo_ships`) so the BT's docked branch runs
+    /// once and undocks it on the first tick out of port. The
+    /// pirate's `policy` is set to `Pirate` and its `faction` to
+    /// `Free` regardless of the host port's flag (a haven hosts
+    /// pirates, but the ships fly their own colors).
+    pub fn spawn_pirate_sloop_at(&mut self, port_name: &str, seed: u64) -> Option<ShipId> {
+        let idx = self.ports.iter().position(|p| p.name == port_name)?;
+        let port_pos = self.ports[idx].position;
+        let mut ship = Ship::seeded_at_port(port_pos, idx, crate::port::Faction::Free);
+        ship.policy = ShipPolicy::Pirate;
+        ship.nav.docked_at_port = Some(idx);
+        let ai = ShipAI::with_seed(seed);
+        Some(self.add_ship(ship, ai))
     }
 
     /// Advance the simulation by one hour.
@@ -355,9 +374,27 @@ impl World {
         // Hiring, and Anchored ships are intentionally excluded —
         // they are not candidates for at-sea interaction.
         self.spatial.clear();
+        let mut snapshots: SecondaryMap<ShipId, ShipSnapshot> = SecondaryMap::new();
         for (id, ship) in &self.ships {
             if ship.state == ShipState::Sailing {
                 self.spatial.insert(id, ship.position);
+                // Step 6: parallel snapshot map so AI code can look up
+                // any other Sailing ship's identifying fields without
+                // taking a second borrow on `self.ships` (which is
+                // mutably borrowed for the active ship). Stats come
+                // from the type registry, copied by value into the
+                // snapshot — cheap (5 scalars per ship per tick).
+                let stats = &self.ship_types.get(ship.ship_type).stats;
+                snapshots.insert(
+                    id,
+                    ShipSnapshot {
+                        position: ship.position,
+                        policy: ship.policy,
+                        faction: ship.faction,
+                        max_speed: stats.speed_max,
+                        cargo_capacity_tons: stats.cargo_capacity_tons,
+                    },
+                );
             }
         }
 
@@ -410,6 +447,8 @@ impl World {
                     goods: &self.goods,
                     commands: &mut self.commands,
                     day_of_year: self.date.day_of_year,
+                    snapshots: &snapshots,
+                    spatial: &self.spatial,
                 };
                 ai.tick(&mut inputs);
             }

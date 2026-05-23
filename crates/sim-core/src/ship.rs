@@ -79,6 +79,25 @@ pub enum ShipState {
 /// and to buy a partial speculative cargo of sugar at base price.
 pub const STARTING_SILVER_PESOS: f32 = 5000.0;
 
+/// What a ship is "doing" at the strategic level — drives BT branch
+/// selection in Step 6 (pursue vs flee vs trade). Distinct from
+/// `ShipState` (Docked/Sailing/Hiring/Anchored), which is the
+/// physical/operational state of the hull. Defaults to `Merchant`.
+///
+/// Step 6 keeps the enum small: only `Merchant` and `Pirate`. Future
+/// steps will extend with `Privateer { against: FactionSet }` and
+/// `Navy`. Per-ship rather than per-faction because piracy/privateering
+/// is a contract held by a captain, not a property of his flag (a Free
+/// ship can be merchant; an English ship can be privateer).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ShipPolicy {
+    /// Default: trade, avoid pirates, run for friendly port if threatened.
+    #[default]
+    Merchant,
+    /// Hunt richer/slower merchant prey within visual range.
+    Pirate,
+}
+
 /// A ship: purely physical entity. Heading is set externally by AI/player.
 pub struct Ship {
     pub position: Position,
@@ -146,6 +165,12 @@ pub struct Ship {
     /// capturer's faction). Test/scaffolding ships built via
     /// `Ship::new` default to `Faction::Free`.
     pub faction: Faction,
+    /// Strategic policy — Merchant (default), Pirate, etc. Drives the
+    /// high-priority pursue/flee branches in the BT (Step 6). Distinct
+    /// from `faction`: a Pirate ship can fly any flag. Captured prizes
+    /// (Step 8) and bankrupt merchants turning to piracy (Step 9) will
+    /// flip this at runtime.
+    pub policy: ShipPolicy,
     /// In-flight navigation tracking — which port the ship is currently
     /// moored at (if any) and the waypoint queue it's following.
     /// Distinct from the captain's `NavGoal` (which lives on `ShipAI`):
@@ -192,6 +217,7 @@ impl Ship {
             wages_owed_pesos: 0.0,
             morale: 1.0,
             faction: Faction::Free,
+            policy: ShipPolicy::Merchant,
             nav: NavTrack::new(),
             dock_action: DockAction::Idle,
         }
@@ -243,6 +269,7 @@ impl Ship {
             wages_owed_pesos: 0.0,
             morale: 1.0,
             faction,
+            policy: ShipPolicy::Merchant,
             nav: NavTrack::new(),
             dock_action: DockAction::Idle,
         }

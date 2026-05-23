@@ -718,4 +718,15 @@ fn spawn_demo_ships(world: &mut World) {
             world.add_ship(ship, ai);
         }
     }
+
+    // Step 6: pirate sloops at the major Caribbean havens — gives the
+    // viz at least one visibly hostile encounter during a normal
+    // session. See `bench_trade.rs` for the same set + rationale.
+    for (name, seed) in &[
+        ("Tortuga", 1009u64),
+        ("Petit-Goâve", 1031),
+        ("Nassau", 1051),
+    ] {
+        let _ = world.spawn_pirate_sloop_at(name, *seed);
+    }
 }

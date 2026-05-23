@@ -116,6 +116,24 @@ fn main() {
         ship_ids.push(id);
     }
 
+    // Step 6: three pirate sloops berthed at the major Caribbean
+    // pirate havens. Tortuga and Petit-Goâve sit at the western tip
+    // of Hispaniola (Île à Vache is Petit-Goâve's working anchorage);
+    // Nassau (New Providence) is the Bahamas haven that becomes the
+    // hub of the Republic of Pirates after 1700. Ship ids and origins
+    // are tracked alongside the merchant fleet so the bench can
+    // identify them in the per-ship table.
+    let pirate_starts: &[(&str, u64)] =
+        &[("Tortuga", 1009), ("Petit-Goâve", 1031), ("Nassau", 1051)];
+    for (name, seed) in pirate_starts {
+        if let Some(id) = world.spawn_pirate_sloop_at(name, *seed) {
+            origin_names.push((*name).to_string());
+            ship_ids.push(id);
+        } else {
+            println!("(skip) pirate port {} not found", name);
+        }
+    }
+
     let n_ships = world.ships.len();
     println!("Calibration run: {} days, {} ships", sim_days, n_ships);
     println!();

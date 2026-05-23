@@ -666,3 +666,34 @@ Neither belongs in Nav-1+2+3.
 - nav_rng_state separate from rng_state (zero-noise nav is bit-identical to baseline).
 
 **Next:** Step 6 — `Ship.policy: ShipPolicy`; `Pursue` / `Flee` BT nodes; `SeePrey` condition consults spatial hash + faction relations + policy; hardcoded pirate-sloop spawn near Tortuga. The chase BT will read `estimated_position()` for prey detection range, completing the loop.
+
+---
+
+## Step 6 — Pursue / Flee BT
+
+**Scope shipped:**
+- `ShipPolicy { Merchant, Pirate }` enum on `Ship`. Defaults to Merchant.
+- `NavGoal { pursue_target: Option<ShipId>, flee_from: Option<ShipId> }` for cross-tick chase/flee state.
+- Two new high-priority BT branches (above trade, below docked):
+  - Sequence(IsSailingPirate, SeePrey, Pursue) — pirates chase richer or slower ships within 12 NM.
+  - Sequence(IsSailingMerchant, SeeThreat, Flee) — merchants run from any pirate in 12 NM.
+- `VISUAL_RANGE_NM = 12.0` (matches `nav::ARRIVAL_NM`); `PURSUE_BREAKOFF_NM = 24.0` for hysteresis (once locked, target sticks until it slips outside the wider band).
+- New per-tick `ShipSnapshot { position, policy, faction, max_speed, cargo_capacity_tons }` map built alongside the existing spatial-hash rebuild. Lets one ship's AI inspect any other Sailing ship without taking a second borrow on `world.ships` (which is already mut-borrowed for the active ship).
+- `World::spawn_pirate_sloop_at(name, seed)` helper. Bench and viz both seed pirates at **Tortuga / Petit-Goâve / Nassau**.
+- 3 new tests in `tests/ai_behavior.rs`: pirate-sees-and-pursues; merchant-flees-when-pirate-in-range; pirate-ignores-other-pirate.
+
+**Design choices:**
+- Detection: pirate prey filter = non-pirate ship with `cargo_capacity > self || max_speed < self`. Since sloops are the smallest hull in the registry, "richer" catches every brig/bark/ship/fluyt; "slower" catches a laden sloop. Threat filter for merchants: any ship with `policy == Pirate`. Relations matrix deferred to Phase 4 (when wars exist).
+- Pursue/flee never touches `goal.destination` — when the encounter ends, the merchant naturally resumes the original trade voyage.
+- Sailing-only: docked pirates don't undock to chase; docked merchants can't run from the dock.
+- Pirates use truth-position to steer toward prey (lookouts see real hulls on the horizon); merchants use estimate to locate nearest port (a lost merchant runs toward where he *thinks* safety is).
+- `act_flee` adds a small evasive bias: if the nearest port lies within 30° of the threat bearing, sheer 90° off the threat instead of sailing straight at it.
+
+**Verification:**
+- `cargo fmt`, `cargo clippy --workspace --all-targets -- -D warnings`: clean.
+- `cargo test --workspace`: **119 pass** (was 116; +3 Step 6 tests).
+- `bench_trade -- 365`: **+1,339,944** (vs +1,451,474 baseline Nav-1+2+3); 10 bankrupt (vs 9). The three pirate sloops contribute +715k of their own P/L (trade activity at home haven when no prey is in range — pursue/flee is a high-priority *override*, but the BT falls through to trade when nothing's chaseable). Merchants in pirate-frequented waters take a small hit from flee detours.
+- Per-ship table now visibly identifies the pirate sloops (rows 10–12: Tortuga +258k, Petit-Goâve +444k, Nassau +13k).
+
+**Caveat:** Step 6 is movement-only — pirates "catch" prey but nothing happens (no combat). Step 7 will add `ShipCommand::FireBroadside` and a damage model.
+
