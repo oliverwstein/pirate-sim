@@ -729,3 +729,22 @@ Neither belongs in Nav-1+2+3.
 - A hulled ship at 0% integrity is a zombie until Step 8 lands sinking + wreck removal.
 - Built ships start unarmed and only acquire ordnance on the first dock cycle at their home European port — first-voyage outbound run is undefended. Acceptable for Step 7; Step 8/9 will tie magazine outfitting to the shipyard build phase.
 - The damage scalars (0.5/0.3/gun, 0.5 NM range, 0.01 t/gun) are sketches. Step 10's calibration sweep will tune them against equilibrium pirate/merchant attrition rates.
+
+---
+
+### Post-Step-7 bugfix: ship ping-pong at provisions-dry havens (commit `52eb1cd`)
+
+**Bug:** 730d bench showed ship 7 (London-seeded sloop) accumulating 2,785 docks (~12/day) once English Harbour's chandler stockpile depleted around day ~510.
+
+**Root cause:** `tick_resupply_at_market` returns `done = true` whenever the port stockpile is empty (interpreted as "tried", not "got fed"). Combined with `act_divert_to_port` picking the geographically nearest port without regard to its actual stock, a low-provisions ship that arrived at a dry sugar island would: dock → resupply succeeds vacuously → undock still hungry → next tick's COND_IS_LOW_PROVISIONS fires again → divert chooses the same dry port → infinite loop. The two existing dock-loop tests didn't cover this path because they ran on empty test markets where divert wasn't gated on stock.
+
+**Fix:** `act_divert_to_port` now filters port candidates by `markets[idx].stockpile.get(PROVISIONS) > 0.5` and returns `Status::Failure` if no qualifying port exists, letting the BT fall through to the normal sail-to-destination branch instead of looping back to the same dry harbor.
+
+**Bench impact (730d):** ship 7 docks 2,785 → 37, P/L \$83k → \$197k; fleet total P/L +2.33M → +2.49M; bankrupt ships 7 → 4.
+
+**Other 730d oddities noted for future investigation (not bugs blocking Step 5.a):**
+- **Ship 6 Fort-Royal: +\$1.06M P/L** — 8× the next-best earner. Possibly exploiting a high-margin sugar-island-to-European-hub route on a sloop. Worth tracing in Step 10 calibration.
+- **4 remaining bankruptcies** — mostly newly-built Amsterdam fluyts and a Cartagena/Nantes sloop. The shipyard may be over-producing fluyts relative to round-trip cadence. Calibration pass.
+- **Equilibrium price LP deviation: mean 210%, max 6,851%** (Elmina Tobacco) — pre-existing structural mismatch between sim prices and analytical LP equilibrium; not a regression.
+- **Tortuga pirate runs out of powder/shot mid-sim** — no Caribbean powder production yet. A future Caribbean import / raid-resupply line would let the haven sustain piracy.
+- **Ship 13 (Boston-built bark) at 0% hull/0% rig still listed "sailing"** — expected; Step 8 will add sinking + wreck removal.
