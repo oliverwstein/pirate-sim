@@ -15,6 +15,7 @@ Maintain a running log of decisions in `planning/development-log.md`. Whenever y
 *   **Core Principle:** "Headless-First". The simulation logic is 100% decoupled from rendering. The core library (`sim-core`) represents the simulation. The visualizer (`sim-viz`) is a read-only observer of the world state.
 *   **AI Pattern:** Flyweight Behavior Trees. Ships are agents that read a snapshot of the world and emit "Intents" (Commands). A central resolver turns these into "Consequences" (Events) that mutate the world state.
 *   **Historical Research:** Historical accuracy, though not necessarily precision, is a core value. planning/research/ contains a variety of notes about the period and the design implications. Review them as appropriate and, when approaching new design elements, be ready to ask if a background agent should be spun up to research historical context and create a new file to add to the research folder.
+*   **Product Vision:** planning/vision-doc.md is a sketch of what we are going for, which will inform development.
 
 ### Standard Build & Lint
 Always format and lint your generated code to pass CI.

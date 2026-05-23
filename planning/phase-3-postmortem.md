@@ -75,11 +75,11 @@ Right now, `ShipStats` has a fixed `cannons: u16` field. To capture the Caribbea
 When a shipyard builds a hull, it should require buying cannons from the port market. When a pirate takes a prize, they should be able to strip the cannons to up-gun their own sloop. This integrates the violence of Phase 3 directly into the economy of Phase 2.
 
 **4. Multi-Hop Trade Planning**
-To fix the Amsterdam Fluyt saturation and the Home Bias loop, `trade.rs` needs a horizon upgrade. Instead of `find_best_trade` evaluating `A -> B`, it should evaluate `A -> B -> Home`. If `B` has no profitable exports back to `Home` (or to a lucrative `C`), the overall score of the route must be penalized. Ships (plan) to travel on circuits and return to home ports on mercantile routes; only pirates and military vessels would pursue other behavioral patterns. 
+To fix the Amsterdam Fluyt saturation and the Home Bias loop, `trade.rs` needs a horizon upgrade. Instead of `find_best_trade` evaluating `A -> B`, it should evaluate `A -> B -> Home`. If `B` has no profitable exports back to `Home` (or to a lucrative `C`), the overall score of the route must be penalized. Ships (plan) to travel on circuits and return to home ports on mercantile routes; only pirates and military vessels should pursue other behavioral patterns. 
 
 **5. The Sub-Tick Combat Dilemma**
 You decided to keep the tick at 1 hour to avoid complexity. As you introduce Naval Squadrons and Forts (from `naval-combat.md`), this will break down. A fort guarding a 1 NM channel will be "stepped over" by a ship doing 8 knots in an hour. 
-*Recommendation:* Introduce a dynamic tick. If `spatial.neighbors` returns hostile ships within 3 NM, the simulation seamlessly shifts to a 15-minute tick for those actors (or the whole world) until the engagement resolves. 
+*Recommendation:* Introduce a dynamic tick. If `spatial.neighbors` returns hostile ships within 3 NM, the simulation seamlessly shifts to a 15-minute tick for those actors (or the whole world) until the engagement resolves. Alternatively, we can have the 'base' tick be 10 minutes, with most systems updating not on every tick; we must consider the best way to handle it.
 
 ### Conclusion
 The codebase is a triumph of rigorous historical research applied to systems engineering. You have successfully mapped the brutal economic realities of 17th-century maritime labor and mercantilism into a stable, headless Rust simulation. Correcting the command-drain loop to achieve true Double Buffering will solidify the architecture, perfectly positioning you for the diplomatic and tactical complexities of Phase 4.
