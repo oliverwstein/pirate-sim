@@ -839,3 +839,53 @@ New `World.mutinies_total: u32` cumulative counter. Bench Combat ledger split in
 
 - 730d shows zero mutinies. Either the threshold is too high in practice or the morale system doesn't drop bankrupt crews fast enough. The hypothesis is that frequent port docking + the rested-in-port morale gain (0.001/hr) cancels out the at-sea bleed. Step 10 calibration question: should the rested-in-port gain be gated on the ship being in funds (already half-gated on `wages_owed <= 0`)?
 - Captured ships and mutinied ships both end up Pirate-policy, but with different starting conditions (captured: morale 0.8, fresh prize crew; mutinied: morale 0.55, full original crew minus officers — currently we don't model the officer kill). Eventually worth distinguishing.
+
+## Step 10.a — Historical fleet scale-up (commit `a042931`)
+
+The bench had been running on a hand-picked 13-ship fleet (10 merchants + 3 pirates) since Step 6. That was an order of magnitude under the historical baseline: per `planning/research/atlantic-fleet-numbers-1650-1720.md`, the Caribbean basin c. 1680 supported roughly **400–800 active hulls**, with a recommended simulation baseline of ~500. Step 10.a scales the bench up to that range so the calibration pass can run against realistic load.
+
+### Design
+
+`Ship::seeded_at_port_typed(pos, port, faction, ship_type, &stats, silver)` is a parameterized starter constructor — like `seeded_at_port`, but with explicit type/stats/silver so a single seed function can produce a mixed fleet.
+
+`World::seed_historical_fleet(base_seed) -> Vec<ShipId>` iterates `world.ports` and, per `PortCategory`, picks a target count and a faction-appropriate ship-type mix:
+
+| Category            | Ships/port | Typical mix                              |
+|---------------------|-----------:|------------------------------------------|
+| `EuropeanHub`       | 30         | fluyt-heavy with ships and brigs         |
+| `CaribbeanEntrepot` | 25         | balanced merchant + a few warships       |
+| `SmallColonial`     | 8          | mostly sloops + brigantines              |
+| `PirateHaven`       | 6          | sloops/brigantines, policy=Pirate        |
+
+Per-port RNG is `LCG(base_seed + port_idx)` so the same `base_seed` always produces the same fleet. Pirate-haven ships flip `policy = Pirate`, `faction = Free`, and start with 4/4 powder/shot instead of the merchant default of 1/1. Starting silver scales with cargo capacity (`max(1500, cap × 25)`), deliberately leaner than the shipyard's ~30/ton so the world doesn't start drowning in cash.
+
+The bench replaces the manual ship list with a single `world.seed_historical_fleet(0xCAFE_1680)` call. The per-ship printer (unreadable at 500 ships) is gone, replaced with a `(faction, type)` aggregate table plus top-5 and bottom-5 P/L outliers. The Combat ledger is preserved and now reads e.g. `67 pirate(s) afloat (24 seeded + 3 captured + 40 mutinied)`.
+
+### Results
+
+Bench produces **503 ships** across 38 ports. Performance is linear in sim time:
+
+| Sim days | Wall (release) |
+|---------:|---------------:|
+| 60       | 2.7 s          |
+| 365      | 17 s           |
+| 730      | 47 s           |
+
+At 730d: fleet P/L +8.66M pesos, 81 bankrupt (16%), 67 pirates afloat (24 seeded + 3 captured + **40 mutinied**), 3 captured by combat, 3 lost. Step 9's mutiny trigger is now visibly firing — at the prior 33-ship scale it never crossed the threshold.
+
+### Production sanity check
+
+Before scaling, asked: does the world produce enough provisions to feed 500 ships? Calculation:
+
+- Per-man burn: 0.0018 t/man/day (≈ 4 lbs/man/day dry food). This matches the 17C Royal Navy victualling allowance (1 lb biscuit + ~2 lb salt meat + peas/cheese; Davis, *Rise of the English Shipping Industry*). Beer/water (~1 gal/man/day = ~8 lbs) is not tracked as "provisions" in the goods catalog.
+- Weighted average crew across our ship-type mix ≈ 25 (sloop 15, brigantine 22, bark 50, fluyt 25, ship 80).
+- Fleet demand: 500 × 25 × 0.0018 × 365 ≈ **8,200 t/yr** at full activity.
+- World production: **9,552 t/yr structural** (sum over all 38 markets of `recipe.monthly_outputs * prosperity * 12`). After port-population consumption (2,208 t/yr), net available to fleet: **7,344 t/yr**.
+
+So fleet need is roughly the same order of magnitude as net production — about a 10% structural shortfall at full activity, well within the slack of ships sometimes sitting in port. The 16% bankruptcy rate is therefore **not a global provisions shortage** — it's a distribution/economics problem (fluyts over-built relative to demand for their slow-but-bulky niche; small colonial ports occasionally starving while European hubs are flush). That's a Step 10.b or later concern.
+
+### Open questions for later calibration
+
+- Fluyt over-supply: most bottom-5 P/L outliers are Amsterdam fluyts. Either the type mix in `EuropeanHub` is too fluyt-heavy or the shipyard's "build pencils" math is over-eager.
+- Small-colonial provisioning: ports like Cumana, La Vela, and the Mosquito Coast outposts may sit far from any provisioning hub. Worth measuring per-port provisions inflow before tuning.
+- The 40 mutinies are concentrated in a few Spanish flotas that get caught between bankrupt and unable-to-careen; the mutiny pipeline now works but the distribution may merit its own pass.
