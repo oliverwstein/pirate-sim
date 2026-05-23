@@ -169,77 +169,97 @@ fn pirate_without_powder_does_no_damage() {
 
 // ── Step 8 integration tests: boarding & sinking ────────────────────────
 
-/// A pirate alongside a dismasted merchant boards her, wins, and either
-/// takes the prize (flipping its policy/faction) or — if it can't spare
-/// the crew — burns her.
+/// Step 11.a: a successful boarding now resolves to one of four
+/// outcomes — take (rare, only on real upgrade), sell, sink, or
+/// release — but in every case the prize's cargo gets stripped and
+/// the attacker's silver goes up. This test pins those invariants
+/// regardless of which outcome the RNG picks.
 #[test]
-fn pirate_boards_dismasted_merchant_and_takes_prize() {
+fn pirate_boards_dismasted_merchant_and_resolves_prize() {
     use sim_core::ai::ShipAI;
+    use sim_core::cargo::Cargo;
+    use sim_core::goods::ids::{CANNON_SHOT, GUNPOWDER, SUGAR};
     use sim_core::port::Faction;
     use sim_core::ship::{ShipPolicy, ShipState};
     use sim_core::types::Position;
 
     let mut world = fresh_world();
 
-    // Pirate ship-of-the-line-ish: a brig with a big crew so even after
-    // splitting off a prize crew she's still above crew_min.
     let mut pirate = Ship::seeded_at_port(Position::new(0.0, 0.0), 0, Faction::Free);
     pirate.policy = ShipPolicy::Pirate;
     pirate.state = ShipState::Sailing;
     pirate.nav.docked_at_port = None;
     pirate.ship_type = sim_core::shiptype::ids::BRIGANTINE;
-    // Refill crew to the brigantine's typical complement.
     let pirate_stats = world.ship_types.get(pirate.ship_type).stats.clone();
     pirate.crew_alive = pirate_stats.crew_typical();
     pirate.morale = 1.0;
-    let pirate_faction = pirate.faction;
+    pirate.silver = 0.0;
+    pirate.cargo = Cargo::new();
+    pirate.cargo.add(GUNPOWDER, 4.0);
+    pirate.cargo.add(CANNON_SHOT, 4.0);
     let pirate_id = world.add_ship(pirate, ShipAI::with_seed(7));
 
-    // Merchant: dismasted to 10% rigging (below the 30% boarding gate),
-    // sitting essentially still 0.02 NM away (well inside the 0.05 NM
-    // boarding range).
     let mut merchant = Ship::seeded_at_port(Position::new(0.0, 0.02), 1, Faction::England);
     merchant.policy = ShipPolicy::Merchant;
     merchant.state = ShipState::Sailing;
     merchant.nav.docked_at_port = None;
     merchant.ship_type = sim_core::shiptype::ids::BARK;
     let merch_stats = world.ship_types.get(merchant.ship_type).stats.clone();
-    merchant.crew_alive = (merch_stats.crew_typical() / 2).max(2); // skeleton crew
+    merchant.crew_alive = (merch_stats.crew_typical() / 2).max(2);
     merchant.rigging_integrity = merch_stats.rigging_integrity_max * 0.1;
+    // Load some valuable cargo and silver so we can confirm the
+    // boarders stripped both.
+    merchant.cargo = Cargo::new();
+    merchant.cargo.add(SUGAR, 20.0);
+    merchant.silver = 500.0;
     let merchant_id = world.add_ship(merchant, ShipAI::with_seed(11));
 
-    // One tick should be enough: snapshots include the merchant's low
-    // rigging_frac, pirate's see_prey accepts (slower target), pursue
-    // emits Steer + AttemptBoard, Resolution applies the fight.
     world.tick();
 
-    let merchant_after = world
-        .ships
-        .get(merchant_id)
-        .expect("merchant should still exist (prize taken, not burned)");
-    assert_eq!(
-        merchant_after.policy,
-        ShipPolicy::Pirate,
-        "captured prize should fly the pirate flag"
-    );
-    assert_eq!(
-        merchant_after.faction, pirate_faction,
-        "captured prize should inherit attacker's faction"
-    );
-    // Defender's morale should have been reset to the prize-crew baseline.
+    // Some prize outcome must have been recorded.
+    let total_outcomes =
+        world.prizes_taken + world.prizes_sold + world.prizes_sunk + world.prizes_released;
     assert!(
-        (merchant_after.morale - 0.8).abs() < 1e-3,
-        "prize morale should be set to 0.8, got {}",
-        merchant_after.morale
+        total_outcomes >= 1,
+        "boarding should have produced at least one prize outcome, counters were 0"
     );
 
-    // Attacker should also still exist with reduced crew (transferred
-    // prize crew + casualties).
+    // Pirate must have accrued silver (cargo bounty + stripped silver
+    // applied on every non-`take` outcome; on `take` she gets the
+    // hull but no cash). At minimum she's still alive.
     let pirate_after = world
         .ships
         .get(pirate_id)
         .expect("attacker should still exist after winning the boarding");
     assert!(pirate_after.crew_alive < pirate_stats.crew_typical());
+
+    if let Some(merch) = world.ships.get(merchant_id) {
+        // If the merchant survived, it must be either released (still
+        // a merchant) or taken (flag flipped, faction inherited). In
+        // either case its cargo should have been stripped of sugar.
+        let sugar_left = merch.cargo.get(SUGAR);
+        assert!(
+            sugar_left == 0.0,
+            "merchant's cargo should be stripped after the boarding (sugar={})",
+            sugar_left
+        );
+        if merch.policy == ShipPolicy::Pirate {
+            assert_eq!(world.prizes_taken, 1);
+        } else {
+            assert_eq!(world.prizes_released, 1);
+        }
+    } else {
+        // Ship gone: must have been sunk or sold (both reaped).
+        assert!(
+            world.prizes_sunk + world.prizes_sold >= 1,
+            "missing ship should correspond to a sink or sell outcome"
+        );
+        // And the attacker should have pocketed the cargo silver.
+        assert!(
+            pirate_after.silver > 0.0,
+            "non-take outcomes should bank stripped cargo silver"
+        );
+    }
 }
 
 /// A merchant whose hull is hammered to 0 by a broadside is marked Sunk
@@ -282,10 +302,12 @@ fn ship_with_zero_hull_is_reaped_in_cleanup() {
     );
 }
 
-/// A pirate too thinly crewed to spare a prize crew burns the prize
-/// instead of taking it.
+/// Step 11.a: a pirate too thinly crewed to spare a prize crew can
+/// never roll the `take` outcome — instead the prize resolves to
+/// sell / sink / release, and the boarders strip the cargo either
+/// way. The defender's flag must NOT have flipped to Pirate.
 #[test]
-fn under_crewed_pirate_burns_prize_instead_of_taking_it() {
+fn under_crewed_pirate_cannot_take_prize() {
     use sim_core::ai::ShipAI;
     use sim_core::port::Faction;
     use sim_core::ship::{ShipPolicy, ShipState};
@@ -320,11 +342,24 @@ fn under_crewed_pirate_burns_prize_instead_of_taking_it() {
 
     world.tick();
 
-    // Prize should have been burned (Sunk → reaped). Either it's gone
-    // entirely (Cleanup), or its policy didn't flip to Pirate (lost the
-    // fight). The burn-prize path means it's gone.
-    assert!(
-        world.ships.get(merchant_id).is_none(),
-        "under-crewed pirate should have burned the prize instead of taking it"
+    // A prize outcome was recorded, but NOT `take`.
+    assert_eq!(
+        world.prizes_taken, 0,
+        "an under-crewed pirate must not roll the take outcome"
     );
+    let resolved = world.prizes_sold + world.prizes_sunk + world.prizes_released;
+    assert!(
+        resolved >= 1,
+        "boarding should have resolved as sell/sink/release"
+    );
+
+    // If the defender survived (release outcome), it must still be a
+    // Merchant — never a Pirate.
+    if let Some(merch) = world.ships.get(merchant_id) {
+        assert_eq!(
+            merch.policy,
+            ShipPolicy::Merchant,
+            "release outcome must leave the defender as a Merchant"
+        );
+    }
 }

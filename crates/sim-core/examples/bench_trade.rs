@@ -341,15 +341,24 @@ fn main() {
             .filter(|(_, s)| s.policy != ShipPolicy::Pirate && s.policy != ShipPolicy::Merchant)
             .count();
         let n_mutinied = world.mutinies_total as usize;
-        let n_captured = n_pirate
-            .saturating_sub(n_seeded_pirates)
-            .saturating_sub(n_mutinied);
+        // Step 11.a: "captured" now means prize-flips (rare path).
+        // The old derivation (n_pirate − seeded − mutinied) was a
+        // proxy that worked when every prize became a pirate; with
+        // the new outcome split, read it straight from the counter.
+        let n_captured = world.prizes_taken as usize;
         let n_known = ship_ids.len();
         let n_alive = world.ships.len();
         let n_lost = n_known.saturating_sub(n_alive);
         println!(
             "Combat ledger: {} pirate(s) afloat ({} seeded + {} captured + {} mutinied), {} navy/privateer, {} lost (sunk or burned prize)",
             n_pirate, n_seeded_pirates, n_captured, n_mutinied, n_navy, n_lost,
+        );
+        // Step 11.a: prize-outcome breakdown. Almost all successful
+        // boardings now result in cargo strip + hull dispatch (sink /
+        // sold / released); flipping the prize to pirate is rare.
+        println!(
+            "Prize outcomes: {} taken (flipped to pirate), {} sold at haven, {} sunk, {} released",
+            world.prizes_taken, world.prizes_sold, world.prizes_sunk, world.prizes_released,
         );
         // Step 10.b: non-combat attrition breakdown. Storm/foundering/
         // fire counters are sinkings only; storm damage that didn't

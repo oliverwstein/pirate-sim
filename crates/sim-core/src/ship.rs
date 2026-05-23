@@ -520,22 +520,27 @@ impl Ship {
         self.morale = (self.morale + delta).clamp(0.0, 1.0);
     }
 
-    /// Check the mutiny trigger (Step 9): a Merchant ship currently at
-    /// sea, whose combined chandler debt + overdue wages exceeds
-    /// `MUTINY_DEBT_THRESHOLD`, with morale below
-    /// `MUTINY_MORALE_THRESHOLD`, flips to `Pirate`. Returns `true` if
-    /// the policy flipped this tick. The caller is responsible for
-    /// clearing any merchant-route NavGoal on the ShipAI so the new
-    /// pirate captain re-plans next tick.
+    /// Check the mutiny trigger (Step 9, retuned in Step 11.b): a
+    /// Merchant ship currently at sea, whose combined chandler debt +
+    /// overdue wages exceeds `MUTINY_DEBT_THRESHOLD`, with morale
+    /// below `MUTINY_MORALE_THRESHOLD`, gets one stochastic roll per
+    /// hour with probability `MUTINY_PROBABILITY_PER_HOUR`. Returns
+    /// `true` if the policy flipped this tick. The caller is
+    /// responsible for clearing any merchant-route NavGoal on the
+    /// ShipAI so the new pirate captain re-plans next tick.
     ///
     /// Combining `debt` and `wages_owed_pesos` matters because the
     /// chandler caps `debt` at `MAX_SHIP_DEBT`: a captain who maxes
     /// out chandler credit AND stops paying his crew is the realistic
     /// distress profile, not raw debt alone.
     ///
+    /// `mutiny_roll` must be a uniform sample in `[0, 1)` drawn from
+    /// the world's combat RNG; pass `combat_rng_step(&mut state)` at
+    /// the call site so the result is deterministic.
+    ///
     /// Privateers / already-Pirate ships and any non-Sailing state are
     /// ignored.
-    pub fn try_mutiny(&mut self) -> bool {
+    pub fn try_mutiny(&mut self, mutiny_roll: f32) -> bool {
         if self.policy != ShipPolicy::Merchant {
             return false;
         }
@@ -547,6 +552,9 @@ impl Ship {
             return false;
         }
         if self.morale >= MUTINY_MORALE_THRESHOLD {
+            return false;
+        }
+        if mutiny_roll >= MUTINY_PROBABILITY_PER_HOUR {
             return false;
         }
         self.policy = ShipPolicy::Pirate;
@@ -728,9 +736,14 @@ pub const MORALE_GAIN_PRIZE_TAKEN: f32 = 0.30;
 pub const MAX_SHIP_DEBT: f32 = 5000.0;
 
 /// Debt threshold above which an at-sea Merchant crew may mutiny
-/// (§9). Set to 1.5× `MAX_SHIP_DEBT` so the captain has already
-/// blown through every credit ceiling the chandlers offer.
-pub const MUTINY_DEBT_THRESHOLD: f32 = MAX_SHIP_DEBT * 1.5;
+/// (§9). Step 11.b: raised from 1.5× to 3× `MAX_SHIP_DEBT` to match
+/// the historical record where significant mutinies (Royal James,
+/// Anstis, Phillips) were rare events at the *end* of a long string
+/// of failures, not first-sign-of-trouble flips. With the chandler
+/// debt cap at MAX_SHIP_DEBT, the only way to reach this threshold
+/// is to also be carrying ~10000 pesos in unpaid wages — roughly a
+/// year's wages for a small merchant crew.
+pub const MUTINY_DEBT_THRESHOLD: f32 = MAX_SHIP_DEBT * 3.0;
 /// Morale ceiling below which an at-sea Merchant with crushing debt
 /// flips to Pirate.
 pub const MUTINY_MORALE_THRESHOLD: f32 = 0.25;
@@ -738,6 +751,16 @@ pub const MUTINY_MORALE_THRESHOLD: f32 = 0.25;
 /// they're not euphoric (they just murdered their officers) but the
 /// immediate grievances are gone.
 pub const MUTINY_POST_FLIP_MORALE: f32 = 0.55;
+
+/// Step 11.b: per-hour probability that a qualifying crew (debt +
+/// wages over threshold, morale below threshold, at sea) actually
+/// mutinies. At ~0.0002/hr a ship that stays in the mutiny zone for
+/// a full year has a ~1 − exp(−24 × 365 × 0.0002) ≈ 83% chance of
+/// flipping; over a typical week-or-two distress window the
+/// per-incident chance is more like 3-7%. Models the "everyone's
+/// grumbling but it takes weeks of conspiring" dynamic seen in
+/// Rediker's accounts.
+pub const MUTINY_PROBABILITY_PER_HOUR: f32 = 0.0002;
 
 /// Fraction of a port's silver that any single chandler-credit
 /// advance may consume. Keeps a string of broke ships from
@@ -923,7 +946,8 @@ mod tests {
         ship.debt = MUTINY_DEBT_THRESHOLD + 1.0;
         ship.morale = MUTINY_MORALE_THRESHOLD - 0.01;
         ship.wages_owed_pesos = 999.0;
-        assert!(ship.try_mutiny());
+        // Pass a roll guaranteed to fall under the probability gate.
+        assert!(ship.try_mutiny(0.0));
         assert_eq!(ship.policy, ShipPolicy::Pirate);
         assert_eq!(ship.debt, 0.0);
         assert_eq!(ship.wages_owed_pesos, 0.0);
@@ -935,7 +959,7 @@ mod tests {
         let mut ship = Ship::new(Position::ZERO, ShipState::Docked);
         ship.debt = MUTINY_DEBT_THRESHOLD + 1000.0;
         ship.morale = 0.0;
-        assert!(!ship.try_mutiny());
+        assert!(!ship.try_mutiny(0.0));
         assert_eq!(ship.policy, ShipPolicy::Merchant);
     }
 
@@ -945,10 +969,10 @@ mod tests {
         ship.debt = MUTINY_DEBT_THRESHOLD - 1.0;
         ship.wages_owed_pesos = 0.0;
         ship.morale = 0.05;
-        assert!(!ship.try_mutiny(), "below distress threshold");
+        assert!(!ship.try_mutiny(0.0), "below distress threshold");
         ship.debt = MUTINY_DEBT_THRESHOLD + 1.0;
         ship.morale = MUTINY_MORALE_THRESHOLD + 0.01;
-        assert!(!ship.try_mutiny(), "above morale threshold");
+        assert!(!ship.try_mutiny(0.0), "above morale threshold");
     }
 
     #[test]
@@ -959,7 +983,7 @@ mod tests {
         ship.debt = MAX_SHIP_DEBT;
         ship.wages_owed_pesos = MUTINY_DEBT_THRESHOLD - MAX_SHIP_DEBT + 1.0;
         ship.morale = 0.1;
-        assert!(ship.try_mutiny());
+        assert!(ship.try_mutiny(0.0));
         assert_eq!(ship.policy, ShipPolicy::Pirate);
     }
 
@@ -969,7 +993,22 @@ mod tests {
         ship.policy = ShipPolicy::Pirate;
         ship.debt = MUTINY_DEBT_THRESHOLD * 10.0;
         ship.morale = 0.0;
-        assert!(!ship.try_mutiny());
+        assert!(!ship.try_mutiny(0.0));
+    }
+
+    /// Step 11.b: the per-hour probability gate suppresses mutinies
+    /// when the random roll is above the configured threshold, even
+    /// when every other condition is met. This is what keeps the
+    /// long-run mutiny rate sane.
+    #[test]
+    fn mutiny_skips_when_roll_above_probability() {
+        let mut ship = Ship::new(Position::ZERO, ShipState::Sailing);
+        ship.policy = ShipPolicy::Merchant;
+        ship.debt = MUTINY_DEBT_THRESHOLD + 1.0;
+        ship.morale = 0.0;
+        // Just above the probability gate -> no flip.
+        assert!(!ship.try_mutiny(MUTINY_PROBABILITY_PER_HOUR + 1e-6));
+        assert_eq!(ship.policy, ShipPolicy::Merchant);
     }
 
     #[test]

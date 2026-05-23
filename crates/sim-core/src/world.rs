@@ -76,6 +76,18 @@ pub struct World {
     pub attrition_storms: u32,
     pub attrition_foundered: u32,
     pub attrition_fires: u32,
+    /// Step 11.a: prize-outcome ledger for successful boardings.
+    /// `prizes_taken` is the rare case where the prize joins the
+    /// pirate fleet (real upgrade); other outcomes strip cargo + silver
+    /// and either sink the hull or release it.
+    pub prizes_taken: u32,
+    pub prizes_sold: u32,
+    pub prizes_sunk: u32,
+    pub prizes_released: u32,
+    /// Step 11.a: deterministic RNG for stochastic combat outcomes
+    /// (prize handling, future morale rolls, etc.). Seeded once at
+    /// `World::load`; same world state → same outcome trace.
+    pub combat_rng_state: u64,
     /// Dynamic spatial index over Sailing ships, rebuilt at the top
     /// of every hourly tick. Read by viz (Step 4.d) and, in Step 6+,
     /// by AI `SeePrey` / `Pursue` / `Flee` conditions. Docked /
@@ -141,6 +153,11 @@ impl World {
             attrition_storms: 0,
             attrition_foundered: 0,
             attrition_fires: 0,
+            prizes_taken: 0,
+            prizes_sold: 0,
+            prizes_sunk: 0,
+            prizes_released: 0,
+            combat_rng_state: 0x5052_495A_4520_5247_u64 ^ 0x9E37_79B9_7F4A_7C15,
             spatial: SpatialHash::new(),
             commands: Vec::new(),
         }
@@ -756,31 +773,97 @@ impl World {
                             // back; no transfer, no flag change.
                             continue;
                         }
-                        // Attacker won. Decide whether to take prize
-                        // or burn it.
+                        // Step 11.a: prize outcome. Historical pattern
+                        // (Rediker, Earle): pirates almost never kept
+                        // captured hulls — they stripped cargo, took
+                        // any silver, and either released the prize
+                        // (after a hostage scare), sank her, or sailed
+                        // her to a friendly haven to sell. Only rarely
+                        // did a prize join the fleet, and then only if
+                        // she was a real upgrade. Old behavior — "every
+                        // prize becomes a pirate" — produced runaway
+                        // pirate growth in long benches.
                         let a_surviving = self
                             .ships
                             .get(attacker_id)
                             .map(|a| a.crew_alive)
                             .unwrap_or(0);
+
+                        // Compute prize value (cargo + hull bounty)
+                        // before mutating either ship. Cargo is valued
+                        // at a flat wholesale ~20 pesos/ton (close to
+                        // average bench prices for bulk goods like
+                        // sugar/molasses); hull bounty scales with
+                        // current hull integrity to reflect sale value
+                        // at a pirate haven.
+                        let (target_cargo_tons, target_hull, target_hull_max) =
+                            match self.ships.get(tgt) {
+                                Some(t) => {
+                                    let stats = &self.ship_types.get(t.ship_type).stats;
+                                    (
+                                        t.cargo.total_tons(),
+                                        t.hull_integrity,
+                                        stats.hull_integrity_max,
+                                    )
+                                }
+                                None => (0.0, 0.0, 0.0),
+                            };
+                        let cargo_silver = target_cargo_tons * 20.0;
+                        let hull_bounty = target_hull * 8.0;
+
+                        // Decide outcome. Real-upgrade check first
+                        // (a 200-ton fluyt is no upgrade for a 60-ton
+                        // sloop pirate); then crew-spareable check;
+                        // then the weighted roll.
+                        let attacker_hull_max = self
+                            .ships
+                            .get(attacker_id)
+                            .map(|a| self.ship_types.get(a.ship_type).stats.hull_integrity_max)
+                            .unwrap_or(0.0);
+                        let could_upgrade = target_hull_max > attacker_hull_max * 1.2;
                         let prize_crew =
                             ((a_surviving as f32) * crate::combat::PRIZE_CREW_SPLIT).round() as u16;
                         let attacker_after = a_surviving.saturating_sub(prize_crew);
-                        if attacker_after < a_min_crew || prize_crew < 2 {
-                            // Can't spare a prize crew. Burn the prize.
-                            if let Some(t) = self.ships.get_mut(tgt) {
-                                t.hull_integrity = 0.0;
-                                t.rigging_integrity = 0.0;
-                                t.state = ShipState::Sunk;
+                        let can_spare_crew = attacker_after >= a_min_crew && prize_crew >= 2;
+
+                        let roll = combat_rng_step(&mut self.combat_rng_state);
+                        // Outcome weights (sum to 1.0):
+                        //   take    : 0.05 (only if real upgrade + crew spareable)
+                        //   sell    : 0.30 (silver bonus, prize sunk)
+                        //   sink    : 0.50 (default — cargo stripped, hull released/burned)
+                        //   release : 0.15 (cargo stripped, target lives to trade again)
+                        let take = could_upgrade && can_spare_crew && roll < 0.05;
+                        let sell = !take && roll < 0.35;
+                        let release = !take && !sell && roll >= 0.85;
+                        // (sink is the default if none of the above)
+
+                        // Apply stripped cargo + silver to attacker
+                        // (and clear from target unless we're taking it).
+                        if !take {
+                            if let Some(a) = self.ships.get_mut(attacker_id) {
+                                let bonus = if sell {
+                                    cargo_silver + hull_bounty
+                                } else {
+                                    cargo_silver
+                                };
+                                a.silver += bonus;
+                                a.morale = (a.morale + crate::ship::MORALE_GAIN_PRIZE_TAKEN)
+                                    .clamp(0.0, 1.0);
                             }
-                        } else {
-                            // Take the prize: transfer crew, flip
-                            // policy/faction, set the new owner-pirate
-                            // captain to head for the nearest port.
+                            if let Some(t) = self.ships.get_mut(tgt) {
+                                t.cargo = crate::cargo::Cargo::new();
+                                t.silver = (t.silver * 0.1).max(0.0); // boarders took most of it
+                            }
+                        }
+
+                        if take {
+                            // Real upgrade — flip the prize. This is
+                            // the *only* outcome that adds to the
+                            // pirate fleet.
+                            self.prizes_taken += 1;
                             let new_faction = self.ships.get(attacker_id).map(|a| a.faction);
                             if let Some(a) = self.ships.get_mut(attacker_id) {
                                 a.crew_alive = attacker_after;
-                                // Prize money: lift the boarders' morale.
                                 a.morale = (a.morale + crate::ship::MORALE_GAIN_PRIZE_TAKEN)
                                     .clamp(0.0, 1.0);
                             }
@@ -790,27 +873,39 @@ impl World {
                                 if let Some(f) = new_faction {
                                     t.faction = f;
                                 }
-                                // Reset morale — fresh prize crew
-                                // is keen; old captives are gone.
                                 t.morale = 0.8;
-                                // Prize sails on her own — clear any
-                                // pending steering and let her AI
-                                // re-plan next tick.
                                 t.speed = 0.0;
-                                // Clear navigation tracking so the
-                                // prize crew's captain replans from
-                                // scratch on the next AI tick.
                                 t.nav.waypoints.clear();
                             }
-                            // Flip the AI's strategic goal so the
-                            // prize ship's captain pursues opportunistic
-                            // raids, not its old trade route.
                             if let Some(ai) = self.ship_ais.get_mut(tgt) {
                                 ai.goal.destination = None;
                                 ai.goal.dest_port = None;
                                 ai.goal.pursue_target = None;
                                 ai.goal.flee_from = None;
                             }
+                        } else if sell || (!release) {
+                            // Sell-at-haven and sink-as-default both
+                            // result in the prize being removed from
+                            // the world (we don't model the actual
+                            // voyage to a pirate haven yet). The
+                            // distinction lives in `prizes_sold` vs
+                            // `prizes_sunk` for bench reporting.
+                            if sell {
+                                self.prizes_sold += 1;
+                            } else {
+                                self.prizes_sunk += 1;
+                            }
+                            if let Some(t) = self.ships.get_mut(tgt) {
+                                t.hull_integrity = 0.0;
+                                t.rigging_integrity = 0.0;
+                                t.state = ShipState::Sunk;
+                            }
+                        } else {
+                            // release — target survives, returns to
+                            // trade with empty holds. The captain re-
+                            // plans next tick (cargo is gone, but the
+                            // hull and crew live).
+                            self.prizes_released += 1;
                         }
                     }
                 }
@@ -831,7 +926,11 @@ impl World {
             ship.tick_morale(&ship_stats);
             // Step 9: mutiny check. On flip, clear the merchant-route
             // NavGoal so the new pirate captain re-plans next tick.
-            if ship.try_mutiny() {
+            // Step 11.b: pass a uniform sample from the world combat
+            // RNG; ship.try_mutiny now rolls stochastically instead of
+            // firing deterministically the moment conditions are met.
+            let mutiny_roll = combat_rng_step(&mut self.combat_rng_state);
+            if ship.try_mutiny(mutiny_roll) {
                 self.mutinies_total += 1;
                 if let Some(ai) = self.ship_ais.get_mut(id) {
                     ai.goal.destination = None;
@@ -974,4 +1073,16 @@ impl World {
             self.silver_at_month_start.remove(id);
         }
     }
+}
+
+/// Free-function form of `World::combat_uniform`, taking the rng state
+/// by `&mut` so it can be called from inside `self.commands.drain(..)`
+/// loops that already hold a mutable borrow on `self`. xorshift64 with
+/// a multiplicative mixer.
+fn combat_rng_step(state: &mut u64) -> f32 {
+    *state ^= *state << 13;
+    *state ^= *state >> 7;
+    *state ^= *state << 17;
+    let r = state.wrapping_mul(0x2545_F491_4F6C_DD1D);
+    (r >> 11) as f32 / ((1u64 << 53) as f32)
 }
