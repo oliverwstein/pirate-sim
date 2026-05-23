@@ -278,6 +278,10 @@ fn main() {
             .map(|(id, t)| format!("{}:{:.1}", world.goods.get(id).name, t))
             .collect();
         let built_tag = if i >= n_ships { " (built)" } else { "" };
+        let policy_tag = match ship.policy {
+            sim_core::ship::ShipPolicy::Pirate => " [PIRATE]",
+            _ => "",
+        };
         let type_name = &world.ship_types.get(ship.ship_type).name;
         let stats = &world.ship_types.get(ship.ship_type).stats;
         let hull_pct = if stats.hull_integrity_max > 0.0 {
@@ -291,9 +295,9 @@ fn main() {
             100.0
         };
         println!(
-            "{:<3}  {:<14}  {:<10}  {:>10.0}  {:>10.0}  {:>10.0}  {:>8.0}  {:>+10.0}  {:>5}  {:>6.0}  {:>6.0}  {:<10}  {:<24}{}",
+            "{:<3}  {:<14}  {:<10}  {:>10.0}  {:>10.0}  {:>10.0}  {:>8.0}  {:>+10.0}  {:>5}  {:>6.0}  {:>6.0}  {:<10}  {:<24}{}{}",
             i, origin_names[i], type_name, ship.starting_silver, ship.silver,
-            ship.lifetime_dividends, ship.debt, pl, ship.lifetime_dock_count, hull_pct, rig_pct, state, cargo.join(","), built_tag
+            ship.lifetime_dividends, ship.debt, pl, ship.lifetime_dock_count, hull_pct, rig_pct, state, cargo.join(","), built_tag, policy_tag
         );
     }
     println!();
@@ -322,12 +326,17 @@ fn main() {
             .iter()
             .filter(|(_, s)| s.policy != ShipPolicy::Pirate && s.policy != ShipPolicy::Merchant)
             .count();
+        // Seeded pirates are recorded in `pirate_starts`. Anything
+        // flying the pirate flag above that count came from a Step 8
+        // capture (boarded merchant turned prize).
+        let n_seeded_pirates = pirate_starts.len();
+        let n_captured = n_pirate.saturating_sub(n_seeded_pirates);
         let n_known = ship_ids.len();
         let n_alive = world.ships.len();
         let n_lost = n_known.saturating_sub(n_alive);
         println!(
-            "Combat ledger: {} active pirate(s), {} navy/privateer, {} lost (sunk or burned prize)",
-            n_pirate, n_navy, n_lost,
+            "Combat ledger: {} pirate(s) afloat ({} seeded + {} captured), {} navy/privateer, {} lost (sunk or burned prize)",
+            n_pirate, n_seeded_pirates, n_captured, n_navy, n_lost,
         );
     }
 

@@ -748,3 +748,45 @@ Neither belongs in Nav-1+2+3.
 - **Equilibrium price LP deviation: mean 210%, max 6,851%** (Elmina Tobacco) — pre-existing structural mismatch between sim prices and analytical LP equilibrium; not a regression.
 - **Tortuga pirate runs out of powder/shot mid-sim** — no Caribbean powder production yet. A future Caribbean import / raid-resupply line would let the haven sustain piracy.
 - **Ship 13 (Boston-built bark) at 0% hull/0% rig still listed "sailing"** — expected; Step 8 will add sinking + wreck removal.
+
+## Step 8 — Boarding, sinking, closest-approach combat gating (2026-05-22 cont., commit `834726f`)
+
+Per `planning/phase-3-plan.md §8`. Adds the violence half of Phase 3: pirates can now actually take ships, and broadsides actually connect.
+
+### The hourly-tick granularity problem
+
+Discovered while designing the boarding range: with hourly ticks and ships moving 5–8 kt, two ships closing at 2+ kt of Δspeed pass through each other's combat envelope in a single tick. End-of-tick distance alone made the 0.5 NM cannon range a near-miss most of the time, and boarding's natural 0.05 NM (actual grapple distance) basically unreachable. Step 7 broadsides were almost certainly under-firing — we just didn't have ship-pair instrumentation to notice.
+
+**Fix:** `combat::min_distance_over_tick(a_pos, a_vel, b_pos, b_vel)` — linear interpolation of relative position over the unit tick interval, returns the minimum `|r(t)|` for t ∈ [0, 1]. Now used as the range gate for both `FireBroadside` (Step 7 retroactive fix) and `AttemptBoard` (Step 8 native). `ShipSnapshot` grew `velocity` and `rigging_frac` so the AI can compute closest-approach and gate on rigging without re-borrowing the ships map.
+
+### Boarding mechanics
+
+- **Command:** `ShipCommand::AttemptBoard { target }`.
+- **AI gate:** in `act_pursue`, pirates emit `AttemptBoard` after `Steer` + `FireBroadside` when target rigging < 30% of max (the "dismasted enough to grapple" condition) AND closest-approach this tick < 0.05 NM.
+- **Resolution:** `combat::resolve_boarding` is a pure function — `force = crew * (1 + 0.5 * morale)`, larger force wins, tied force goes to defender (home-deck advantage). Casualty rates: 20% winner, 65% loser. Defender takes losses first; if attacker wins, half its surviving crew transfers as prize crew. Prize gets `policy = Pirate`, inherits attacker's `faction`, morale reset to 0.8, nav cleared. If the prize crew split would drop the attacker below `stats.crew_min()`, the prize is burned instead (`state = Sunk`).
+
+### Sinking and Cleanup Phase
+
+- `ShipState::Sunk` variant added. Set by Resolution when `hull_integrity <= 0` (broadside kill) or by the burn-prize path.
+- New Cleanup Phase at the end of `tick_hourly_ai_and_physics` sweeps Sunk ships out of the SlotMap. SecondaryMap entries (`ship_ais`, `silver_at_month_start`) removed alongside. SlotMap generation bumps, so the `ShipId` becomes permanently invalid — no ghost references.
+
+### Bench impact (730d)
+
+- Fleet total P/L: +2.49M → **+3.41M** (+37%). All from broadsides actually firing via closest-approach — boarding doesn't transfer cargo so doesn't directly inject silver.
+- Bankrupt: 4 → **7**. Long-tail merchants caught in pirate windows.
+- **Combat ledger: 5 pirate(s) afloat (3 seeded + 2 captured), 0 sunk.** Step 8's first real signal — 2 successful boardings turned merchant prizes (Boston bark, Amsterdam fluyt) into pirates. The captured ships show 9% hull / 27% rig — signature of a long-running brawl.
+- No outright sinkings yet — gunnery alone isn't lethal enough to hull-zero a merchant before boarding kicks in. Calibration (Step 10) will tune.
+- 365d run shows +10% P/L vs pre-Step-8 (1.999M → 2.196M) — confirms the closest-approach gunnery effect compounds over horizon.
+
+### Test coverage
+
+141 tests pass (was 130). Added:
+- 5 `combat` unit tests for `min_distance_over_tick` (stationary, crossing paths, passes-close-during-tick, clamping)
+- 4 `combat` unit tests for `resolve_boarding` (force decides outcome, tie goes to defender, morale can flip, losses clamp to crew)
+- 3 integration tests in `tests/combat.rs`: prize-taking (policy + faction + morale flip), Cleanup reaping a hull-zero ship, under-crewed pirate burns the prize
+
+### Known follow-ups (logged, not blocking)
+
+- Captured prizes still hold their original merchant cargo — Step 9 territory (the prize crew presumably sells it at the next haven). Worth a separate look once mutiny lands.
+- Tortuga and Nassau pirates run their magazines down to 0.4 t over 730 days (started with 4 t each). No Caribbean powder production means they would starve out long-term. Step 10 calibration question: should boarders salvage powder/shot from prizes?
+- Equilibrium LP deviation (max 6,851% at Elmina Tobacco) unchanged from pre-Step-8 — still a structural pricing question separate from combat.
