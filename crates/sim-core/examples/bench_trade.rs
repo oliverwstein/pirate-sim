@@ -330,13 +330,16 @@ fn main() {
         // flying the pirate flag above that count came from a Step 8
         // capture (boarded merchant turned prize).
         let n_seeded_pirates = pirate_starts.len();
-        let n_captured = n_pirate.saturating_sub(n_seeded_pirates);
+        let n_mutinied = world.mutinies_total as usize;
+        let n_captured = n_pirate
+            .saturating_sub(n_seeded_pirates)
+            .saturating_sub(n_mutinied);
         let n_known = ship_ids.len();
         let n_alive = world.ships.len();
         let n_lost = n_known.saturating_sub(n_alive);
         println!(
-            "Combat ledger: {} pirate(s) afloat ({} seeded + {} captured), {} navy/privateer, {} lost (sunk or burned prize)",
-            n_pirate, n_seeded_pirates, n_captured, n_navy, n_lost,
+            "Combat ledger: {} pirate(s) afloat ({} seeded + {} captured + {} mutinied), {} navy/privateer, {} lost (sunk or burned prize)",
+            n_pirate, n_seeded_pirates, n_captured, n_mutinied, n_navy, n_lost,
         );
     }
 

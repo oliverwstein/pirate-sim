@@ -446,6 +446,11 @@ impl Ship {
             delta -= MORALE_LOSS_WAGES_OVERDUE;
         }
 
+        // Heavy debt: chandler credit blown past (or sitting at) the ceiling.
+        if self.debt >= MAX_SHIP_DEBT {
+            delta -= MORALE_LOSS_DEBT_HEAVY;
+        }
+
         // Rested in port: docked, full belly, no wage debt.
         if self.state == ShipState::Docked
             && days_left >= MORALE_PROVISIONS_LOW_DAYS
@@ -455,6 +460,44 @@ impl Ship {
         }
 
         self.morale = (self.morale + delta).clamp(0.0, 1.0);
+    }
+
+    /// Check the mutiny trigger (Step 9): a Merchant ship currently at
+    /// sea, whose combined chandler debt + overdue wages exceeds
+    /// `MUTINY_DEBT_THRESHOLD`, with morale below
+    /// `MUTINY_MORALE_THRESHOLD`, flips to `Pirate`. Returns `true` if
+    /// the policy flipped this tick. The caller is responsible for
+    /// clearing any merchant-route NavGoal on the ShipAI so the new
+    /// pirate captain re-plans next tick.
+    ///
+    /// Combining `debt` and `wages_owed_pesos` matters because the
+    /// chandler caps `debt` at `MAX_SHIP_DEBT`: a captain who maxes
+    /// out chandler credit AND stops paying his crew is the realistic
+    /// distress profile, not raw debt alone.
+    ///
+    /// Privateers / already-Pirate ships and any non-Sailing state are
+    /// ignored.
+    pub fn try_mutiny(&mut self) -> bool {
+        if self.policy != ShipPolicy::Merchant {
+            return false;
+        }
+        if self.state != ShipState::Sailing {
+            return false;
+        }
+        let financial_distress = self.debt + self.wages_owed_pesos.max(0.0);
+        if financial_distress <= MUTINY_DEBT_THRESHOLD {
+            return false;
+        }
+        if self.morale >= MUTINY_MORALE_THRESHOLD {
+            return false;
+        }
+        self.policy = ShipPolicy::Pirate;
+        // The new pirate crew torches the ship's books — debt to the
+        // chandler ashore and unpaid wages are no longer their problem.
+        self.debt = 0.0;
+        self.wages_owed_pesos = 0.0;
+        self.morale = MUTINY_POST_FLIP_MORALE;
+        true
     }
 
     /// Consume provisions and accumulate fouling for one hour.
@@ -606,11 +649,32 @@ pub const MORALE_LOSS_WAGES_OVERDUE: f32 = 0.001;
 /// Hourly morale gain while docked with provisions fully topped up
 /// and no outstanding wage debt (the "rested in port" recovery).
 pub const MORALE_GAIN_RESTED_IN_PORT: f32 = 0.001;
+/// Hourly morale loss while the ship is carrying chandler debt above
+/// `MAX_SHIP_DEBT` (i.e., the captain has run out of legitimate credit
+/// and is shipping freight on tramping terms). Sized to push a chronically
+/// indebted crew toward the mutiny threshold over weeks, not hours.
+pub const MORALE_LOSS_DEBT_HEAVY: f32 = 0.0015;
+/// One-shot morale boost applied to a boarding attacker when they
+/// successfully take a prize (Step 8). Models the lift from prize-share
+/// distribution. Applied in the AttemptBoard Resolution arm.
+pub const MORALE_GAIN_PRIZE_TAKEN: f32 = 0.30;
 
 /// Maximum outstanding chandler/factor debt a single ship can
 /// accumulate before further credit is refused. Sized to cover a
 /// few hold-fillings of cheap cargo plus a season's provisions.
 pub const MAX_SHIP_DEBT: f32 = 5000.0;
+
+/// Debt threshold above which an at-sea Merchant crew may mutiny
+/// (§9). Set to 1.5× `MAX_SHIP_DEBT` so the captain has already
+/// blown through every credit ceiling the chandlers offer.
+pub const MUTINY_DEBT_THRESHOLD: f32 = MAX_SHIP_DEBT * 1.5;
+/// Morale ceiling below which an at-sea Merchant with crushing debt
+/// flips to Pirate.
+pub const MUTINY_MORALE_THRESHOLD: f32 = 0.25;
+/// Morale baseline assigned to a fresh pirate crew after a mutiny —
+/// they're not euphoric (they just murdered their officers) but the
+/// immediate grievances are gone.
+pub const MUTINY_POST_FLIP_MORALE: f32 = 0.55;
 
 /// Fraction of a port's silver that any single chandler-credit
 /// advance may consume. Keeps a string of broke ships from
@@ -775,6 +839,74 @@ mod tests {
         ship.morale = 0.5;
         ship.tick_morale(&stats);
         assert!((ship.morale - (0.5 + MORALE_GAIN_RESTED_IN_PORT)).abs() < 1e-5);
+    }
+
+    #[test]
+    fn morale_drops_on_heavy_debt() {
+        let stats = ShipStats::sloop();
+        let mut ship = Ship::new(Position::ZERO, ShipState::Sailing);
+        ship.provisions = stats.provision_capacity;
+        ship.wages_owed_pesos = 0.0;
+        ship.debt = MAX_SHIP_DEBT;
+        let before = ship.morale;
+        ship.tick_morale(&stats);
+        assert!((before - ship.morale - MORALE_LOSS_DEBT_HEAVY).abs() < 1e-5);
+    }
+
+    #[test]
+    fn mutiny_flips_indebted_low_morale_merchant_at_sea() {
+        let mut ship = Ship::new(Position::ZERO, ShipState::Sailing);
+        ship.policy = ShipPolicy::Merchant;
+        ship.debt = MUTINY_DEBT_THRESHOLD + 1.0;
+        ship.morale = MUTINY_MORALE_THRESHOLD - 0.01;
+        ship.wages_owed_pesos = 999.0;
+        assert!(ship.try_mutiny());
+        assert_eq!(ship.policy, ShipPolicy::Pirate);
+        assert_eq!(ship.debt, 0.0);
+        assert_eq!(ship.wages_owed_pesos, 0.0);
+        assert!((ship.morale - MUTINY_POST_FLIP_MORALE).abs() < 1e-5);
+    }
+
+    #[test]
+    fn mutiny_does_not_trigger_when_docked() {
+        let mut ship = Ship::new(Position::ZERO, ShipState::Docked);
+        ship.debt = MUTINY_DEBT_THRESHOLD + 1000.0;
+        ship.morale = 0.0;
+        assert!(!ship.try_mutiny());
+        assert_eq!(ship.policy, ShipPolicy::Merchant);
+    }
+
+    #[test]
+    fn mutiny_does_not_trigger_below_thresholds() {
+        let mut ship = Ship::new(Position::ZERO, ShipState::Sailing);
+        ship.debt = MUTINY_DEBT_THRESHOLD - 1.0;
+        ship.wages_owed_pesos = 0.0;
+        ship.morale = 0.05;
+        assert!(!ship.try_mutiny(), "below distress threshold");
+        ship.debt = MUTINY_DEBT_THRESHOLD + 1.0;
+        ship.morale = MUTINY_MORALE_THRESHOLD + 0.01;
+        assert!(!ship.try_mutiny(), "above morale threshold");
+    }
+
+    #[test]
+    fn mutiny_triggers_on_wages_pushing_total_over_threshold() {
+        let mut ship = Ship::new(Position::ZERO, ShipState::Sailing);
+        // Maxed out chandler credit + heavy unpaid wages combine to
+        // push the crew over the edge.
+        ship.debt = MAX_SHIP_DEBT;
+        ship.wages_owed_pesos = MUTINY_DEBT_THRESHOLD - MAX_SHIP_DEBT + 1.0;
+        ship.morale = 0.1;
+        assert!(ship.try_mutiny());
+        assert_eq!(ship.policy, ShipPolicy::Pirate);
+    }
+
+    #[test]
+    fn mutiny_ignores_already_pirate_ships() {
+        let mut ship = Ship::new(Position::ZERO, ShipState::Sailing);
+        ship.policy = ShipPolicy::Pirate;
+        ship.debt = MUTINY_DEBT_THRESHOLD * 10.0;
+        ship.morale = 0.0;
+        assert!(!ship.try_mutiny());
     }
 
     #[test]

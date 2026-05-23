@@ -65,6 +65,10 @@ pub struct World {
     /// Diagnostic counter: total number of ships built by the
     /// shipyard system since `World::load`.
     pub ships_built: u32,
+    /// Diagnostic counter: cumulative mutiny flips since `World::load`
+    /// (Step 9). Incremented in the per-ship tick when `try_mutiny`
+    /// returns true.
+    pub mutinies_total: u32,
     /// Dynamic spatial index over Sailing ships, rebuilt at the top
     /// of every hourly tick. Read by viz (Step 4.d) and, in Step 6+,
     /// by AI `SeePrey` / `Pursue` / `Flee` conditions. Docked /
@@ -126,6 +130,7 @@ impl World {
             silver_at_month_start: SecondaryMap::new(),
             last_month_avg_profit: 0.0,
             ships_built: 0,
+            mutinies_total: 0,
             spatial: SpatialHash::new(),
             commands: Vec::new(),
         }
@@ -651,6 +656,9 @@ impl World {
                             let new_faction = self.ships.get(attacker_id).map(|a| a.faction);
                             if let Some(a) = self.ships.get_mut(attacker_id) {
                                 a.crew_alive = attacker_after;
+                                // Prize money: lift the boarders' morale.
+                                a.morale = (a.morale + crate::ship::MORALE_GAIN_PRIZE_TAKEN)
+                                    .clamp(0.0, 1.0);
                             }
                             if let Some(t) = self.ships.get_mut(tgt) {
                                 t.crew_alive = t.crew_alive.saturating_add(prize_crew);
@@ -697,6 +705,18 @@ impl World {
             ship.tick_resources(&ship_stats);
             // Morale tick (after resources so days_left reflects this hour's burn).
             ship.tick_morale(&ship_stats);
+            // Mutiny check (Step 9). On flip, clear the merchant-route
+            // NavGoal so the new pirate captain re-plans next tick.
+            if ship.try_mutiny() {
+                self.mutinies_total += 1;
+                if let Some(ai) = self.ship_ais.get_mut(id) {
+                    ai.goal.destination = None;
+                    ai.goal.dest_port = None;
+                    ai.goal.pursue_target = None;
+                    ai.goal.flee_from = None;
+                }
+                ship.nav.waypoints.clear();
+            }
 
             // Wages: accrue while at sea, pay out into the port's
             // market silver while docked. See crewing-plan §6 / §3.3.
