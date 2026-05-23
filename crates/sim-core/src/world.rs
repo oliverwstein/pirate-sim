@@ -69,6 +69,13 @@ pub struct World {
     /// (Step 9). Incremented in the per-ship tick when `try_mutiny`
     /// returns true.
     pub mutinies_total: u32,
+    /// Step 10.b: cumulative non-combat losses since `World::load`,
+    /// split by cause. Storm/foundering/fire totals only count
+    /// **sinkings**; damage-only events live in
+    /// `weather.hazards.counters`. Read by the bench attrition table.
+    pub attrition_storms: u32,
+    pub attrition_foundered: u32,
+    pub attrition_fires: u32,
     /// Dynamic spatial index over Sailing ships, rebuilt at the top
     /// of every hourly tick. Read by viz (Step 4.d) and, in Step 6+,
     /// by AI `SeePrey` / `Pursue` / `Flee` conditions. Docked /
@@ -131,6 +138,9 @@ impl World {
             last_month_avg_profit: 0.0,
             ships_built: 0,
             mutinies_total: 0,
+            attrition_storms: 0,
+            attrition_foundered: 0,
+            attrition_fires: 0,
             spatial: SpatialHash::new(),
             commands: Vec::new(),
         }
@@ -398,6 +408,13 @@ impl World {
         let today = self.date.day_of_year;
         if today == self.last_hire_day {
             return;
+        }
+        // Step 10.b: age every live ship by one day. Sits on the same
+        // day-of-year gate as hiring so both fire exactly once per
+        // calendar day. `HazardSystem::tick_age` is a no-op on Sunk
+        // ships.
+        for (_, ship) in self.ships.iter_mut() {
+            crate::weather::hazards::HazardSystem::tick_age(ship);
         }
         const HIRE_PER_DAY: u16 = 5;
         let ids: Vec<ShipId> = self.ships.keys().collect();
@@ -812,7 +829,7 @@ impl World {
             ship.tick_resources(&ship_stats);
             // Morale tick (after resources so days_left reflects this hour's burn).
             ship.tick_morale(&ship_stats);
-            // Mutiny check (Step 9). On flip, clear the merchant-route
+            // Step 9: mutiny check. On flip, clear the merchant-route
             // NavGoal so the new pirate captain re-plans next tick.
             if ship.try_mutiny() {
                 self.mutinies_total += 1;
@@ -823,6 +840,52 @@ impl World {
                     ai.goal.flee_from = None;
                 }
                 ship.nav.waypoints.clear();
+            }
+
+            // Step 10.b: non-combat attrition. Teredo accumulates
+            // hourly while the hull is wet; storms / foundering / fire
+            // get one stochastic roll each. Sinking events flip
+            // `ship.state = Sunk` so the Cleanup phase at end-of-tick
+            // reaps the slot. Damage-only events reduce hull integrity
+            // and may push a previously combat-damaged hull under.
+            let pos = ship.position;
+            crate::weather::hazards::HazardSystem::tick_environment(ship, pos);
+            let events = self.weather.hazards.roll_hazards(ship, pos, month);
+            for ev in events {
+                use crate::weather::hazards::HazardEvent;
+                match ev {
+                    HazardEvent::StormDamage { hull_loss } => {
+                        ship.hull_integrity = (ship.hull_integrity - hull_loss).max(0.0);
+                        if ship.hull_integrity <= 0.0 && ship.state != ShipState::Sunk {
+                            ship.state = ShipState::Sunk;
+                            self.attrition_storms += 1;
+                        }
+                    }
+                    HazardEvent::StormSunk => {
+                        if ship.state != ShipState::Sunk {
+                            ship.hull_integrity = 0.0;
+                            ship.state = ShipState::Sunk;
+                            self.attrition_storms += 1;
+                        }
+                    }
+                    HazardEvent::Foundered => {
+                        if ship.state != ShipState::Sunk {
+                            ship.hull_integrity = 0.0;
+                            ship.state = ShipState::Sunk;
+                            self.attrition_foundered += 1;
+                        }
+                    }
+                    HazardEvent::Fire { hull_loss, sunk } => {
+                        ship.hull_integrity = (ship.hull_integrity - hull_loss).max(0.0);
+                        if sunk && ship.state != ShipState::Sunk {
+                            ship.state = ShipState::Sunk;
+                            self.attrition_fires += 1;
+                        }
+                    }
+                }
+            }
+            if ship.state == ShipState::Sunk {
+                continue;
             }
 
             // Wages: accrue while at sea, pay out into the port's

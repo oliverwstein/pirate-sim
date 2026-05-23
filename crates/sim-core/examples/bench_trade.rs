@@ -351,6 +351,18 @@ fn main() {
             "Combat ledger: {} pirate(s) afloat ({} seeded + {} captured + {} mutinied), {} navy/privateer, {} lost (sunk or burned prize)",
             n_pirate, n_seeded_pirates, n_captured, n_mutinied, n_navy, n_lost,
         );
+        // Step 10.b: non-combat attrition breakdown. Storm/foundering/
+        // fire counters are sinkings only; storm damage that didn't
+        // sink the hull lives in `weather.hazards.counters.storms_damaged`.
+        let hz = world.weather.hazards.counters;
+        println!(
+            "Attrition: {} storm sinkings ({} damage-only), {} foundered, {} fires ({} sunk)",
+            world.attrition_storms,
+            hz.storms_damaged,
+            world.attrition_foundered,
+            hz.fires,
+            world.attrition_fires,
+        );
     }
 
     // Sailor pool snapshot (Step 3.a diagnostic). Categories the

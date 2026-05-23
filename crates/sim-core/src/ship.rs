@@ -211,6 +211,17 @@ pub struct Ship {
     /// by `rigging_integrity / stats.rigging_integrity_max` — a fully-
     /// dismasted ship is dead in the water and easy prize for boarders.
     pub rigging_integrity: f32,
+    /// Step 10.b: structural worm damage in `[0, 100]`. Distinct from
+    /// `hull_fouling` (which is barnacles/weed and only hurts speed):
+    /// teredo eats the planking and drives the foundering hazard roll
+    /// in `weather::hazards`. Accumulates fastest in tropical water
+    /// and is reduced by careening. See
+    /// `planning/research/ship-attrition-economics-1650-1720.md §1.3`.
+    pub teredo_damage: f32,
+    /// Step 10.b: age in days since seeding/build. Multiplies the
+    /// foundering hazard rate so older hulls fail more readily, and
+    /// will eventually drive economic obsolescence in later steps.
+    pub age_days: u32,
 }
 
 /// What the ship is doing while docked. Used by the docking sequence in
@@ -251,6 +262,8 @@ impl Ship {
             dock_action: DockAction::Idle,
             hull_integrity: stats.hull_integrity_max,
             rigging_integrity: stats.rigging_integrity_max,
+            teredo_damage: 0.0,
+            age_days: 0,
         }
     }
 
@@ -305,6 +318,8 @@ impl Ship {
             dock_action: DockAction::Idle,
             hull_integrity: stats.hull_integrity_max,
             rigging_integrity: stats.rigging_integrity_max,
+            teredo_damage: 0.0,
+            age_days: 0,
         }
     }
 
@@ -346,6 +361,8 @@ impl Ship {
             dock_action: DockAction::Idle,
             hull_integrity: stats.hull_integrity_max,
             rigging_integrity: stats.rigging_integrity_max,
+            teredo_damage: 0.0,
+            age_days: 0,
         }
     }
 
@@ -631,9 +648,14 @@ impl Ship {
     }
 
     /// Careen the hull for one hour at a port. Returns `true` once the
-    /// hull is fully clean.
+    /// hull is fully clean. Reduces both fouling (barnacles/weed) and
+    /// teredo damage (worm-eaten planking) — the latter at half the
+    /// rate, since structural plank replacement is slower work than
+    /// scraping the bottom. See
+    /// `planning/research/ship-attrition-economics-1650-1720.md §1.3`.
     pub fn tick_careen(&mut self) -> bool {
         self.hull_fouling = (self.hull_fouling - CAREEN_RATE_PER_HOUR).max(0.0);
+        self.teredo_damage = (self.teredo_damage - CAREEN_RATE_PER_HOUR * 0.5).max(0.0);
         self.hull_fouling <= 0.0
     }
 
