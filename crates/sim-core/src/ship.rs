@@ -86,6 +86,12 @@ pub enum ShipState {
     /// `PortDemographics`; transitions to `Docked` when
     /// `crew_alive >= stats.crew_min()`. See `planning/crewing-plan.md §3`.
     Hiring,
+    /// Step 8: ship has been sunk this tick (hull integrity at 0, or
+    /// boarded and burned by a pirate too short-crewed to take a prize).
+    /// Sunk ships are skipped by the rest of the hourly loop and removed
+    /// from the world by the Cleanup Phase at end-of-tick. The id then
+    /// becomes permanently invalid (SlotMap generation bumps).
+    Sunk,
 }
 
 /// Default starting silver (pesos) for a freshly-spawned merchant ship.
@@ -327,6 +333,18 @@ impl Ship {
     pub fn anchor(&mut self) {
         self.state = ShipState::Anchored;
         self.speed = 0.0;
+    }
+
+    /// Velocity vector in NM/hr (= knots), derived from current
+    /// `(heading, speed)`. Used by the Resolution Phase to compute
+    /// closest-approach distance between ships over the hour-long tick
+    /// — see `combat::min_distance_over_tick`. Returns `(vx, vy)` in
+    /// the same axes as `position` (x = East, y = North).
+    pub fn velocity(&self) -> (f32, f32) {
+        // heading is degrees CW from North: 0=N, 90=E.
+        // So vx (east) = speed * sin(heading), vy (north) = speed * cos(heading).
+        let h = self.heading.to_radians();
+        (self.speed * h.sin(), self.speed * h.cos())
     }
 
     /// Calculate effective speed: the commanded speed (set by the navigator)

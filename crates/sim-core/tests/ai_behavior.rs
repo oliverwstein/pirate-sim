@@ -28,6 +28,10 @@ fn apply_commands(ship: &mut Ship, commands: &[(ShipId, ShipCommand)]) {
                 // Step 7: combat resolution is the world's job; these
                 // single-ship tests just verify the command was emitted.
             }
+            ShipCommand::AttemptBoard { .. } => {
+                // Step 8: same — boarding resolution lives in the
+                // world. Single-ship tests just confirm the intent.
+            }
         }
     }
 }
@@ -890,6 +894,8 @@ fn pirate_sees_and_pursues_merchant_in_range() {
             max_speed: stats.speed_max,
             // Bigger than a sloop's hold to trip the "richer" branch.
             cargo_capacity_tons: stats.cargo_capacity_tons + 50.0,
+            velocity: (0.0, 0.0),
+            rigging_frac: 1.0,
         },
     );
     // Pirate also in the snapshot (matching the per-tick map shape).
@@ -901,6 +907,8 @@ fn pirate_sees_and_pursues_merchant_in_range() {
             faction: sim_core::port::Faction::Free,
             max_speed: stats.speed_max,
             cargo_capacity_tons: stats.cargo_capacity_tons,
+            velocity: (0.0, 0.0),
+            rigging_frac: 1.0,
         },
     );
     let mut spatial = SpatialHash::new();
@@ -967,6 +975,8 @@ fn merchant_flees_when_pirate_in_range() {
             faction: sim_core::port::Faction::Free,
             max_speed: stats.speed_max,
             cargo_capacity_tons: stats.cargo_capacity_tons,
+            velocity: (0.0, 0.0),
+            rigging_frac: 1.0,
         },
     );
     snapshots.insert(
@@ -977,6 +987,8 @@ fn merchant_flees_when_pirate_in_range() {
             faction: sim_core::port::Faction::England,
             max_speed: stats.speed_max,
             cargo_capacity_tons: stats.cargo_capacity_tons,
+            velocity: (0.0, 0.0),
+            rigging_frac: 1.0,
         },
     );
     let mut spatial = SpatialHash::new();
@@ -1029,6 +1041,8 @@ fn pirate_ignores_other_pirate() {
             faction: sim_core::port::Faction::Free,
             max_speed: stats.speed_max,
             cargo_capacity_tons: stats.cargo_capacity_tons + 100.0,
+            velocity: (0.0, 0.0),
+            rigging_frac: 1.0,
         },
     );
     snapshots.insert(
@@ -1039,6 +1053,8 @@ fn pirate_ignores_other_pirate() {
             faction: sim_core::port::Faction::Free,
             max_speed: stats.speed_max,
             cargo_capacity_tons: stats.cargo_capacity_tons,
+            velocity: (0.0, 0.0),
+            rigging_frac: 1.0,
         },
     );
     let mut spatial = SpatialHash::new();

@@ -387,6 +387,16 @@ pub struct ShipSnapshot {
     /// Cargo hold capacity (tons). Lets a pirate identify richer
     /// prey (bigger merchantmen) without consulting the registry.
     pub cargo_capacity_tons: f32,
+    /// Velocity vector (vx, vy) in NM/hr at the moment of snapshot
+    /// (top of the hourly tick, pre-Steer-this-tick). Used by Step 8
+    /// closest-approach gating for broadside and boarding actions —
+    /// the AI needs to know roughly where the target will be over
+    /// the next hour to know whether a shot is even worth trying.
+    pub velocity: (f32, f32),
+    /// Current rigging integrity, as a fraction of
+    /// `stats.rigging_integrity_max`. Used by Step 8 boarding-gate:
+    /// a target with healthy rigging can outrun grapples.
+    pub rigging_frac: f32,
 }
 
 /// Simple xorshift64 RNG — deterministic and fast.
@@ -397,6 +407,15 @@ fn xorshift64(state: &mut u64) -> u64 {
     x ^= x << 17;
     *state = x;
     x
+}
+
+/// Convert a steering command (heading in degrees CW from N, speed in
+/// knots) to a velocity vector in (East, North) NM/hr. Used by Step 8
+/// closest-approach gating so the AI can predict the next-tick segment
+/// of motion the physics step is about to apply.
+fn velocity_from(heading: f32, speed: f32) -> (f32, f32) {
+    let h = heading.to_radians();
+    (speed * h.sin(), speed * h.cos())
 }
 
 /// Context struct that connects BT leaf nodes to actual ship logic.
@@ -901,7 +920,16 @@ impl<'a> ShipBtContext<'a> {
         let speed = speed_at_heading(heading, self.stats, self.wind);
         self.commands
             .push((self.me, ShipCommand::Steer { heading, speed }));
-        self.maybe_fire_at(target_id, target.position);
+        // Step 7/8: emit broadside + boarding intents using the velocity
+        // we're about to command (so the closest-approach gate sees the
+        // pursuit, not the previous tick's lazier heading). Target
+        // velocity comes from its snapshot at top-of-tick.
+        let attacker_vel = velocity_from(heading, speed);
+        self.maybe_fire_at(target_id, target.position, attacker_vel, target.velocity);
+        // Only pirates board; merchants firing back in act_flee do not.
+        if self.ship.policy == ShipPolicy::Pirate {
+            self.maybe_board(target_id, target.position, attacker_vel, target);
+        }
         Status::Running
     }
 
@@ -975,19 +1003,34 @@ impl<'a> ShipBtContext<'a> {
         // closes inside cannon range. A lucky hit to the chaser's
         // rigging is the textbook way for a slower merchant to break
         // off a pursuit.
-        self.maybe_fire_at(threat_id, threat.position);
+        let attacker_vel = velocity_from(heading, speed);
+        self.maybe_fire_at(threat_id, threat.position, attacker_vel, threat.velocity);
         Status::Running
     }
 
-    /// Step 7: emit a `FireBroadside` if `target` is within
-    /// `combat::CANNON_RANGE_NM` and this ship carries both gunpowder
-    /// and cannon shot. Silently no-ops otherwise — out of supply, out
-    /// of range, or no guns shipped.
-    fn maybe_fire_at(&mut self, target: ShipId, target_pos: crate::types::Position) {
+    /// Step 7: emit a `FireBroadside` if the target's *closest approach*
+    /// over the next tick lies within `combat::CANNON_RANGE_NM` and this
+    /// ship carries both gunpowder and cannon shot. Closest-approach
+    /// rather than end-of-tick distance because at hourly granularity
+    /// two ships closing at 5+ kt can pass through each other's combat
+    /// envelope in a single tick — see `combat::min_distance_over_tick`.
+    /// Silently no-ops otherwise (out of supply, out of range, no guns).
+    fn maybe_fire_at(
+        &mut self,
+        target: ShipId,
+        target_pos: crate::types::Position,
+        attacker_vel: (f32, f32),
+        target_vel: (f32, f32),
+    ) {
         if self.stats.cannons == 0 {
             return;
         }
-        let range = self.ship.position.distance(target_pos);
+        let range = crate::combat::min_distance_over_tick(
+            (self.ship.position.x, self.ship.position.y),
+            attacker_vel,
+            (target_pos.x, target_pos.y),
+            target_vel,
+        );
         if range > crate::combat::CANNON_RANGE_NM {
             return;
         }
@@ -999,6 +1042,40 @@ impl<'a> ShipBtContext<'a> {
         }
         self.commands
             .push((self.me, ShipCommand::FireBroadside { target }));
+    }
+
+    /// Step 8: emit an `AttemptBoard` if the target is within
+    /// `combat::BOARDING_RANGE_NM` at closest approach this tick AND
+    /// its rigging has been beaten below
+    /// `combat::BOARDING_RIGGING_THRESHOLD`. Boarding only resolves
+    /// when the prey can no longer outrun the grapples — otherwise
+    /// the pirate just keeps chasing and shooting.
+    fn maybe_board(
+        &mut self,
+        target: ShipId,
+        target_pos: crate::types::Position,
+        attacker_vel: (f32, f32),
+        target_snap: &ShipSnapshot,
+    ) {
+        // Need a crew aboard to put a boarding party over.
+        if self.ship.crew_alive < 2 {
+            return;
+        }
+        // Target must be crippled enough that we can come alongside.
+        if target_snap.rigging_frac >= crate::combat::BOARDING_RIGGING_THRESHOLD {
+            return;
+        }
+        let range = crate::combat::min_distance_over_tick(
+            (self.ship.position.x, self.ship.position.y),
+            attacker_vel,
+            (target_pos.x, target_pos.y),
+            target_snap.velocity,
+        );
+        if range > crate::combat::BOARDING_RANGE_NM {
+            return;
+        }
+        self.commands
+            .push((self.me, ShipCommand::AttemptBoard { target }));
     }
 
     /// Condition: this pirate ship currently has a viable prey within

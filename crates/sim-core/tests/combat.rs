@@ -166,3 +166,165 @@ fn pirate_without_powder_does_no_damage() {
         "merchant rigging should be untouched when pirate has no powder"
     );
 }
+
+// ── Step 8 integration tests: boarding & sinking ────────────────────────
+
+/// A pirate alongside a dismasted merchant boards her, wins, and either
+/// takes the prize (flipping its policy/faction) or — if it can't spare
+/// the crew — burns her.
+#[test]
+fn pirate_boards_dismasted_merchant_and_takes_prize() {
+    use sim_core::ai::ShipAI;
+    use sim_core::port::Faction;
+    use sim_core::ship::{ShipPolicy, ShipState};
+    use sim_core::types::Position;
+
+    let mut world = fresh_world();
+
+    // Pirate ship-of-the-line-ish: a brig with a big crew so even after
+    // splitting off a prize crew she's still above crew_min.
+    let mut pirate = Ship::seeded_at_port(Position::new(0.0, 0.0), 0, Faction::Free);
+    pirate.policy = ShipPolicy::Pirate;
+    pirate.state = ShipState::Sailing;
+    pirate.nav.docked_at_port = None;
+    pirate.ship_type = sim_core::shiptype::ids::BRIGANTINE;
+    // Refill crew to the brigantine's typical complement.
+    let pirate_stats = world.ship_types.get(pirate.ship_type).stats.clone();
+    pirate.crew_alive = pirate_stats.crew_typical();
+    pirate.morale = 1.0;
+    let pirate_faction = pirate.faction;
+    let pirate_id = world.add_ship(pirate, ShipAI::with_seed(7));
+
+    // Merchant: dismasted to 10% rigging (below the 30% boarding gate),
+    // sitting essentially still 0.02 NM away (well inside the 0.05 NM
+    // boarding range).
+    let mut merchant = Ship::seeded_at_port(Position::new(0.0, 0.02), 1, Faction::England);
+    merchant.policy = ShipPolicy::Merchant;
+    merchant.state = ShipState::Sailing;
+    merchant.nav.docked_at_port = None;
+    merchant.ship_type = sim_core::shiptype::ids::BARK;
+    let merch_stats = world.ship_types.get(merchant.ship_type).stats.clone();
+    merchant.crew_alive = (merch_stats.crew_typical() / 2).max(2); // skeleton crew
+    merchant.rigging_integrity = merch_stats.rigging_integrity_max * 0.1;
+    let merchant_id = world.add_ship(merchant, ShipAI::with_seed(11));
+
+    // One tick should be enough: snapshots include the merchant's low
+    // rigging_frac, pirate's see_prey accepts (slower target), pursue
+    // emits Steer + AttemptBoard, Resolution applies the fight.
+    world.tick();
+
+    let merchant_after = world
+        .ships
+        .get(merchant_id)
+        .expect("merchant should still exist (prize taken, not burned)");
+    assert_eq!(
+        merchant_after.policy,
+        ShipPolicy::Pirate,
+        "captured prize should fly the pirate flag"
+    );
+    assert_eq!(
+        merchant_after.faction, pirate_faction,
+        "captured prize should inherit attacker's faction"
+    );
+    // Defender's morale should have been reset to the prize-crew baseline.
+    assert!(
+        (merchant_after.morale - 0.8).abs() < 1e-3,
+        "prize morale should be set to 0.8, got {}",
+        merchant_after.morale
+    );
+
+    // Attacker should also still exist with reduced crew (transferred
+    // prize crew + casualties).
+    let pirate_after = world
+        .ships
+        .get(pirate_id)
+        .expect("attacker should still exist after winning the boarding");
+    assert!(pirate_after.crew_alive < pirate_stats.crew_typical());
+}
+
+/// A merchant whose hull is hammered to 0 by a broadside is marked Sunk
+/// and removed from the world before the next tick begins.
+#[test]
+fn ship_with_zero_hull_is_reaped_in_cleanup() {
+    use sim_core::ai::ShipAI;
+    use sim_core::port::Faction;
+    use sim_core::ship::{ShipPolicy, ShipState};
+    use sim_core::types::Position;
+
+    let mut world = fresh_world();
+
+    // Pirate at point-blank, plenty of powder, big guns.
+    let mut pirate = Ship::seeded_at_port(Position::new(0.0, 0.0), 0, Faction::Free);
+    pirate.policy = ShipPolicy::Pirate;
+    pirate.state = ShipState::Sailing;
+    pirate.nav.docked_at_port = None;
+    pirate.ship_type = sim_core::shiptype::ids::BRIGANTINE;
+    let pirate_stats = world.ship_types.get(pirate.ship_type).stats.clone();
+    pirate.crew_alive = pirate_stats.crew_typical();
+    pirate.cargo.add(GUNPOWDER, 10.0);
+    pirate.cargo.add(CANNON_SHOT, 10.0);
+    let _ = world.add_ship(pirate, ShipAI::with_seed(7));
+
+    // Merchant pre-damaged to 1 hull point — the next broadside finishes her.
+    let mut merchant = Ship::seeded_at_port(Position::new(0.0, 0.1), 1, Faction::England);
+    merchant.policy = ShipPolicy::Merchant;
+    merchant.state = ShipState::Sailing;
+    merchant.nav.docked_at_port = None;
+    merchant.ship_type = sim_core::shiptype::ids::BARK;
+    merchant.hull_integrity = 1.0;
+    let merchant_id = world.add_ship(merchant, ShipAI::with_seed(11));
+
+    world.tick();
+
+    assert!(
+        world.ships.get(merchant_id).is_none(),
+        "merchant should have been reaped by Cleanup after hull hit 0"
+    );
+}
+
+/// A pirate too thinly crewed to spare a prize crew burns the prize
+/// instead of taking it.
+#[test]
+fn under_crewed_pirate_burns_prize_instead_of_taking_it() {
+    use sim_core::ai::ShipAI;
+    use sim_core::port::Faction;
+    use sim_core::ship::{ShipPolicy, ShipState};
+    use sim_core::types::Position;
+
+    let mut world = fresh_world();
+
+    // Pirate with just enough crew above min to fight, but not enough
+    // to split off a prize crew.
+    let mut pirate = Ship::seeded_at_port(Position::new(0.0, 0.0), 0, Faction::Free);
+    pirate.policy = ShipPolicy::Pirate;
+    pirate.state = ShipState::Sailing;
+    pirate.nav.docked_at_port = None;
+    let pirate_stats = world.ship_types.get(pirate.ship_type).stats.clone();
+    // Just at crew_min — surviving any boarding leaves us below the
+    // split threshold required to crew a prize.
+    pirate.crew_alive = pirate_stats.crew_min();
+    pirate.morale = 1.0;
+    let _ = world.add_ship(pirate, ShipAI::with_seed(7));
+
+    // Tiny defender so the pirate still wins despite the rough match.
+    let mut merchant = Ship::seeded_at_port(Position::new(0.0, 0.02), 1, Faction::England);
+    merchant.policy = ShipPolicy::Merchant;
+    merchant.state = ShipState::Sailing;
+    merchant.nav.docked_at_port = None;
+    merchant.ship_type = sim_core::shiptype::ids::BARK;
+    let merch_stats = world.ship_types.get(merchant.ship_type).stats.clone();
+    merchant.crew_alive = 3;
+    merchant.morale = 0.1; // shaken
+    merchant.rigging_integrity = merch_stats.rigging_integrity_max * 0.1;
+    let merchant_id = world.add_ship(merchant, ShipAI::with_seed(11));
+
+    world.tick();
+
+    // Prize should have been burned (Sunk → reaped). Either it's gone
+    // entirely (Cleanup), or its policy didn't flip to Pirate (lost the
+    // fight). The burn-prize path means it's gone.
+    assert!(
+        world.ships.get(merchant_id).is_none(),
+        "under-crewed pirate should have burned the prize instead of taking it"
+    );
+}

@@ -363,6 +363,10 @@ fn draw_hud(world: &World, camera: &Camera, paused: bool, ticks_per_frame: u32) 
             ShipState::Docked => n_dock += 1,
             ShipState::Anchored => n_anchor += 1,
             ShipState::Hiring => n_dock += 1,
+            // Sunk ships are removed in the Cleanup Phase before viz
+            // sees them; this arm is defensive (e.g., if a future
+            // refactor lets viz peek mid-tick).
+            ShipState::Sunk => {}
         }
         total_silver += ship.silver;
         total_dividends += ship.lifetime_dividends;
@@ -463,6 +467,7 @@ fn draw_ship_panel(world: &World, ship_id: ShipId) {
         }
         ShipState::Anchored => "ANCHORED".to_string(),
         ShipState::Hiring => format!("HIRING (crew {}/{})", ship.crew_alive, stats.crew_typical()),
+        ShipState::Sunk => "SUNK".to_string(),
     };
 
     let prov_pct = (ship.provisions / stats.provision_capacity * 100.0) as i32;

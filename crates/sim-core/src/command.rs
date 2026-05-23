@@ -31,4 +31,17 @@ pub enum ShipCommand {
     /// deducts powder + shot from the attacker's cargo. If the attacker
     /// is out of supply the command is silently dropped.
     FireBroadside { target: ShipId },
+    /// Step 8: attempt to board `target`. Resolved deterministically in
+    /// the Resolution Phase: re-checks that the attacker is within
+    /// `combat::BOARDING_RANGE_NM` of the target at closest approach
+    /// during this tick, and that the target's rigging is damaged
+    /// enough (`< BOARDING_RIGGING_THRESHOLD * rigging_max`) that it
+    /// cannot slip the grapples. On success, computes per-side losses
+    /// via `combat::resolve_boarding`; if the attacker wins it either
+    /// takes the prize (transferring half its crew aboard, flipping
+    /// `target.policy = Pirate` and `target.faction = Free`) or — when
+    /// the prize crew it would have to detach would leave the attacker
+    /// below `stats.crew_min()` — burns the prize instead
+    /// (`target.state = Sunk`). Loser flees if it survives.
+    AttemptBoard { target: ShipId },
 }

@@ -269,6 +269,7 @@ fn main() {
             ShipState::Docked => "docked",
             ShipState::Anchored => "anchored",
             ShipState::Hiring => "hiring",
+            ShipState::Sunk => "sunk",
         };
         let cargo: Vec<String> = ship
             .cargo
@@ -305,6 +306,30 @@ fn main() {
         "Ships built by shipyards: {}  (last_month_avg_profit = {:+.0})",
         world.ships_built, world.last_month_avg_profit
     );
+    // Step 8 diagnostics: counts of active pirates and of ships that
+    // were spawned/built over the run but no longer exist (sunk by
+    // broadside or burned after boarding). The "lost" count is total
+    // ids we ever knew about minus surviving ships.
+    {
+        use sim_core::ship::ShipPolicy;
+        let n_pirate = world
+            .ships
+            .iter()
+            .filter(|(_, s)| s.policy == ShipPolicy::Pirate)
+            .count();
+        let n_navy = world
+            .ships
+            .iter()
+            .filter(|(_, s)| s.policy != ShipPolicy::Pirate && s.policy != ShipPolicy::Merchant)
+            .count();
+        let n_known = ship_ids.len();
+        let n_alive = world.ships.len();
+        let n_lost = n_known.saturating_sub(n_alive);
+        println!(
+            "Combat ledger: {} active pirate(s), {} navy/privateer, {} lost (sunk or burned prize)",
+            n_pirate, n_navy, n_lost,
+        );
+    }
 
     // Sailor pool snapshot (Step 3.a diagnostic). Categories the
     // calibration sweep will watch for collapse/explosion.

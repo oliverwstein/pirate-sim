@@ -51,6 +51,126 @@ pub const POWDER_TONS_PER_GUN: f32 = 0.01;
 /// Tons of cannon shot consumed per gun per broadside.
 pub const SHOT_TONS_PER_GUN: f32 = 0.01;
 
+// ── Step 8: boarding & sinking constants ────────────────────────────────
+
+/// Maximum closest-approach distance during a tick (NM) at which a
+/// boarding action can resolve. ~0.05 NM ≈ 100 yd — grappling hooks
+/// and the boarders' bowsprit can reach across that gap once the
+/// pursuer's longboat has been put over the side. Smaller than
+/// `CANNON_RANGE_NM` because boarding required the ships to physically
+/// be alongside, not merely in pistol-shot.
+pub const BOARDING_RANGE_NM: f32 = 0.05;
+
+/// Target rigging integrity (as a fraction of `rigging_integrity_max`)
+/// below which the prey is considered crippled enough to be boarded:
+/// it can no longer outrun the boarders' grapples. 0.30 means "less
+/// than 30% of original rig" — a half-dismasted hulk.
+pub const BOARDING_RIGGING_THRESHOLD: f32 = 0.30;
+
+/// Effective-force multiplier per unit morale. Fully-content crew
+/// (`morale = 1.0`) fights at `(1 + this)` times their raw count;
+/// shaken crew (`morale = 0`) fights at raw count. Models the
+/// difference between an eager pirate boarding party and a press-
+/// ganged merchantman's defense — see Step 9 morale plumbing.
+pub const BOARDING_MORALE_BONUS: f32 = 0.5;
+
+/// Fraction of the *loser*'s crew killed in a single-tick boarding.
+/// Boarding fights were ferocious and short; survivors typically
+/// surrendered rather than fought to the last man. Calibrated so a
+/// well-matched fight (1:1 force) still leaves ~30% of the smaller
+/// crew alive to be transferred or marooned.
+pub const LOSER_CASUALTY_RATE: f32 = 0.65;
+
+/// Fraction of the *winner*'s crew killed in a single-tick boarding.
+/// Boarders take real losses even when they win — climbing aboard
+/// under fire is the worst place to be on a ship.
+pub const WINNER_CASUALTY_RATE: f32 = 0.20;
+
+/// Fraction of the winning attacker's surviving crew transferred to
+/// the prize as the prize crew (sailing the prize home). The remainder
+/// stays on the attacker's hull. 0.5 keeps the attacker viable while
+/// giving the prize enough hands to make port.
+pub const PRIZE_CREW_SPLIT: f32 = 0.5;
+
+/// Minimum closest approach (NM) between two line segments over a unit
+/// tick. Both ships are modeled as travelling at constant velocity for
+/// the duration of the tick — a good approximation for the 1-hour
+/// hourly tick. Returns the minimum |r(t)| for t ∈ [0, 1], where
+/// `r(t) = (b_pos - a_pos) + (b_vel - a_vel) * t`. Used by the
+/// Resolution Phase to decide whether a broadside or boarding action
+/// actually had a chance to land — end-of-tick positions alone are
+/// too coarse at this granularity (ships moving 5–8 kt can pass
+/// through each other's combat envelope in a single tick).
+pub fn min_distance_over_tick(
+    a_pos: (f32, f32),
+    a_vel: (f32, f32),
+    b_pos: (f32, f32),
+    b_vel: (f32, f32),
+) -> f32 {
+    let rx0 = b_pos.0 - a_pos.0;
+    let ry0 = b_pos.1 - a_pos.1;
+    let dvx = b_vel.0 - a_vel.0;
+    let dvy = b_vel.1 - a_vel.1;
+    let dv2 = dvx * dvx + dvy * dvy;
+    let t_star = if dv2 < 1e-8 {
+        // Parallel motion (or both stationary): distance is constant.
+        0.0
+    } else {
+        let t = -(rx0 * dvx + ry0 * dvy) / dv2;
+        t.clamp(0.0, 1.0)
+    };
+    let rx = rx0 + dvx * t_star;
+    let ry = ry0 + dvy * t_star;
+    (rx * rx + ry * ry).sqrt()
+}
+
+/// Outcome of a deterministic single-tick boarding action.
+///
+/// `attacker_wins` is true iff the attacker's effective force strictly
+/// exceeds the defender's. Ties go to the defender (the home-side
+/// advantage of fighting from your own deck). `attacker_losses` and
+/// `defender_losses` are the number of crew killed on each side and
+/// have been clamped to each side's current `crew_alive` count by the
+/// caller before they're applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BoardingOutcome {
+    pub attacker_wins: bool,
+    pub attacker_losses: u16,
+    pub defender_losses: u16,
+}
+
+/// Resolve a boarding fight in a single tick. Force = `crew * (1 +
+/// BOARDING_MORALE_BONUS * morale)`; the larger force wins. Casualties
+/// are flat fractions of each side's starting crew.
+///
+/// Pure function: takes only the relevant per-ship scalars, returns
+/// the outcome. Callers are responsible for applying the losses, the
+/// prize transfer, and any state-flip side effects.
+pub fn resolve_boarding(
+    attacker_crew: u16,
+    attacker_morale: f32,
+    defender_crew: u16,
+    defender_morale: f32,
+) -> BoardingOutcome {
+    let am = attacker_morale.clamp(0.0, 1.0);
+    let dm = defender_morale.clamp(0.0, 1.0);
+    let a_force = (attacker_crew as f32) * (1.0 + BOARDING_MORALE_BONUS * am);
+    let d_force = (defender_crew as f32) * (1.0 + BOARDING_MORALE_BONUS * dm);
+    let attacker_wins = a_force > d_force;
+    let (a_rate, d_rate) = if attacker_wins {
+        (WINNER_CASUALTY_RATE, LOSER_CASUALTY_RATE)
+    } else {
+        (LOSER_CASUALTY_RATE, WINNER_CASUALTY_RATE)
+    };
+    let attacker_losses = ((attacker_crew as f32) * a_rate).round() as u16;
+    let defender_losses = ((defender_crew as f32) * d_rate).round() as u16;
+    BoardingOutcome {
+        attacker_wins,
+        attacker_losses: attacker_losses.min(attacker_crew),
+        defender_losses: defender_losses.min(defender_crew),
+    }
+}
+
 /// Compute (hull, rigging) damage for a broadside.
 ///
 /// `range_nm` is the slant range from attacker to target. Returns
@@ -117,5 +237,77 @@ mod tests {
         let (p, s) = broadside_supply_cost(24);
         assert!((p - 0.24).abs() < 1e-4);
         assert!((s - 0.24).abs() < 1e-4);
+    }
+
+    #[test]
+    fn min_distance_stationary() {
+        // Both ships still at origin and (3,4) — distance is 5, constant.
+        let d = min_distance_over_tick((0.0, 0.0), (0.0, 0.0), (3.0, 4.0), (0.0, 0.0));
+        assert!((d - 5.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn min_distance_crossing_paths() {
+        // A at (0,0) heading east at 6 kt; B at (3,1) heading west at 6 kt.
+        // They cross at t=0.25h, B at (1.5, 1), A at (1.5, 0) → 1.0 NM.
+        let d = min_distance_over_tick((0.0, 0.0), (6.0, 0.0), (3.0, 1.0), (-6.0, 0.0));
+        assert!((d - 1.0).abs() < 1e-3, "got {}", d);
+    }
+
+    #[test]
+    fn min_distance_passes_close_during_tick() {
+        // Ships 5 NM apart at start; one tick later, A has run past B.
+        // End-of-tick distance is large, but at closest approach they're
+        // alongside — the whole reason we use this helper.
+        // A at (0,0) east at 10 kt; B at (5,0) east at 0 kt.
+        // Relative vel = (-10,0); r0 = (5,0); t* = 0.5; closest = 0.
+        let d = min_distance_over_tick((0.0, 0.0), (10.0, 0.0), (5.0, 0.0), (0.0, 0.0));
+        assert!(d < 1e-3, "expected ~0, got {}", d);
+    }
+
+    #[test]
+    fn min_distance_clamps_to_tick_end() {
+        // Closing trajectories that won't actually meet until t > 1.
+        // A at (0,0) east at 1 kt; B at (10,0) east at 0 kt.
+        // Closest in unconstrained time would be at t=10, beyond tick.
+        // Within [0,1] the minimum is at t=1: distance = 9.
+        let d = min_distance_over_tick((0.0, 0.0), (1.0, 0.0), (10.0, 0.0), (0.0, 0.0));
+        assert!((d - 9.0).abs() < 1e-3, "got {}", d);
+    }
+
+    #[test]
+    fn boarding_larger_force_wins() {
+        let out = resolve_boarding(40, 0.8, 20, 0.5);
+        assert!(out.attacker_wins);
+        // Attacker pays winner rate; defender pays loser rate.
+        assert!(out.attacker_losses < out.defender_losses);
+        // Defender mostly wiped.
+        assert!(out.defender_losses as f32 >= 20.0 * LOSER_CASUALTY_RATE - 0.5);
+    }
+
+    #[test]
+    fn boarding_defender_wins_on_tie() {
+        // Exactly equal force → home-side advantage = defender wins.
+        let out = resolve_boarding(20, 0.5, 20, 0.5);
+        assert!(!out.attacker_wins);
+    }
+
+    #[test]
+    fn boarding_morale_can_flip_outcome() {
+        // Equal crew, but high-morale defender beats low-morale attacker.
+        let out = resolve_boarding(25, 0.1, 25, 1.0);
+        assert!(!out.attacker_wins);
+        // And a high-morale attacker beats a demoralized defender.
+        let out2 = resolve_boarding(25, 1.0, 25, 0.1);
+        assert!(out2.attacker_wins);
+    }
+
+    #[test]
+    fn boarding_losses_clamped_to_crew() {
+        let out = resolve_boarding(2, 0.5, 100, 1.0);
+        assert!(!out.attacker_wins);
+        // Attacker has only 2 crew — losses can't exceed that even at
+        // the loser casualty rate.
+        assert!(out.attacker_losses <= 2);
     }
 }
