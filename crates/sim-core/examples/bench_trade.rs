@@ -109,6 +109,11 @@ fn main() {
         let port_pos = world.ports[idx].position;
         let faction = world.ports[idx].faction;
         let mut ship = Ship::seeded_at_port(port_pos, idx, faction);
+        // Step 7: armed merchantmen — period-correct, even ordinary
+        // traders carried defensive ordnance. 1 t of each lets them
+        // bark back ~12 times before going dry.
+        ship.cargo.add(sim_core::goods::ids::GUNPOWDER, 1.0);
+        ship.cargo.add(sim_core::goods::ids::CANNON_SHOT, 1.0);
         let ai = ShipAI::with_seed(*seed);
         ship.nav.docked_at_port = Some(idx);
         let id = world.add_ship(ship, ai);
@@ -229,7 +234,7 @@ fn main() {
     println!();
     println!("Per-ship P/L after {} days:", sim_days);
     println!(
-        "{:<3}  {:<14}  {:<10}  {:>10}  {:>10}  {:>10}  {:>8}  {:>10}  {:>5}  {:<10}  {:<24}",
+        "{:<3}  {:<14}  {:<10}  {:>10}  {:>10}  {:>10}  {:>8}  {:>10}  {:>5}  {:>6}  {:>6}  {:<10}  {:<24}",
         "#",
         "from",
         "type",
@@ -239,6 +244,8 @@ fn main() {
         "debt",
         "P/L",
         "docks",
+        "hull%",
+        "rig%",
         "state",
         "cargo"
     );
@@ -271,10 +278,21 @@ fn main() {
             .collect();
         let built_tag = if i >= n_ships { " (built)" } else { "" };
         let type_name = &world.ship_types.get(ship.ship_type).name;
+        let stats = &world.ship_types.get(ship.ship_type).stats;
+        let hull_pct = if stats.hull_integrity_max > 0.0 {
+            100.0 * ship.hull_integrity / stats.hull_integrity_max
+        } else {
+            100.0
+        };
+        let rig_pct = if stats.rigging_integrity_max > 0.0 {
+            100.0 * ship.rigging_integrity / stats.rigging_integrity_max
+        } else {
+            100.0
+        };
         println!(
-            "{:<3}  {:<14}  {:<10}  {:>10.0}  {:>10.0}  {:>10.0}  {:>8.0}  {:>+10.0}  {:>5}  {:<10}  {:<24}{}",
+            "{:<3}  {:<14}  {:<10}  {:>10.0}  {:>10.0}  {:>10.0}  {:>8.0}  {:>+10.0}  {:>5}  {:>6.0}  {:>6.0}  {:<10}  {:<24}{}",
             i, origin_names[i], type_name, ship.starting_silver, ship.silver,
-            ship.lifetime_dividends, ship.debt, pl, ship.lifetime_dock_count, state, cargo.join(","), built_tag
+            ship.lifetime_dividends, ship.debt, pl, ship.lifetime_dock_count, hull_pct, rig_pct, state, cargo.join(","), built_tag
         );
     }
     println!();

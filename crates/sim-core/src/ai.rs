@@ -661,19 +661,67 @@ impl<'a> ShipBtContext<'a> {
         if idx >= self.markets.len() {
             return Status::Success;
         }
+        // Step 7: gunner's stores are bookkept separately from the
+        // supercargo's trade hold. Sell only what's *over* the policy-
+        // appropriate magazine target; refill any shortfall after.
+        let (powder_keep, shot_keep) = match self.ship.policy {
+            crate::ship::ShipPolicy::Pirate => (4.0_f32, 4.0_f32),
+            crate::ship::ShipPolicy::Merchant => (1.0_f32, 1.0_f32),
+        };
         let market = &mut self.markets[idx];
         let entries: Vec<(crate::goods::GoodId, f32)> = self.ship.cargo.iter().collect();
         for (gid, tons) in entries {
-            if tons > 0.0 {
+            if tons <= 0.0 {
+                continue;
+            }
+            let sellable = if gid == crate::goods::ids::GUNPOWDER {
+                (tons - powder_keep).max(0.0)
+            } else if gid == crate::goods::ids::CANNON_SHOT {
+                (tons - shot_keep).max(0.0)
+            } else {
+                tons
+            };
+            if sellable > 0.0 {
                 // Best-effort: ignore "port out of silver" by
                 // selling whatever the port can afford. For
                 // v1 we just attempt the full amount; if the
                 // port can't pay, the cargo stays aboard and
                 // we'll try again on the next leg.
-                let _ = market.sell(self.ship, gid, tons, self.goods);
+                let _ = market.sell(self.ship, gid, sellable, self.goods);
             }
         }
+        // Top up any shortfall below the magazine target. Best-effort:
+        // if the port has none in stock or the ship is broke, the
+        // ship sails with whatever it has — combat AI silently skips
+        // firing when the magazine runs dry.
+        self.replenish_ordnance(idx, powder_keep, shot_keep);
         Status::Success
+    }
+
+    /// Step 7: buy gunpowder / cannon shot from the docked market up to
+    /// the per-policy target tonnage. Best-effort: stops at whatever the
+    /// port can supply or the ship can afford. Called from `act_sell_all`
+    /// so re-stocking happens before the trade-pick buy fills the hold.
+    fn replenish_ordnance(&mut self, market_idx: usize, powder_target: f32, shot_target: f32) {
+        let market = &mut self.markets[market_idx];
+        for (good, target) in [
+            (crate::goods::ids::GUNPOWDER, powder_target),
+            (crate::goods::ids::CANNON_SHOT, shot_target),
+        ] {
+            let have = self.ship.cargo.get(good);
+            if have >= target {
+                continue;
+            }
+            let want = target - have;
+            let unit = market.buy_price(good, self.goods).max(0.0001);
+            let affordable = (self.ship.silver / unit).max(0.0);
+            let in_stock = market.stockpile.get(good);
+            let cargo_room = self.stats.cargo_capacity_tons - self.ship.cargo.total_tons();
+            let tons = want.min(affordable).min(in_stock).min(cargo_room).max(0.0);
+            if tons > 0.0 {
+                let _ = market.buy(self.ship, self.stats, good, tons, self.goods);
+            }
+        }
     }
 
     fn act_buy_best(&mut self) -> Status {
@@ -826,6 +874,7 @@ impl<'a> ShipBtContext<'a> {
         let speed = speed_at_heading(heading, self.stats, self.wind);
         self.commands
             .push((self.me, ShipCommand::Steer { heading, speed }));
+        self.maybe_fire_at(target_id, target.position);
         Status::Running
     }
 
@@ -895,10 +944,35 @@ impl<'a> ShipBtContext<'a> {
         let speed = speed_at_heading(heading, self.stats, self.wind);
         self.commands
             .push((self.me, ShipCommand::Steer { heading, speed }));
+        // Step 7: fleeing merchants may still bark back if the pirate
+        // closes inside cannon range. A lucky hit to the chaser's
+        // rigging is the textbook way for a slower merchant to break
+        // off a pursuit.
+        self.maybe_fire_at(threat_id, threat.position);
         Status::Running
     }
 
-    // ───────── Step 6: see_prey / see_threat ─────────
+    /// Step 7: emit a `FireBroadside` if `target` is within
+    /// `combat::CANNON_RANGE_NM` and this ship carries both gunpowder
+    /// and cannon shot. Silently no-ops otherwise — out of supply, out
+    /// of range, or no guns shipped.
+    fn maybe_fire_at(&mut self, target: ShipId, target_pos: crate::types::Position) {
+        if self.stats.cannons == 0 {
+            return;
+        }
+        let range = self.ship.position.distance(target_pos);
+        if range > crate::combat::CANNON_RANGE_NM {
+            return;
+        }
+        let (powder_need, shot_need) = crate::combat::broadside_supply_cost(self.stats.cannons);
+        if self.ship.cargo.get(crate::goods::ids::GUNPOWDER) < powder_need
+            || self.ship.cargo.get(crate::goods::ids::CANNON_SHOT) < shot_need
+        {
+            return;
+        }
+        self.commands
+            .push((self.me, ShipCommand::FireBroadside { target }));
+    }
 
     /// Condition: this pirate ship currently has a viable prey within
     /// detection range (or already-locked prey within breakoff range).

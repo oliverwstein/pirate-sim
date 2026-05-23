@@ -564,7 +564,15 @@ impl PortArchetype {
             // every European archetype produces provisions in addition
             // to manufactures.
             PortArchetype::EuropeanLondon => (
-                &[(MANUFACTURES, 200.0), (PROVISIONS, 100.0)],
+                &[
+                    (MANUFACTURES, 200.0),
+                    (PROVISIONS, 100.0),
+                    // Step 7: Royal powder mills (Faversham, Waltham
+                    // Abbey) and the Tower Foundry. London is the
+                    // dominant English arsenal of the era.
+                    (GUNPOWDER, 8.0),
+                    (CANNON_SHOT, 12.0),
+                ],
                 &[
                     (SUGAR, 200.0),
                     (TOBACCO, 80.0),
@@ -579,6 +587,10 @@ impl PortArchetype {
                     (MANUFACTURES, 120.0),
                     (NAVAL_STORES, 30.0),
                     (PROVISIONS, 80.0),
+                    // Dutch powder works (Muiden) + Swedish iron-shot
+                    // re-exported through the entrepôt of Europe.
+                    (GUNPOWDER, 6.0),
+                    (CANNON_SHOT, 10.0),
                 ],
                 &[
                     (SUGAR, 120.0),
@@ -589,7 +601,15 @@ impl PortArchetype {
                 ],
             ),
             PortArchetype::EuropeanCadiz => (
-                &[(MANUFACTURES, 30.0), (PROVISIONS, 60.0)],
+                &[
+                    (MANUFACTURES, 30.0),
+                    (PROVISIONS, 60.0),
+                    // Royal Spanish arsenal at La Carraca. Smaller
+                    // output than London/Amsterdam but enough to
+                    // victual the treasure fleets with shot.
+                    (GUNPOWDER, 3.0),
+                    (CANNON_SHOT, 5.0),
+                ],
                 &[(SILVER, 1.0), (SUGAR, 40.0), (TOBACCO, 20.0)],
             ),
             PortArchetype::EuropeanNantes => (

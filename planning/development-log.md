@@ -697,3 +697,35 @@ Neither belongs in Nav-1+2+3.
 
 **Caveat:** Step 6 is movement-only — pirates "catch" prey but nothing happens (no combat). Step 7 will add `ShipCommand::FireBroadside` and a damage model.
 
+
+## Step 7 — Gunnery & damage events (2026-05-22)
+
+**Goal:** turn Step 6's pursue/flee chases into actual ship-to-ship combat. Pirates and merchants exchange broadsides when within range; hull and rigging damage accumulate. Sinking, boarding, and morale impact are deferred (Steps 8/9). All damage is deterministic for now — a calibration RNG can layer on in Step 10.
+
+**What landed:**
+- New `combat` module (`crates/sim-core/src/combat.rs`): single damage formula `compute_broadside_damage(cannons, range_nm) → (hull, rig)` with linear falloff from 1.0× at point-blank to 0.3× at `CANNON_RANGE_NM = 0.5 NM` (~1000 yd). Hull base 0.5/gun, rigging base 0.3/gun. Powder & shot cost 0.01 t/gun/broadside.
+- New `ShipCommand::FireBroadside { target }` variant; emitted by `act_pursue` and `act_flee` whenever the target is within `CANNON_RANGE_NM` and the attacker has both `Gunpowder` and `Cannon Shot` in cargo. Resolved in the existing Resolution Phase by reading attacker cannons + position, deducting powder + shot from the attacker, and saturating-down hull/rigging on the target.
+- `ShipStats` gains 3 fields: `cannons`, `hull_integrity_max`, `rigging_integrity_max` (RON-loaded; sloop 8/100/80, brigantine 12/130/100, bark 14/160/120, fluyt 12/180/130, ship 24/400/200).
+- `Ship` gains 2 runtime fields: `hull_integrity`, `rigging_integrity`, init to stats max in both constructors. `Ship::effective_speed` now multiplies by `rigging_integrity / rigging_integrity_max` — knocking out a chaser's rigging is how a slower merchant breaks contact.
+- Two new goods: `Gunpowder` (id 9) and `Cannon Shot` (id 10). Light monthly production at London (8t/12t), Amsterdam (6t/10t), and Cadiz (3t/5t) — period-correct: those were the major Atlantic powder mills and arsenals. No port consumption — only ships in combat burn them.
+- `act_sell_all` now skips the magazine (powder/shot stay aboard across dock visits) and calls `replenish_ordnance` to top up to 4t each for pirates / 1t each for merchants. Built ships pick up their first magazine on the first dock cycle at their home port.
+- Bench `bench_trade.rs`: 2 new columns `hull%` / `rig%`; seed merchants start with 1t+1t. Pirate spawn helper seeds 4t+4t at the haven port.
+- New test file `tests/combat.rs` with 5 integration tests (formula falloff, rigging-speed coupling, supply-cost scaling, end-to-end FireBroadside damage, no-fire-without-supply). Existing `tests/ai_behavior.rs` updated to handle the new `ShipCommand` variant in its test-side resolver.
+
+**Design choices:**
+- **Deterministic damage, no RNG.** Per user preference: "simple version for now, fancier later". A crit/miss roll can layer over the falloff formula in Step 10's calibration pass without touching the wiring.
+- **Both sides fire while in range.** Merchants don't drop their bowls when chased — `act_flee` also pushes FireBroadside. Captures the "armed merchantman" reality of the 1670–1720 Caribbean.
+- **Cannons are a static stat, not a Good (yet).** Promoting cannons to a Good (so ports can build them up over time, ships can rearm at home, captured prizes inherit guns) is a future step. For Step 7 a fixed `stats.cannons` per ship type is the smallest change that makes combat meaningful.
+- **Magazine stays aboard.** `act_sell_all` filters out powder/shot to keep the trade AI from accidentally disarming the ship between dock visits. Pirates top up to 4t/4t (deep magazine because hunting is full-time), merchants to 1t/1t (defensive ration).
+- **`CANNON_RANGE_NM = 0.5`** (≈ 1000 yd). 0.25 NM was the "real" engagement distance in the period, but at 1-hour tick granularity a 0.25-NM window leaves only one tick to fire before the chase resolves; 0.5 NM gives the pursuer 2–3 ticks of actual gunnery. Tunable in Step 10.
+- **Hull and rigging decouple cleanly.** Rigging immediately throttles speed (visible effect), hull is the bookkeeping that Step 8 will turn into sinking thresholds. Both saturate to 0 in Step 7 (a fully shot ship still floats — comes back into play at Step 8).
+
+**Verification:**
+- `cargo fmt`, `cargo clippy --workspace --all-targets -- -D warnings`: clean.
+- `cargo test --workspace`: **130 pass** (was 119; +6 combat unit tests + 5 combat integration tests). Existing `ai_behavior` tests untouched.
+- `bench_trade -- 365`: **+1,999,209** fleet P/L (vs Step 6 baseline +1,339,944), 3 bankrupt (was 3). Combat visible in per-ship table: ship 13 (Boston-built bark) hammered to **0% hull / 0% rig** by the Tortuga & Petit-Goâve pirates — still floats (Step 7 design: no sinking yet), but now creeps along under shredded canvas. Petit-Goâve sloop holds full 4t/4t magazine (resupplied each dock cycle); Tortuga sloop ran out and is back on trade behavior. Fleet P/L jump comes partly from new powder/shot trade flows and partly from merchants making more round-trips with armed ordnance reducing pirate effective harvest.
+
+**Caveat / known follow-ups:**
+- A hulled ship at 0% integrity is a zombie until Step 8 lands sinking + wreck removal.
+- Built ships start unarmed and only acquire ordnance on the first dock cycle at their home European port — first-voyage outbound run is undefended. Acceptable for Step 7; Step 8/9 will tie magazine outfitting to the shipyard build phase.
+- The damage scalars (0.5/0.3/gun, 0.5 NM range, 0.01 t/gun) are sketches. Step 10's calibration sweep will tune them against equilibrium pirate/merchant attrition rates.

@@ -24,6 +24,10 @@ fn apply_commands(ship: &mut Ship, commands: &[(ShipId, ShipCommand)]) {
     for (_id, cmd) in commands {
         match cmd {
             ShipCommand::Steer { heading, speed } => ship.set_steering(*heading, *speed),
+            ShipCommand::FireBroadside { .. } => {
+                // Step 7: combat resolution is the world's job; these
+                // single-ship tests just verify the command was emitted.
+            }
         }
     }
 }
@@ -907,10 +911,16 @@ fn pirate_sees_and_pursues_merchant_in_range() {
         "act_pursue should have emitted a Steer command"
     );
     // Heading roughly north (0°) since merchant is due north.
-    let ShipCommand::Steer { heading, .. } = cmds[0].1;
+    let steer = cmds
+        .iter()
+        .find_map(|(_id, c)| match c {
+            ShipCommand::Steer { heading, .. } => Some(*heading),
+            _ => None,
+        })
+        .expect("act_pursue should emit a Steer command");
     assert!(
-        (heading.abs() < 5.0) || ((heading - 360.0).abs() < 5.0),
-        "pirate should steer ~north toward merchant, got {heading}"
+        (steer.abs() < 5.0) || ((steer - 360.0).abs() < 5.0),
+        "pirate should steer ~north toward merchant, got {steer}"
     );
 }
 

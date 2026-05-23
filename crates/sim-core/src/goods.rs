@@ -149,6 +149,12 @@ pub mod ids {
     pub const NAVAL_STORES: GoodId = GoodId(6);
     pub const SILVER: GoodId = GoodId(7);
     pub const ENSLAVED_PERSONS: GoodId = GoodId(8);
+    /// Step 7: gunpowder, consumed by ships per broadside. Produced
+    /// at European powder mills (London, Amsterdam, Cadiz).
+    pub const GUNPOWDER: GoodId = GoodId(9);
+    /// Step 7: cast-iron cannon shot, consumed alongside gunpowder.
+    /// Produced at the same European arsenals.
+    pub const CANNON_SHOT: GoodId = GoodId(10);
 }
 
 #[cfg(test)]
@@ -156,9 +162,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn starter_has_nine_goods() {
+    fn starter_has_eleven_goods() {
         let registry = GoodsRegistry::starter();
-        assert_eq!(registry.len(), 9);
+        assert_eq!(registry.len(), 11);
     }
 
     #[test]

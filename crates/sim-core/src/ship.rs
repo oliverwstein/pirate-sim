@@ -14,6 +14,17 @@ pub struct ShipStats {
     pub crew: u32,                // crew complement (determines provision consumption)
     pub provision_capacity: f32,  // max tons of provisions (separate from trade hold)
     pub cargo_capacity_tons: f32, // max tons of trade cargo
+    /// Step 7: number of broadside-firing cannons (one broadside fires
+    /// `cannons` guns per tick when in range and supplied). Static per
+    /// ship type for now; a later step may promote cannons to a Good.
+    pub cannons: u16,
+    /// Step 7: maximum hull integrity (HP). Damage saturates at 0; for
+    /// Step 7 a hulled ship stays afloat (sinking lands in Step 8).
+    pub hull_integrity_max: f32,
+    /// Step 7: maximum rigging integrity. Effective speed scales with
+    /// `rigging_integrity / rigging_integrity_max` — knocking a chaser's
+    /// rigging down is how a slower merchant can break contact.
+    pub rigging_integrity_max: f32,
 }
 
 impl ShipStats {
@@ -26,6 +37,9 @@ impl ShipStats {
             crew: 25,
             provision_capacity: 6.0, // ~130 days of food for 25 crew — historical 17C ocean-going ships carried 3–4 months of provisions for transatlantic crossings
             cargo_capacity_tons: 60.0, // typical sloop trade hold (Phase 2 starter)
+            cannons: 8,
+            hull_integrity_max: 100.0,
+            rigging_integrity_max: 80.0,
         }
     }
 
@@ -182,6 +196,15 @@ pub struct Ship {
     /// `ShipAI` in Step 5.b because a careen in progress is a property
     /// of the hull (paint scraped, ship beached), not the captain.
     pub dock_action: DockAction,
+    /// Step 7: current hull integrity in `[0, stats.hull_integrity_max]`.
+    /// Decremented by broadside hits in the Resolution Phase. A hulled
+    /// ship still floats and still fights for Step 7; sinking thresholds
+    /// arrive with Step 8 (boarding & sinking).
+    pub hull_integrity: f32,
+    /// Step 7: current rigging integrity. Multiplies `effective_speed`
+    /// by `rigging_integrity / stats.rigging_integrity_max` — a fully-
+    /// dismasted ship is dead in the water and easy prize for boarders.
+    pub rigging_integrity: f32,
 }
 
 /// What the ship is doing while docked. Used by the docking sequence in
@@ -220,6 +243,8 @@ impl Ship {
             policy: ShipPolicy::Merchant,
             nav: NavTrack::new(),
             dock_action: DockAction::Idle,
+            hull_integrity: stats.hull_integrity_max,
+            rigging_integrity: stats.rigging_integrity_max,
         }
     }
 
@@ -272,6 +297,8 @@ impl Ship {
             policy: ShipPolicy::Merchant,
             nav: NavTrack::new(),
             dock_action: DockAction::Idle,
+            hull_integrity: stats.hull_integrity_max,
+            rigging_integrity: stats.rigging_integrity_max,
         }
     }
 
@@ -315,7 +342,14 @@ impl Ship {
         // Above 0.4 = no effect; below 0.25 the ship is heading for
         // mutiny (Step 9) but for now still moves at the sullen rate.
         let morale_mult = if self.morale >= 0.4 { 1.0 } else { 0.8 };
-        self.speed * fouling_penalty * crew_mult * morale_mult
+        // Step 7: rigging damage proportionally caps speed. A ship with
+        // half its rigging shot away makes half its rigged speed.
+        let rigging_mult = if stats.rigging_integrity_max > 0.0 {
+            (self.rigging_integrity / stats.rigging_integrity_max).clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        self.speed * fouling_penalty * crew_mult * morale_mult * rigging_mult
     }
 
     /// Advance position by one time step. Returns new position (doesn't apply it).

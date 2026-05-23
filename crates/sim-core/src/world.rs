@@ -156,6 +156,12 @@ impl World {
         let mut ship = Ship::seeded_at_port(port_pos, idx, crate::port::Faction::Free);
         ship.policy = ShipPolicy::Pirate;
         ship.nav.docked_at_port = Some(idx);
+        // Step 7: seed pirates with magazine + shot locker so they can
+        // actually fire when they catch prey. 4 t each is enough for
+        // ~50 broadsides from an 8-gun sloop — plenty for Step 7's
+        // bench window, and a clean signal that combat is wired.
+        ship.cargo.add(crate::goods::ids::GUNPOWDER, 4.0);
+        ship.cargo.add(crate::goods::ids::CANNON_SHOT, 4.0);
         let ai = ShipAI::with_seed(seed);
         Some(self.add_ship(ship, ai))
     }
@@ -463,6 +469,60 @@ impl World {
                     crate::command::ShipCommand::Steer { heading, speed } => {
                         if let Some(target_ship) = self.ships.get_mut(target) {
                             target_ship.set_steering(heading, speed);
+                        }
+                    }
+                    // Step 7: single broadside, deterministic damage.
+                    // Attacker is the currently-ticking ship (`id`),
+                    // target is the FireBroadside payload. We've already
+                    // re-validated supply + range in the AI step, but
+                    // re-check here because either ship could have been
+                    // mutated by an earlier command in this drain (and
+                    // for defensive symmetry with future steps).
+                    crate::command::ShipCommand::FireBroadside { target: tgt } => {
+                        let attacker_id = id;
+                        let (cannons, attacker_pos) = match self.ships.get(attacker_id) {
+                            Some(a) => (self.ship_types.get(a.ship_type).stats.cannons, a.position),
+                            None => continue,
+                        };
+                        if cannons == 0 {
+                            continue;
+                        }
+                        let target_pos = match self.ships.get(tgt) {
+                            Some(t) => t.position,
+                            None => continue,
+                        };
+                        let range = attacker_pos.distance(target_pos);
+                        if range > crate::combat::CANNON_RANGE_NM {
+                            continue;
+                        }
+                        let (powder_need, shot_need) =
+                            crate::combat::broadside_supply_cost(cannons);
+                        // Deduct supply from attacker; if either good
+                        // is short, drop the command silently.
+                        let fired = match self.ships.get_mut(attacker_id) {
+                            Some(a) => {
+                                let have_p = a.cargo.get(crate::goods::ids::GUNPOWDER);
+                                let have_s = a.cargo.get(crate::goods::ids::CANNON_SHOT);
+                                if have_p < powder_need || have_s < shot_need {
+                                    false
+                                } else {
+                                    a.cargo.remove(crate::goods::ids::GUNPOWDER, powder_need);
+                                    a.cargo.remove(crate::goods::ids::CANNON_SHOT, shot_need);
+                                    true
+                                }
+                            }
+                            None => false,
+                        };
+                        if !fired {
+                            continue;
+                        }
+                        let (hull_dmg, rig_dmg) =
+                            crate::combat::compute_broadside_damage(cannons, range);
+                        if let Some(target_ship) = self.ships.get_mut(tgt) {
+                            target_ship.hull_integrity =
+                                (target_ship.hull_integrity - hull_dmg).max(0.0);
+                            target_ship.rigging_integrity =
+                                (target_ship.rigging_integrity - rig_dmg).max(0.0);
                         }
                     }
                 }
