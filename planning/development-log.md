@@ -943,3 +943,71 @@ The same bench seed (`0xCAFE_1680` for fleet seeding, hardcoded constant for haz
 - `roll_hazards` doesn't yet know about combat-state: ships fleeing under all sail in heavy weather should have *higher* storm risk. Worth wiring in after Step 11.
 - Fire rate doesn't yet scale with magazine load. The infrastructure is there (`ship.magazine_powder`); plug in when calibration calls for it.
 - AI doesn't currently care about `teredo_damage` — careening is triggered by fouling alone. A captain who's never put in for a careen will quietly accumulate teredo until the foundering roll catches up. That's behaviorally accurate but means the AI is leaving free survival on the table.
+
+
+---
+
+## Step 11 — Prize handling rework + stochastic mutiny (`1ba214e`)
+
+### Context
+
+The 5-year bench after Step 10 surfaced a glaring problem: 256 pirates afloat at year 5 (60% of the active fleet), with 236 mutinies fueling almost all of the growth (captures: 0). Two structural defects were producing it.
+
+1. **Every successful boarding flipped the prize to Pirate** (or burned it if the attacker couldn't spare crew). Historically pirates rarely kept prizes — they were after cargo and quick cash, not more hulls to maintain.
+2. **The mutiny trigger was deterministic**: any Merchant at sea with debt > 1.5× MAX_SHIP_DEBT and morale < 0.25 flipped *on the first tick* conditions held. Historically (Rediker, Earle) mutinies were rare and took weeks of conspiring; the Golden Age saw maybe 1-2 significant mutinies per year basin-wide, not the 47/yr the bench was producing.
+
+### Step 11.a — prize handling
+
+Successful boardings now draw a weighted outcome from a deterministic per-world combat RNG (xorshift64, seeded at load):
+
+| outcome | weight | effect |
+|---|---|---|
+| `take` | 5% | flip to Pirate (only if target hull > attacker × 1.2 AND attacker can spare a prize crew) |
+| `sell` | 30% | cargo + hull bounty banked, prize sunk |
+| `sink` | 50% | cargo stripped, hull dispatched |
+| `release` | 15% | cargo stripped, target sails on with empty holds |
+
+Cargo and 90% of silver are stripped on every non-`take` outcome. The world now tracks four counters (`prizes_taken/sold/sunk/released`) printed by the bench.
+
+The size-gate is important: a 60-ton sloop pirate is not going to crew up a 200-ton fluyt as a prize even if the dice fall right. Without that, "take" became the universal outcome again for big targets.
+
+### Step 11.b — stochastic mutiny
+
+Two changes to `try_mutiny`:
+
+- Threshold raised from 1.5× to **3× MAX_SHIP_DEBT** (5000 → 15000). With the chandler debt cap at MAX_SHIP_DEBT (=5000), the only way to reach the new threshold is also to carry ~10k pesos in unpaid wages — about a year of crew payroll. This filters out "annoyed" crews and keeps only "ruined and starving" crews.
+- Per-hour roll: when all conditions hold, the crew flips with `p = 0.0002/hour`. A ship stuck in the mutiny zone for a full year has ~83% odds of flipping, but a typical 1-2 week distress window only fires 3-7% of the time. This models the "weeks of grumbling before the conspiracy fires" dynamic.
+
+`try_mutiny` now takes a uniform sample as a parameter; the world calls it with `combat_rng_step(&mut self.combat_rng_state)` so the result is deterministic across runs but no longer a step function.
+
+### Bench results (1825 d, ~500-ship Caribbean)
+
+```
+Combat ledger:  35 pirate(s) afloat (24 seeded + 0 captured + 13 mutinied), 60 lost
+Prize outcomes: 0 taken, 1 sold, 1 sunk, 1 released
+Attrition:      26 storm sinkings (39 damage-only), 33 foundered, 8 fires (5 sunk)
+```
+
+| metric | pre-Step-11 | post-Step-11 |
+|---|---:|---:|
+| pirates afloat @ 5yr | 256 | **35** |
+| mutinies (5yr total) | 236 | **13** (2.6/yr) |
+| captures | 0 | 0 |
+| non-combat attrition rate | 2.2%/yr | 2.2%/yr (unchanged) |
+| bankrupt ships | 55 | 86 |
+
+The bankruptcy bump is the expected counterpart to the mutiny drop: ships that previously flipped to Pirate (and zeroed their books) now stay merchants and accumulate debt until they're written off. Same population of distressed hulls, different label.
+
+### Observations
+
+- Boardings remain rare in this bench (3 in 5 years). With the new outcome split that's *no* additional pirates from captures over the whole run — meaning the only growth path for the pirate fleet is mutiny, and we now have a sane mutiny rate. The fleet is stable around the seeded baseline.
+- Captures will become more important once we add (i) navy patrols (Phase 4), which actually find pirates and force boardings, and (ii) intercept BTs that drive pirates toward known merchant lanes.
+- The 5-year structural issues that aren't pirate-related — Tobacco chronic deficit (−564 t/yr), Cadiz Manufactures hoarding (9467% over LP equilibrium) — are still there. Those are LP/production calibration problems, not piracy problems.
+
+### Test updates
+
+- `pirate_boards_dismasted_merchant_and_takes_prize` → `..._and_resolves_prize`: now asserts the invariants that hold regardless of which weighted outcome the RNG picks (some prize counter incremented; cargo stripped; defender either gone, released-as-merchant, or flag-flipped).
+- `under_crewed_pirate_burns_prize_instead_of_taking_it` → `..._cannot_take_prize`: under-crewed attackers can't satisfy the `can_spare_crew` gate, so the `take` outcome is unreachable for them; the test pins that invariant.
+- Added `mutiny_skips_when_roll_above_probability`: with all deterministic conditions met but a roll just above the probability gate, no flip occurs.
+
+158 tests pass.
