@@ -825,14 +825,41 @@ impl<'a> ShipBtContext<'a> {
     }
 
     fn act_divert_to_port(&mut self) -> Status {
-        if let Some((nearest_idx, _)) = self.ports.iter().enumerate().min_by(|(_, a), (_, b)| {
-            let da = self.estimated_position().distance(a.position);
-            let db = self.estimated_position().distance(b.position);
-            da.partial_cmp(&db).unwrap()
-        }) {
+        // Pick the nearest port that actually has provisions to sell.
+        // Without the stockpile filter, a low-provisions ship would
+        // dock-loop at the closest sugar island whose chandler ran
+        // dry weeks ago: resupply returns Success without filling,
+        // ship undocks still hungry, this branch reselects the same
+        // dry port, and we ping-pong forever. Skipping dry ports lets
+        // the ship instead keep its original course toward a real
+        // resupply port (or, if every port within range is dry, push
+        // on toward the trade destination and fail gracefully).
+        let provisions = crate::goods::ids::PROVISIONS;
+        let nearest = self
+            .ports
+            .iter()
+            .enumerate()
+            .filter(|(idx, _)| {
+                self.markets
+                    .get(*idx)
+                    .map(|m| m.stockpile.get(provisions) > 0.5)
+                    .unwrap_or(false)
+            })
+            .min_by(|(_, a), (_, b)| {
+                let da = self.estimated_position().distance(a.position);
+                let db = self.estimated_position().distance(b.position);
+                da.partial_cmp(&db).unwrap()
+            })
+            .map(|(idx, _)| idx);
+        if let Some(nearest_idx) = nearest {
             self.assign_destination_port(nearest_idx);
+            Status::Success
+        } else {
+            // Every reachable port is out of provisions; let the BT
+            // fall through to the regular sail-to-destination branch
+            // instead of looping back to the same dry harbor.
+            Status::Failure
         }
-        Status::Success
     }
 
     // ───────── Step 6: pursue / flee ─────────

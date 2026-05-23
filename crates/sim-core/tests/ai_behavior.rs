@@ -569,7 +569,25 @@ fn low_provisions_diverts_to_nearest_port() {
     ship.provisions = 0.15; // ~3.3 days at 25 crew — below 4-day threshold
     let mut ai = ShipAI::with_destination(Position { x: 500.0, y: 0.0 });
 
-    tick_ai(&mut ai, &mut ship, &stats, &wind, &ports);
+    // Seed NearPort with provisions so the divert-stockpile filter
+    // accepts it; FarPort stays dry so it can't be the chosen divert.
+    let goods = GoodsRegistry::starter();
+    let mut markets: Vec<PortMarket> = vec![
+        PortMarket::with_initial_stockpile(&goods),
+        PortMarket::with_initial_stockpile(&goods),
+    ];
+    markets[1]
+        .stockpile
+        .remove(sim_core::goods::ids::PROVISIONS, 1_000_000.0);
+    tick_ai_with_markets(
+        &mut ai,
+        &mut ship,
+        &stats,
+        &wind,
+        &ports,
+        &mut markets,
+        &goods,
+    );
 
     // Should have diverted to nearest port (NearPort at 50,0)
     assert_eq!(
