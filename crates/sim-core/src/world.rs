@@ -171,6 +171,113 @@ impl World {
         Some(self.add_ship(ship, ai))
     }
 
+    /// Step 10: seed a historically-scaled starter fleet across every
+    /// port in the world. Per `planning/research/atlantic-fleet-numbers-1650-1720`
+    /// the Caribbean basin held ~400–800 active hulls c. 1680; with
+    /// 38 ports this method targets ~480 ships. Counts and type mixes
+    /// scale by `PortCategory`:
+    ///
+    /// | Category          | Ships per port | Type mix                                              |
+    /// |-------------------|----------------|-------------------------------------------------------|
+    /// | EuropeanHub       | 30             | 30% ship, 40% fluyt, 20% brigantine, 10% bark        |
+    /// | CaribbeanEntrepot | 25             | 15% ship, 25% fluyt, 30% brigantine, 30% sloop       |
+    /// | SmallColonial     | 8              | 50% sloop, 30% brigantine, 20% bark                  |
+    /// | PirateHaven       | 6              | 100% sloop (Pirate policy, extra powder)             |
+    ///
+    /// All ships start `Docked` at their home port with full crew,
+    /// full provisions, and a defensive powder+shot loadout. RNG is
+    /// deterministic in `base_seed + port_idx` so the same call
+    /// produces the same fleet across runs. Returns the spawned
+    /// ShipIds in spawn order.
+    pub fn seed_historical_fleet(&mut self, base_seed: u64) -> Vec<ShipId> {
+        use crate::pop::PortCategory;
+        use crate::shiptype::ids as st;
+        let mut ids = Vec::new();
+        let n_ports = self.ports.len();
+        for port_idx in 0..n_ports {
+            let category = self.ports[port_idx].category;
+            let faction = self.ports[port_idx].faction;
+            let port_pos = self.ports[port_idx].position;
+            let port_seed = base_seed
+                .wrapping_add(port_idx as u64)
+                .wrapping_mul(2654435761);
+
+            let (count, mix): (usize, &[(crate::shiptype::ShipTypeId, u32)]) = match category {
+                PortCategory::EuropeanHub => (
+                    30,
+                    &[
+                        (st::SHIP, 30),
+                        (st::FLUYT, 40),
+                        (st::BRIGANTINE, 20),
+                        (st::BARK, 10),
+                    ],
+                ),
+                PortCategory::CaribbeanEntrepot => (
+                    25,
+                    &[
+                        (st::SHIP, 15),
+                        (st::FLUYT, 25),
+                        (st::BRIGANTINE, 30),
+                        (st::SLOOP, 30),
+                    ],
+                ),
+                PortCategory::SmallColonial => {
+                    (8, &[(st::SLOOP, 50), (st::BRIGANTINE, 30), (st::BARK, 20)])
+                }
+                PortCategory::PirateHaven => (6, &[(st::SLOOP, 100)]),
+            };
+            let weight_total: u32 = mix.iter().map(|(_, w)| *w).sum();
+
+            for k in 0..count {
+                let mut s = port_seed.wrapping_add((k as u64).wrapping_mul(1442695040888963407));
+                // Pick a type from the weighted mix.
+                let pick = (s % weight_total as u64) as u32;
+                s ^= s >> 17;
+                let mut acc = 0u32;
+                let mut chosen = mix[0].0;
+                for (ty, w) in mix {
+                    acc += *w;
+                    if pick < acc {
+                        chosen = *ty;
+                        break;
+                    }
+                }
+                let stats = self.ship_types.get(chosen).stats.clone();
+                // Starting silver: roughly enough to buy a hold's worth
+                // of cheap cargo. The shipyard sizing uses ~30 pesos/ton
+                // of capacity; we use a slightly leaner factor here so
+                // seeded fleets don't drown the simulation in cash.
+                let starting_silver = (stats.cargo_capacity_tons * 25.0).max(1500.0);
+                let mut ship = Ship::seeded_at_port_typed(
+                    port_pos,
+                    port_idx,
+                    faction,
+                    chosen,
+                    &stats,
+                    starting_silver,
+                );
+                ship.nav.docked_at_port = Some(port_idx);
+                // Defensive armament — even ordinary merchants carried
+                // a few guns. Pirates get a heavier magazine.
+                let (powder, shot) = if category == PortCategory::PirateHaven {
+                    ship.policy = ShipPolicy::Pirate;
+                    // Pirate sloops fly their own colors irrespective
+                    // of the host haven's nominal flag.
+                    ship.faction = crate::port::Faction::Free;
+                    (4.0, 4.0)
+                } else {
+                    (1.0, 1.0)
+                };
+                ship.cargo.add(crate::goods::ids::GUNPOWDER, powder);
+                ship.cargo.add(crate::goods::ids::CANNON_SHOT, shot);
+                let ai_seed = s.wrapping_add(0xdeadbeef);
+                let ai = ShipAI::with_seed(ai_seed);
+                ids.push(self.add_ship(ship, ai));
+            }
+        }
+        ids
+    }
+
     /// Advance the simulation by one hour.
     /// Advance the simulation by one hour. Dispatches to per-cadence
     /// helpers; see `tick_monthly`, `tick_daily_hiring`, and

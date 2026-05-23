@@ -16,11 +16,10 @@
 //!   cargo run --release --example bench_trade -- 365     # 1-year sweep
 //!   cargo run --release --example bench_trade -- 730     # 2-year sweep
 
-use sim_core::ai::ShipAI;
 use sim_core::equilibrium::{self, EquilibriumScenario, FreightCostModel, PortSpec};
 use sim_core::goods::{ids, GoodId};
 use sim_core::market::archetype_for;
-use sim_core::ship::{Ship, ShipState, ShipStats};
+use sim_core::ship::ShipStats;
 use sim_core::types::ShipId;
 use sim_core::world::World;
 use std::collections::BTreeMap;
@@ -86,58 +85,25 @@ fn main() {
 
     let mut world = World::load(Path::new("data/"));
 
-    // Starter fleet: 5 ships seeded across the map.
-    let starts: &[(&str, u64)] = &[
-        ("Bridgetown", 7),
-        ("Port Royal", 13),
-        ("Boston", 21),
-        ("Charleston", 33),
-        ("Cartagena", 41),
-        ("Havana", 53),
-        ("Fort-Royal", 67),
-        ("London", 79),
-        ("Amsterdam", 89),
-        ("Nantes", 97),
-    ];
-    let mut origin_names: Vec<String> = Vec::new();
-    let mut ship_ids: Vec<ShipId> = Vec::new();
-    for (name, seed) in starts {
-        let Some(idx) = world.ports.iter().position(|p| p.name == *name) else {
-            println!("(skip) port {} not found", name);
-            continue;
-        };
-        let port_pos = world.ports[idx].position;
-        let faction = world.ports[idx].faction;
-        let mut ship = Ship::seeded_at_port(port_pos, idx, faction);
-        // Step 7: armed merchantmen — period-correct, even ordinary
-        // traders carried defensive ordnance. 1 t of each lets them
-        // bark back ~12 times before going dry.
-        ship.cargo.add(sim_core::goods::ids::GUNPOWDER, 1.0);
-        ship.cargo.add(sim_core::goods::ids::CANNON_SHOT, 1.0);
-        let ai = ShipAI::with_seed(*seed);
-        ship.nav.docked_at_port = Some(idx);
-        let id = world.add_ship(ship, ai);
-        origin_names.push((*name).to_string());
-        ship_ids.push(id);
-    }
-
-    // Step 6: three pirate sloops berthed at the major Caribbean
-    // pirate havens. Tortuga and Petit-Goâve sit at the western tip
-    // of Hispaniola (Île à Vache is Petit-Goâve's working anchorage);
-    // Nassau (New Providence) is the Bahamas haven that becomes the
-    // hub of the Republic of Pirates after 1700. Ship ids and origins
-    // are tracked alongside the merchant fleet so the bench can
-    // identify them in the per-ship table.
-    let pirate_starts: &[(&str, u64)] =
-        &[("Tortuga", 1009), ("Petit-Goâve", 1031), ("Nassau", 1051)];
-    for (name, seed) in pirate_starts {
-        if let Some(id) = world.spawn_pirate_sloop_at(name, *seed) {
-            origin_names.push((*name).to_string());
-            ship_ids.push(id);
-        } else {
-            println!("(skip) pirate port {} not found", name);
-        }
-    }
+    // Step 10: seed a historically-scaled starter fleet (~480 ships
+    // across all 38 ports — see `planning/research/atlantic-fleet-
+    // numbers-1650-1720.md`). Replaces the hand-picked 10-merchant +
+    // 3-pirate starter from Steps 6–9; that fleet was 1–2 orders of
+    // magnitude under the historical baseline of ~400–800 active
+    // hulls in the Caribbean basin c. 1680.
+    let ship_ids: Vec<ShipId> = world.seed_historical_fleet(0xCAFE_1680);
+    let mut ship_ids = ship_ids;
+    let mut origin_names: Vec<String> = ship_ids
+        .iter()
+        .map(|&id| {
+            let port_idx = world.ships[id].owner_port.unwrap_or(0);
+            world.ports[port_idx].name.clone()
+        })
+        .collect();
+    let n_seeded_pirates = ship_ids
+        .iter()
+        .filter(|&&id| world.ships[id].policy == sim_core::ship::ShipPolicy::Pirate)
+        .count();
 
     let n_ships = world.ships.len();
     println!("Calibration run: {} days, {} ships", sim_days, n_ships);
@@ -232,57 +198,37 @@ fn main() {
     }
 
     println!();
-    println!("Per-ship P/L after {} days:", sim_days);
-    println!(
-        "{:<3}  {:<14}  {:<10}  {:>10}  {:>10}  {:>10}  {:>8}  {:>10}  {:>5}  {:>6}  {:>6}  {:<10}  {:<24}",
-        "#",
-        "from",
-        "type",
-        "silver_in",
-        "silver_out",
-        "dividends",
-        "debt",
-        "P/L",
-        "docks",
-        "hull%",
-        "rig%",
-        "state",
-        "cargo"
-    );
+    println!("Fleet aggregate after {} days:", sim_days);
     let mut total_pl = 0.0f32;
     let mut total_debt = 0.0f32;
     let mut bankrupt = 0;
-    for (i, &id) in ship_ids.iter().enumerate() {
-        let ship = &world.ships[id];
-        // True lifetime P/L includes dividends paid back to the
-        // owner port (which may have settled silver out of the
-        // strongbox) and subtracts any outstanding chandler/freight
-        // debt the captain still owes the merchant network.
+    // Aggregate by (faction, ship-type) → (count, total_pl, total_debt,
+    // total_hull_pct, total_rig_pct, sailing/docked/anchored/hiring/sunk).
+    use sim_core::port::Faction;
+    use sim_core::ship::ShipPolicy;
+    #[derive(Default)]
+    struct Bucket {
+        n: u32,
+        pl: f32,
+        debt: f32,
+        hull_pct: f32,
+        rig_pct: f32,
+        n_pirate: u32,
+        n_bankrupt: u32,
+    }
+    let mut buckets: BTreeMap<(String, String), Bucket> = BTreeMap::new();
+    let mut top: Vec<(i64, ShipId)> = Vec::new();
+    for &id in &ship_ids {
+        let Some(ship) = world.ships.get(id) else {
+            continue;
+        };
         let pl = (ship.silver - ship.starting_silver) + ship.lifetime_dividends - ship.debt;
         total_pl += pl;
         total_debt += ship.debt;
-        if ship.silver < 50.0 && ship.lifetime_dividends < 1.0 {
+        let is_bankrupt = ship.silver < 50.0 && ship.lifetime_dividends < 1.0;
+        if is_bankrupt {
             bankrupt += 1;
         }
-        let state = match ship.state {
-            ShipState::Sailing => "sailing",
-            ShipState::Docked => "docked",
-            ShipState::Anchored => "anchored",
-            ShipState::Hiring => "hiring",
-            ShipState::Sunk => "sunk",
-        };
-        let cargo: Vec<String> = ship
-            .cargo
-            .iter()
-            .filter(|(_, t)| *t > 0.01)
-            .map(|(id, t)| format!("{}:{:.1}", world.goods.get(id).name, t))
-            .collect();
-        let built_tag = if i >= n_ships { " (built)" } else { "" };
-        let policy_tag = match ship.policy {
-            sim_core::ship::ShipPolicy::Pirate => " [PIRATE]",
-            _ => "",
-        };
-        let type_name = &world.ship_types.get(ship.ship_type).name;
         let stats = &world.ship_types.get(ship.ship_type).stats;
         let hull_pct = if stats.hull_integrity_max > 0.0 {
             100.0 * ship.hull_integrity / stats.hull_integrity_max
@@ -294,12 +240,82 @@ fn main() {
         } else {
             100.0
         };
+        let faction_key = match ship.faction {
+            Faction::Spain => "Spain",
+            Faction::England => "England",
+            Faction::France => "France",
+            Faction::Netherlands => "Netherlands",
+            Faction::Free => "Free",
+        }
+        .to_string();
+        let type_key = world.ship_types.get(ship.ship_type).name.clone();
+        let b = buckets.entry((faction_key, type_key)).or_default();
+        b.n += 1;
+        b.pl += pl;
+        b.debt += ship.debt;
+        b.hull_pct += hull_pct;
+        b.rig_pct += rig_pct;
+        if ship.policy == ShipPolicy::Pirate {
+            b.n_pirate += 1;
+        }
+        if is_bankrupt {
+            b.n_bankrupt += 1;
+        }
+        top.push((pl as i64, id));
+    }
+    println!(
+        "{:<12}  {:<10}  {:>5}  {:>+12}  {:>10}  {:>6}  {:>6}  {:>6}  {:>6}",
+        "faction", "type", "n", "P/L total", "debt tot", "hull%", "rig%", "pirate", "broke"
+    );
+    for ((fac, ty), b) in &buckets {
+        if b.n == 0 {
+            continue;
+        }
         println!(
-            "{:<3}  {:<14}  {:<10}  {:>10.0}  {:>10.0}  {:>10.0}  {:>8.0}  {:>+10.0}  {:>5}  {:>6.0}  {:>6.0}  {:<10}  {:<24}{}{}",
-            i, origin_names[i], type_name, ship.starting_silver, ship.silver,
-            ship.lifetime_dividends, ship.debt, pl, ship.lifetime_dock_count, hull_pct, rig_pct, state, cargo.join(","), built_tag, policy_tag
+            "{:<12}  {:<10}  {:>5}  {:>+12.0}  {:>10.0}  {:>6.0}  {:>6.0}  {:>6}  {:>6}",
+            fac,
+            ty,
+            b.n,
+            b.pl,
+            b.debt,
+            b.hull_pct / b.n as f32,
+            b.rig_pct / b.n as f32,
+            b.n_pirate,
+            b.n_bankrupt,
         );
     }
+    // Outliers: top 5 and bottom 5 by P/L.
+    top.sort_by(|a, b| b.0.cmp(&a.0));
+    println!();
+    println!("Top 5 earners:");
+    for (pl, id) in top.iter().take(5) {
+        let s = &world.ships[*id];
+        let port = s
+            .owner_port
+            .and_then(|i| world.ports.get(i).map(|p| p.name.as_str()))
+            .unwrap_or("?");
+        println!(
+            "  {:>+10}  {:<10} from {}",
+            pl,
+            world.ship_types.get(s.ship_type).name,
+            port
+        );
+    }
+    println!("Bottom 5:");
+    for (pl, id) in top.iter().rev().take(5) {
+        let s = &world.ships[*id];
+        let port = s
+            .owner_port
+            .and_then(|i| world.ports.get(i).map(|p| p.name.as_str()))
+            .unwrap_or("?");
+        println!(
+            "  {:>+10}  {:<10} from {}",
+            pl,
+            world.ship_types.get(s.ship_type).name,
+            port
+        );
+    }
+
     println!();
     println!(
         "Fleet total P/L: {:+.0} pesos   (outstanding debt: {:.0})",
@@ -310,12 +326,10 @@ fn main() {
         "Ships built by shipyards: {}  (last_month_avg_profit = {:+.0})",
         world.ships_built, world.last_month_avg_profit
     );
-    // Step 8 diagnostics: counts of active pirates and of ships that
-    // were spawned/built over the run but no longer exist (sunk by
-    // broadside or burned after boarding). The "lost" count is total
-    // ids we ever knew about minus surviving ships.
+    // Step 8 / Step 9 diagnostics: counts of active pirates and of
+    // ships that were spawned/built over the run but no longer exist
+    // (sunk by broadside or burned after boarding).
     {
-        use sim_core::ship::ShipPolicy;
         let n_pirate = world
             .ships
             .iter()
@@ -326,10 +340,6 @@ fn main() {
             .iter()
             .filter(|(_, s)| s.policy != ShipPolicy::Pirate && s.policy != ShipPolicy::Merchant)
             .count();
-        // Seeded pirates are recorded in `pirate_starts`. Anything
-        // flying the pirate flag above that count came from a Step 8
-        // capture (boarded merchant turned prize).
-        let n_seeded_pirates = pirate_starts.len();
         let n_mutinied = world.mutinies_total as usize;
         let n_captured = n_pirate
             .saturating_sub(n_seeded_pirates)

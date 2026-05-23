@@ -267,6 +267,47 @@ impl Ship {
         }
     }
 
+    /// Typed variant of `seeded_at_port` — same idea, but lets the
+    /// caller pick the ship type and supply per-type stats so the
+    /// hull/provisions/crew are sized correctly. Starting silver is
+    /// caller-supplied (sized to a hold's worth of cargo at the home
+    /// port; the historical-fleet seeder calibrates per-type).
+    pub fn seeded_at_port_typed(
+        position: Position,
+        owner_port: usize,
+        faction: Faction,
+        ship_type: crate::shiptype::ShipTypeId,
+        stats: &ShipStats,
+        starting_silver: f32,
+    ) -> Self {
+        Self {
+            position,
+            heading: 0.0,
+            speed: 0.0,
+            state: ShipState::Docked,
+            provisions: stats.provision_capacity,
+            cargo: Cargo::new(),
+            hull_fouling: 0.0,
+            silver: starting_silver,
+            owner_port: Some(owner_port),
+            ship_type,
+            starting_silver,
+            lifetime_dividends: 0.0,
+            lifetime_dock_count: 0,
+            debt: 0.0,
+            // Seed-fleet ships are fully crewed (no Hiring loop).
+            crew_alive: stats.crew_typical(),
+            wages_owed_pesos: 0.0,
+            morale: 1.0,
+            faction,
+            policy: ShipPolicy::Merchant,
+            nav: NavTrack::new(),
+            dock_action: DockAction::Idle,
+            hull_integrity: stats.hull_integrity_max,
+            rigging_integrity: stats.rigging_integrity_max,
+        }
+    }
+
     /// Construct a ship freshly built at a specific shipyard port, with
     /// a custom amount of starting silver (sized at build time to be
     /// roughly enough to buy one hold of cargo at the home port). The
