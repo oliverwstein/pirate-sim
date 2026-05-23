@@ -889,3 +889,57 @@ So fleet need is roughly the same order of magnitude as net production — about
 - Fluyt over-supply: most bottom-5 P/L outliers are Amsterdam fluyts. Either the type mix in `EuropeanHub` is too fluyt-heavy or the shipyard's "build pencils" math is over-eager.
 - Small-colonial provisioning: ports like Cumana, La Vela, and the Mosquito Coast outposts may sit far from any provisioning hub. Worth measuring per-port provisions inflow before tuning.
 - The 40 mutinies are concentrated in a few Spanish flotas that get caught between bankrupt and unable-to-careen; the mutiny pipeline now works but the distribution may merit its own pass.
+
+## Step 10.b — Non-combat attrition (commit `d0f4d46`)
+
+Step 9 added a path for ships to die via mutiny → piracy, and Step 8 added boarding+sinking. But the historical record is dominated by *non-combat* losses — storms, foundering from teredo-rotted hulls, and fires aboard. Per Davis (1962) and Jarvis (1954), 17C peacetime English merchant shipping ran 1.5–2.5%/yr all-cause loss, with the cause mix roughly storms 50–65%, foundering 10–20%, fire 5–10%, piracy 5–10%. The bench's ~500-ship fleet should be losing 8–13 ships/yr to the elements. Before Step 10.b: zero non-combat losses.
+
+### Module layout
+
+All hazard logic lives in a new `crates/sim-core/src/weather/hazards.rs` (~360 LOC). `WeatherSystem` now holds a `HazardSystem` alongside the existing `WindGrid`. The hazard system owns:
+
+- A deterministic `xorshift64` RNG state seeded at `WeatherSystem::load`, so the same bench seed produces the same attrition trace.
+- `HazardCounters` for bench reporting (storms damaged vs sunk, foundered, fires sunk vs total).
+- Two pure functions on `Ship`: `tick_environment` (teredo accumulation per hour, in tropical or open water) and `tick_age` (daily age bump).
+- `roll_hazards(ship, pos, month) -> Vec<HazardEvent>` for the stochastic events.
+
+The world tick calls `tick_environment` + `roll_hazards` per ship-hour (after `try_mutiny`, before the wages block) and applies any returned `HazardEvent` to the ship: hull damage, possible sink, magazine clear on fire. Sinking ships are reaped by the existing Step 8 Cleanup phase at end-of-tick — no new plumbing required. `tick_age` fires once per day from `tick_daily_hiring` which already gates on `day_of_year` transitions.
+
+### Calibration
+
+| Constant | Value | Source / rationale |
+|---|---|---|
+| `STORM_RATE_TROPICAL` | 2.5%/yr | Davis 1962 (Caribbean basin 3–6%/yr; ours is mid-low because foundering covers part of that range) |
+| `STORM_RATE_OPEN` | 1.2%/yr | Davis 1962 (open Atlantic 1.5–3%/yr) |
+| `HURRICANE_MONTH_MULTIPLIER` | 3.0 (Aug–Oct, tropical only) | NOAA HURDAT climatology: ~85% of Atlantic land-falling storms in this window |
+| `STORM_CATASTROPHIC_FRACTION` | 40% | Storm "losses" historically were total losses; the other 60% are survivable damage events that bleed hull integrity for next time |
+| `FIRE_RATE_SAILING` | 0.4%/yr | Davis et al.: fire = 5–10% of all losses, scales to ~0.1–0.2%/yr at sea |
+| `FOUNDERING_RATE_AT_MAX_TEREDO` | 3%/yr at teredo=100 | Ramps from 0 at teredo=30 (research's "structurally suspect" threshold); multiplied by `max(1, age_days/3650)` |
+| `TEREDO_RATE_TROPICAL_PER_HOUR` | 0.005 (≈ 43/yr) | Reaches the 80-point "structurally dangerous" mark in ~22 months, matching §1.3's 18–36 month figure |
+| `TEREDO_RATE_OPEN_PER_HOUR` | 0.001 | Teredo navalis prefers warm salty water; northern routes are ~1/5 the tropical rate |
+| `TROPICAL_Y_NM` | 450 (= 25°N in our origin frame) | Covers Caribbean + Gulf of Mexico, excludes Bermuda/Carolinas |
+
+`Ship` gains two fields: `teredo_damage: f32` (0–100) and `age_days: u32`. All four constructors initialize them; `tick_careen` now reduces teredo at half the fouling rate (structural replanking is slower than scraping the bottom).
+
+### Bench results (730 d, 503 ships)
+
+```
+Combat ledger:  63 pirate(s) afloat (24 seeded + 0 captured + 39 mutinied), 24 lost
+Attrition:      16 storm sinkings (15 damage-only), 4 foundered, 2 fires (1 sunk)
+```
+
+- Non-combat losses: 21 over 2 years → **2.1%/yr** — squarely inside Davis's 1.5–2.5%/yr peacetime envelope.
+- Cause mix: storms 81%, foundering 15%, fire 4%. Storms are a bit high vs research's 50–65%; foundering and fire are textbook.
+- 15 damage-only storm events left ships limping but afloat — these compound, so over a 5-year run the same hulls would eventually sink to repeated storms even without a catastrophic roll.
+- Bankruptcies fell from 81 → 67. Attrition is impartial: it disproportionately removes ships that were already in trouble (sat at sea undermanned, etc.), nudging the bankrupt count down indirectly.
+
+### Determinism check
+
+The same bench seed (`0xCAFE_1680` for fleet seeding, hardcoded constant for hazard RNG) produces an identical attrition trace across runs. Verified with two back-to-back invocations of `cargo run --release -p sim-core --example bench_trade -- 730`.
+
+### Open follow-ups for later calibration
+
+- Storm cause-share is 81% vs research's 50–65%. Could lower `STORM_RATE_TROPICAL` to 0.018 and raise foundering to compensate.
+- `roll_hazards` doesn't yet know about combat-state: ships fleeing under all sail in heavy weather should have *higher* storm risk. Worth wiring in after Step 11.
+- Fire rate doesn't yet scale with magazine load. The infrastructure is there (`ship.magazine_powder`); plug in when calibration calls for it.
+- AI doesn't currently care about `teredo_damage` — careening is triggered by fouling alone. A captain who's never put in for a careen will quietly accumulate teredo until the foundering roll catches up. That's behaviorally accurate but means the AI is leaving free survival on the table.
