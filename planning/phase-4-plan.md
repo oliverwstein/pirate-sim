@@ -170,11 +170,117 @@ next_fire_at = now + reload_minutes(participant)
 
 `reload_minutes` for ships ≈ `1.5 * (2.0 - seasoned_ratio())` — i.e., 1.5 min for fully-seasoned crews, 3.0 min for fully green. **Here is where the A2 `crew_seasoned` field finally bites:** seasoned crews fire twice as fast. Forts have a flat 2.0 min reload (land-based gun crews historically less practiced).
 
-### 3.4 Engagement / disengagement
+### 3.4 Engagement, disengagement, terminal outcomes
 
-A ship enters engagement when its hourly AI emits a `FireBroadside` or `AttemptBoard` against a nearby target, or when a fort's range circle is breached by a hostile.
+The §3b sub-tick fire loop made one thing obvious in the colosseum: without an engagement concept, combat sputters out. The AI re-decides every hour, no party commits to the chase, no party considers surrender, and a fleeing ship simply drifts out of range until next-hour AI silently disengages. §3.4 fixes this by making "engagement" a real state expressed through the BT (no hardcoded override), and by defining the terminal conditions under which an engagement ends.
 
-A ship can **disengage** by reaching > 2 NM separation from all hostile contacts for a full sub-tick. This is the breakaway condition: a pursuer must commit to closing or accept the loss of contact.
+#### 3.4.1 Engagement state
+
+New fields on `Ship`:
+
+```rust
+pub engaged_with: Option<ShipId>,
+pub engagement_role: EngagementRole, // Attacker | Defender | NotEngaged
+pub engagement_started_at_minute: u64,
+pub follow_target: Option<ShipId>,   // prize ships following their captor
+```
+
+Mutually set on the first landed broadside (or first `AttemptBoard`). The ship that opened fire (or initiated the boarding attempt) becomes `Attacker`; the other becomes `Defender`. Forts entering combat with a ship also set the ship's engagement (fort is `Attacker`-equivalent — no engaged-with `ShipId` needed since forts are immobile).
+
+#### 3.4.2 BT extension (no override)
+
+The ship BT gains a high-priority `Engaged` branch at the top of its selector:
+
+```
+Selector
+├─ engaged?
+│   └─ engaged_subtree
+│       ├─ should_surrender? → Strike
+│       ├─ can_board?         → AttemptBoard
+│       ├─ role == Attacker   → PursueAndFire (steer to close, FireBroadside)
+│       └─ role == Defender   → FleeAndFire   (steer to open, FireBroadside)
+├─ follow_target.is_some()? → Follow (match leader speed + station)
+└─ default subtree (trade / patrol / loiter)
+```
+
+The "engagement lock" is **emergent**, not imperative: as long as `engaged_with.is_some()`, the engaged branch wins the selector. No imperative override of the AI. This keeps the flyweight BT pattern intact.
+
+#### 3.4.3 Firing cadence (clarification)
+
+Unchanged from §3b: the BT emits **one `FireBroadside` intent per hour per attacker** ("I intend to keep firing this hour"). The actual cannon discharges happen on the 5-min sub-tick gated by `reload_minutes(seasoned_ratio)`, range, and ordnance. The BT decides *what to do*; the sub-tick decides *when cannons can physically fire*.
+
+#### 3.4.4 Terminal conditions
+
+The engagement ends (clearing `engaged_with` for both ships) on the first of:
+
+1. **Sink** — hull ≤ 0. No prize. Crew loss handled by existing morale/casualty path.
+2. **Strike (surrender)** — defender's BT emits `Strike` when `morale × hull_fraction < strike_threshold` AND defender cannot outrun attacker (`defender.effective_speed ≤ attacker.effective_speed`). Triggers §3.4a prize handling.
+3. **Boarded** — `resolve_boarding` returns a winner. Winner's BT runs the same §3.4a victor decision tree on the loser.
+4. **Escape** — `range > escape_threshold_nm` AND `defender.effective_speed > attacker.effective_speed` for `K_ESCAPE_HOURS` consecutive hours. Both ships clear engagement; defender resumes normal AI; attacker re-enters its default subtree (which may re-engage another target or resume trade).
+
+Constants (initial values, subject to calibration in §3.6):
+- `strike_threshold = 0.15` (morale × hull-fraction)
+- `escape_threshold_nm = 4.0`
+- `K_ESCAPE_HOURS = 2`
+
+#### 3.4a Prize mechanics
+
+When a defender Strikes (or loses a boarding), the victor's BT chooses one of three outcomes via `decide_prize_action(victor, prize) -> PrizeAction`:
+
+```rust
+pub enum PrizeAction {
+    TakePrize,            // send prize crew, prize follows victor
+    TakeCargoAndRelease,  // transfer cargo, defender sails away (damaged)
+    TakeCargoAndSink,     // transfer cargo, scuttle the hull
+}
+```
+
+**Decision heuristic (v1):**
+
+- **TakePrize** if all of:
+  - Victor has spare crew ≥ `prize_crew_min(prize)` (= ⌈prize.crew_required × 0.4⌉, enough to sail her home).
+  - Prize hull-fraction ≥ 0.25 (worth the prize money).
+  - Victor's faction policy permits prizes (Pirate, Privateer-with-LoM in Phase 5; merchants typically refuse).
+- Else **TakeCargoAndRelease** if cargo-value > 0 AND victor's hold can carry at least some of it AND defender's faction is not flagged for sinking (e.g. naval ROE).
+- Else **TakeCargoAndSink** (denial of resources to enemy faction, or no spare crew + no cargo room).
+
+**TakePrize mechanics:**
+- Transfer `prize_crew_min` from victor.crew_alive to prize.crew_alive (and proportionally from crew_seasoned).
+- Set `prize.owner = victor.owner` (and faction).
+- Set `prize.follow_target = Some(victor.id)`.
+- Clear both ships' `engaged_with`.
+- Prize joins victor's voyages via the `Follow` BT branch (match speed, sit on quarter).
+- When victor next reaches a friendly port, the prize is "sold": port pays victor a prize-money lump sum based on prize hull-fraction × ship-class base value + cargo value at port prices. Prize ship is despawned (v1) or added to fleet (FW item).
+
+**TakeCargoAndRelease mechanics:**
+- Transfer cargo from prize to victor up to victor's remaining hold capacity, in descending unit-value order.
+- Clear both ships' `engaged_with`.
+- Defender resumes normal AI (likely flees to nearest friendly port for repair).
+
+**TakeCargoAndSink mechanics:**
+- Transfer cargo as above.
+- Set prize.hull = 0 → ShipState::Sunk via existing sink path next tick.
+- Clear victor's `engaged_with`.
+
+#### 3.4b Follow BT branch
+
+When `follow_target.is_some()`:
+- Compute leader position + leader velocity.
+- Steer to a station-keeping point (leader.position − leader.velocity.normalized() × 0.2 NM, i.e. on the leader's quarter).
+- Match leader's speed (capped at follower's own max).
+- If leader despawns or follower reaches a friendly port AND follower is a prize → prize is sold (despawn or fleet-add).
+
+#### 3.4c Colosseum cleanup
+
+Drop the anchor hack from `examples/colosseum.rs`. Each scenario now spawns two ships and ticks until terminal outcome (Sunk / Surrendered / Boarded / Escaped). Print per-tick log (as today) plus a final verdict block: outcome, duration in hours, total broadsides each side, final hull/rigging/crew/cargo, prize value if any.
+
+#### 3.4d Implementation phasing
+
+Implement in three sub-commits (each green on fmt/clippy/test):
+
+- **§3c-1**: Engagement state (fields + EngagementRole), BT `Engaged` branch, sink + escape terminal conditions. Colosseum drops anchor; scenarios resolve as Sunk or Escaped.
+- **§3c-2**: `Strike` command + surrender condition + `PrizeAction` decision tree + Follow BT branch + prize-sells-at-port. Colosseum shows Surrendered outcomes.
+- **§3c-3**: Boarding integrates with PrizeAction (boarding victor runs same decision tree). `AttemptBoard` becomes a legitimate engaged-subtree choice when rigging conditions permit.
 
 ### 3.5 Forts
 
@@ -239,10 +345,11 @@ Carrying these forward as Phase 5 / FW-N items:
 
 1. **1.1–1.3 (ordnance production + AI top-up)** — recipe additions, top-up logic. Tests + small `bench_trade` extension.
 2. **2.1–2.4 (repair at port)** — hull/rig recovery while docked, silver debit, debt path. Tests + check `bench_trade 730` average hull integrity climbs.
-3. **3.1–3.4 (sub-tick combat for ships)** — engagement detection, sub-tick loop, reload model, disengagement. New unit tests; existing combat tests adapted.
-4. **3.5 (forts)** — `Fort` struct, seed data, integration into sub-tick loop.
-5. **3.6 (calibration)** — `bench_combat`, regression check against `bench_trade 730`, tune damage tables / reload times if needed.
-6. **Development-log entry** + `phase-4-postmortem.md` skeleton (so we have a place to drop issues during the work).
+3. **3.1–3.3 (sub-tick combat for ships, reload model)** — engagement detection, sub-tick fire loop, reload model. New unit tests; existing combat tests adapted. **[§3a + §3b done]**
+4. **3.4 + 3.4a + 3.4b + 3.4c (engagement, surrender, prize, follow)** — in three sub-commits per §3.4d.
+5. **3.5 (forts)** — `Fort` struct, seed data, integration into sub-tick loop.
+6. **3.6 (calibration)** — `bench_combat`, regression check against `bench_trade 730`, tune damage tables / reload times if needed.
+7. **Development-log entry** + `phase-4-postmortem.md` skeleton (so we have a place to drop issues during the work).
 
 Each step ends with `cargo fmt && cargo clippy --workspace -- -D warnings && cargo test --workspace` green, plus the relevant bench.
 

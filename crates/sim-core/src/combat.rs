@@ -195,6 +195,41 @@ pub fn broadside_supply_cost(cannons: u16) -> (f32, f32) {
     (POWDER_TONS_PER_GUN * guns, SHOT_TONS_PER_GUN * guns)
 }
 
+// ── Phase 4 §3b: sub-tick reload model ──────────────────────────────────
+
+/// Minutes for a fully-seasoned crew (`seasoned_ratio == 1.0`) to reload
+/// the great-gun battery. Three minutes ≈ the published RN ideal for
+/// well-drilled 17C ships; faster crews (Nelson-era 90-second drills)
+/// are out of period for this sim.
+pub const RELOAD_MINUTES_SEASONED: f32 = 3.0;
+
+/// Minutes for a fully-green crew (`seasoned_ratio == 0.0`) to reload.
+/// Six minutes matches contemporary complaints about scratch crews on
+/// freshly-pressed Spanish galleons and merchantmen converted to
+/// privateers, where the time between effective broadsides was twice
+/// or more that of veteran ships. The 2× spread between seasoned and
+/// green is the single biggest payoff of the `crew_seasoned` machinery
+/// (Phase 3 / A2).
+pub const RELOAD_MINUTES_GREEN: f32 = 6.0;
+
+/// Phase 4 §3b: minutes from `now` before this crew can next fire a
+/// broadside. Linear interpolation in the seasoned ratio between
+/// `RELOAD_MINUTES_GREEN` (ratio = 0.0) and `RELOAD_MINUTES_SEASONED`
+/// (ratio = 1.0). Floored at 1 minute so the u64 sub-tick clock can
+/// always make forward progress.
+pub fn reload_minutes(seasoned_ratio: f32) -> u64 {
+    let r = seasoned_ratio.clamp(0.0, 1.0);
+    let mins = RELOAD_MINUTES_GREEN + r * (RELOAD_MINUTES_SEASONED - RELOAD_MINUTES_GREEN);
+    mins.round().max(1.0) as u64
+}
+
+/// Phase 4 §3b: minutes per sub-tick step inside an engagement-locked
+/// hour. 12 sub-ticks fit in one hourly tick (12 × 5 = 60).
+pub const MINUTES_PER_SUB_TICK: u64 = 5;
+
+/// Phase 4 §3b: number of sub-tick steps per hourly tick.
+pub const SUB_TICKS_PER_HOUR: u64 = 12;
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -638,11 +638,20 @@ impl World {
 
         // ─── Resolution Phase ────────────────────────────────────────
         // Drain the command buffer in push order (== AI-tick id order).
-        // Steering writes apply to the issuing ship; combat commands
-        // (FireBroadside, AttemptBoard) read attacker + target state and
-        // mutate both. Range/supply/rigging gates re-fire here because an
-        // earlier command in the same drain may have moved or damaged
-        // either party.
+        // Steering writes apply inline. Combat commands (FireBroadside,
+        // AttemptBoard) are collected into intent vectors and processed
+        // in two phases:
+        //   1. Sub-tick combat (Phase 4 §3b) — converts each
+        //      FireBroadside intent into up to `SUB_TICKS_PER_HOUR`
+        //      actual fires, gated by reload + range + ordnance.
+        //   2. Boarding — runs after sub-tick so that rigging damage
+        //      from this hour's exchange is visible to the
+        //      `BOARDING_RIGGING_THRESHOLD` gate.
+        //
+        // Determinism: both intent vectors preserve drain order, which
+        // is AI-tick (i.e., ShipId) order.
+        let mut engagements: Vec<(ShipId, ShipId)> = Vec::new();
+        let mut boardings: Vec<(ShipId, ShipId)> = Vec::new();
         for (attacker, cmd) in self.commands.drain(..) {
             match cmd {
                 crate::command::ShipCommand::Steer { heading, speed } => {
@@ -653,308 +662,29 @@ impl World {
                         target_ship.set_steering(heading, speed);
                     }
                 }
-                // Step 7: single broadside, deterministic damage.
-                // Attacker is the issuing ship; target is the
-                // FireBroadside payload. The AI re-validated supply +
-                // range, but we re-check here for the same reason the
-                // drain is here at all: another command may have moved
-                // or sunk either party.
+                // Phase 4 §3b: a FireBroadside intent unlocks up to
+                // SUB_TICKS_PER_HOUR shots over the hour, depending on
+                // reload, range, and ordnance. Defer to the sub-tick
+                // loop below.
                 crate::command::ShipCommand::FireBroadside { target: tgt } => {
-                    let attacker_id = attacker;
-                    let (cannons, attacker_pos, attacker_vel) = match self.ships.get(attacker_id) {
-                        Some(a) => (
-                            self.ship_types.get(a.ship_type).stats.cannons,
-                            a.position,
-                            a.velocity(),
-                        ),
-                        None => continue,
-                    };
-                    if cannons == 0 {
-                        continue;
-                    }
-                    let (target_pos, target_vel) = match self.ships.get(tgt) {
-                        Some(t) => (t.position, t.velocity()),
-                        None => continue,
-                    };
-                    // Step 8: gate on closest approach over the
-                    // hour, not end-of-tick distance — see
-                    // `combat::min_distance_over_tick`.
-                    let range = crate::combat::min_distance_over_tick(
-                        (attacker_pos.x, attacker_pos.y),
-                        attacker_vel,
-                        (target_pos.x, target_pos.y),
-                        target_vel,
-                    );
-                    if range > crate::combat::CANNON_RANGE_NM {
-                        continue;
-                    }
-                    let (powder_need, shot_need) = crate::combat::broadside_supply_cost(cannons);
-                    // Deduct supply from attacker; if either good
-                    // is short, drop the command silently.
-                    let fired = match self.ships.get_mut(attacker_id) {
-                        Some(a) => {
-                            let have_p = a.cargo.get(crate::goods::ids::GUNPOWDER);
-                            let have_s = a.cargo.get(crate::goods::ids::CANNON_SHOT);
-                            if have_p < powder_need || have_s < shot_need {
-                                false
-                            } else {
-                                a.cargo.remove(crate::goods::ids::GUNPOWDER, powder_need);
-                                a.cargo.remove(crate::goods::ids::CANNON_SHOT, shot_need);
-                                true
-                            }
-                        }
-                        None => false,
-                    };
-                    if !fired {
-                        continue;
-                    }
-                    let (hull_dmg, rig_dmg) =
-                        crate::combat::compute_broadside_damage(cannons, range);
-                    if let Some(target_ship) = self.ships.get_mut(tgt) {
-                        target_ship.hull_integrity =
-                            (target_ship.hull_integrity - hull_dmg).max(0.0);
-                        target_ship.rigging_integrity =
-                            (target_ship.rigging_integrity - rig_dmg).max(0.0);
-                        // Step 8: a broadside can sink outright if
-                        // it staves the hull. Mark as Sunk so the
-                        // rest of this tick skips it and Cleanup
-                        // reaps the slot.
-                        if target_ship.hull_integrity <= 0.0 && target_ship.state != ShipState::Sunk
-                        {
-                            target_ship.state = ShipState::Sunk;
-                        }
-                    }
+                    engagements.push((attacker, tgt));
                 }
-                // Step 8: boarding action. Attacker is the
-                // currently-ticking ship; target is in the payload.
-                // Re-validates range (closest-approach) and target
-                // rigging gate, then runs deterministic combat,
-                // applies casualties, and either takes the prize
-                // (transferring crew + flipping policy/faction) or
-                // burns it when the attacker would be left below
-                // crew minimum.
                 crate::command::ShipCommand::AttemptBoard { target: tgt } => {
-                    let attacker_id = attacker;
-                    let (a_pos, a_vel, a_crew, a_morale, a_min_crew) =
-                        match self.ships.get(attacker_id) {
-                            Some(a) => {
-                                let stats = &self.ship_types.get(a.ship_type).stats;
-                                (
-                                    a.position,
-                                    a.velocity(),
-                                    a.crew_alive,
-                                    a.morale,
-                                    stats.crew_min(),
-                                )
-                            }
-                            None => continue,
-                        };
-                    let (t_pos, t_vel, t_crew, t_morale, t_rig_frac) = match self.ships.get(tgt) {
-                        Some(t) => {
-                            if t.state == ShipState::Sunk {
-                                continue;
-                            }
-                            let stats = &self.ship_types.get(t.ship_type).stats;
-                            let frac = if stats.rigging_integrity_max > 0.0 {
-                                (t.rigging_integrity / stats.rigging_integrity_max).clamp(0.0, 1.0)
-                            } else {
-                                1.0
-                            };
-                            (t.position, t.velocity(), t.crew_alive, t.morale, frac)
-                        }
-                        None => continue,
-                    };
-                    // Re-gate range and rigging — same checks the
-                    // AI applied, repeated here in case another
-                    // command in this drain bumped either ship.
-                    let range = crate::combat::min_distance_over_tick(
-                        (a_pos.x, a_pos.y),
-                        a_vel,
-                        (t_pos.x, t_pos.y),
-                        t_vel,
-                    );
-                    if range > crate::combat::BOARDING_RANGE_NM {
-                        continue;
-                    }
-                    if t_rig_frac >= crate::combat::BOARDING_RIGGING_THRESHOLD {
-                        continue;
-                    }
-                    if a_crew < 2 || t_crew == 0 {
-                        continue;
-                    }
-                    let outcome =
-                        crate::combat::resolve_boarding(a_crew, a_morale, t_crew, t_morale);
-                    // Apply attacker losses (pro-rata across
-                    // seasoned/unseasoned — boarding cuts down
-                    // veteran and landsman alike).
-                    if let Some(a) = self.ships.get_mut(attacker_id) {
-                        a.apply_crew_losses(outcome.attacker_losses);
-                    }
-                    // Apply defender losses.
-                    if let Some(t) = self.ships.get_mut(tgt) {
-                        t.apply_crew_losses(outcome.defender_losses);
-                    }
-                    if !outcome.attacker_wins {
-                        // Defender holds the deck. Boarders fall
-                        // back; no transfer, no flag change.
-                        continue;
-                    }
-                    // Step 11.a: prize outcome. Historical pattern
-                    // (Rediker, Earle): pirates almost never kept
-                    // captured hulls — they stripped cargo, took
-                    // any silver, and either released the prize
-                    // (after a hostage scare), sank her, or sailed
-                    // her to a friendly haven to sell. Only rarely
-                    // did a prize join the fleet, and then only if
-                    // she was a real upgrade. Old behavior — "every
-                    // prize becomes a pirate" — produced runaway
-                    // pirate growth in long benches.
-                    let a_surviving = self
-                        .ships
-                        .get(attacker_id)
-                        .map(|a| a.crew_alive)
-                        .unwrap_or(0);
-
-                    // Compute prize value (cargo + hull bounty)
-                    // before mutating either ship. Cargo is valued
-                    // at a flat wholesale ~20 pesos/ton (close to
-                    // average bench prices for bulk goods like
-                    // sugar/molasses); hull bounty scales with
-                    // current hull integrity to reflect sale value
-                    // at a pirate haven.
-                    let (target_cargo_tons, target_hull, target_hull_max) =
-                        match self.ships.get(tgt) {
-                            Some(t) => {
-                                let stats = &self.ship_types.get(t.ship_type).stats;
-                                (
-                                    t.cargo.total_tons(),
-                                    t.hull_integrity,
-                                    stats.hull_integrity_max,
-                                )
-                            }
-                            None => (0.0, 0.0, 0.0),
-                        };
-                    let cargo_silver = target_cargo_tons * 20.0;
-                    let hull_bounty = target_hull * 8.0;
-
-                    // Decide outcome. Real-upgrade check first
-                    // (a 200-ton fluyt is no upgrade for a 60-ton
-                    // sloop pirate); then crew-spareable check;
-                    // then the weighted roll.
-                    let attacker_hull_max = self
-                        .ships
-                        .get(attacker_id)
-                        .map(|a| self.ship_types.get(a.ship_type).stats.hull_integrity_max)
-                        .unwrap_or(0.0);
-                    let could_upgrade = target_hull_max > attacker_hull_max * 1.2;
-                    let prize_crew =
-                        ((a_surviving as f32) * crate::combat::PRIZE_CREW_SPLIT).round() as u16;
-                    let attacker_after = a_surviving.saturating_sub(prize_crew);
-                    let can_spare_crew = attacker_after >= a_min_crew && prize_crew >= 2;
-
-                    let roll = combat_rng_step(&mut self.combat_rng_state);
-                    // Outcome weights (sum to 1.0):
-                    //   take    : 0.05 (only if real upgrade + crew spareable)
-                    //   sell    : 0.30 (silver bonus, prize sunk)
-                    //   sink    : 0.50 (default — cargo stripped, hull released/burned)
-                    //   release : 0.15 (cargo stripped, target lives to trade again)
-                    let take = could_upgrade && can_spare_crew && roll < 0.05;
-                    let sell = !take && roll < 0.35;
-                    let release = !take && !sell && roll >= 0.85;
-                    // (sink is the default if none of the above)
-
-                    // Apply stripped cargo + silver to attacker
-                    // (and clear from target unless we're taking it).
-                    if !take {
-                        if let Some(a) = self.ships.get_mut(attacker_id) {
-                            let bonus = if sell {
-                                cargo_silver + hull_bounty
-                            } else {
-                                cargo_silver
-                            };
-                            a.silver += bonus;
-                            a.morale =
-                                (a.morale + crate::ship::MORALE_GAIN_PRIZE_TAKEN).clamp(0.0, 1.0);
-                        }
-                        if let Some(t) = self.ships.get_mut(tgt) {
-                            t.cargo = crate::cargo::Cargo::new();
-                            t.silver = (t.silver * 0.1).max(0.0); // boarders took most of it
-                        }
-                    }
-
-                    if take {
-                        // Real upgrade — flip the prize. This is
-                        // the *only* outcome that adds to the
-                        // pirate fleet.
-                        self.prizes_taken += 1;
-                        let new_faction = self.ships.get(attacker_id).map(|a| a.faction);
-                        // Detach the prize crew from the attacker
-                        // pro-rata over seasoned (veterans split with
-                        // the rest of the boarding party). Note:
-                        // `prize_crew` was computed against
-                        // `a_surviving` (post-melee), and the attacker
-                        // already had `attacker_losses` applied above,
-                        // so `crew_alive` here equals `a_surviving` —
-                        // the detach below leaves it at `attacker_after`.
-                        let (detached, detached_seasoned) = match self.ships.get_mut(attacker_id) {
-                            Some(a) => {
-                                let d = a.detach_prize_crew(prize_crew);
-                                a.morale = (a.morale + crate::ship::MORALE_GAIN_PRIZE_TAKEN)
-                                    .clamp(0.0, 1.0);
-                                d
-                            }
-                            None => (0, 0),
-                        };
-                        debug_assert_eq!(
-                            self.ships.get(attacker_id).map(|a| a.crew_alive),
-                            Some(attacker_after),
-                            "detach_prize_crew should leave attacker at attacker_after"
-                        );
-                        if let Some(t) = self.ships.get_mut(tgt) {
-                            t.crew_alive = t.crew_alive.saturating_add(detached);
-                            t.crew_seasoned = t.crew_seasoned.saturating_add(detached_seasoned);
-                            t.policy = ShipPolicy::Pirate;
-                            if let Some(f) = new_faction {
-                                t.faction = f;
-                            }
-                            t.morale = 0.8;
-                            t.speed = 0.0;
-                            t.nav.waypoints.clear();
-                        }
-                        if let Some(ai) = self.ship_ais.get_mut(tgt) {
-                            ai.goal.destination = None;
-                            ai.goal.dest_port = None;
-                            ai.goal.pursue_target = None;
-                            ai.goal.flee_from = None;
-                        }
-                    } else if sell || (!release) {
-                        // Sell-at-haven and sink-as-default both
-                        // result in the prize being removed from
-                        // the world (we don't model the actual
-                        // voyage to a pirate haven yet). The
-                        // distinction lives in `prizes_sold` vs
-                        // `prizes_sunk` for bench reporting.
-                        if sell {
-                            self.prizes_sold += 1;
-                        } else {
-                            self.prizes_sunk += 1;
-                        }
-                        if let Some(t) = self.ships.get_mut(tgt) {
-                            t.hull_integrity = 0.0;
-                            t.rigging_integrity = 0.0;
-                            t.state = ShipState::Sunk;
-                        }
-                    } else {
-                        // release — target survives, returns to
-                        // trade with empty holds. The captain re-
-                        // plans next tick (cargo is gone, but the
-                        // hull and crew live).
-                        self.prizes_released += 1;
-                    }
+                    boardings.push((attacker, tgt));
                 }
             }
         }
 
+        // Phase 4 §3b: convert engagement intents into a multi-broadside
+        // exchange resolved at 5-minute sub-tick precision.
+        self.run_sub_tick_combat(&engagements);
+
+        // Boarding actions are resolved after sub-tick so that any
+        // rigging damage taken this hour is visible to the boarding
+        // gate. See the original Step 8 implementation below.
+        for (attacker, tgt) in boardings {
+            self.resolve_boarding(attacker, tgt);
+        }
         // ─── Mutation / Physics Phase ────────────────────────────────
         // Per-ship state updates that depend on the world *after*
         // Resolution: provisions burn, morale, mutiny rolls, weather
@@ -1127,6 +857,333 @@ impl World {
             self.ships.remove(id);
             self.ship_ais.remove(id);
             self.silver_at_month_start.remove(id);
+        }
+    }
+
+    /// Phase 4 §3b: sub-tick combat resolver. Each `(attacker, target)`
+    /// engagement runs over `SUB_TICKS_PER_HOUR` 5-minute steps inside
+    /// the hour about to elapse. At each step, the attacker fires if
+    /// its `next_fire_at_minute` has reached the current sub-tick, the
+    /// target is within `CANNON_RANGE_NM` at the interpolated positions
+    /// for this sub-tick, and the magazine has the required powder +
+    /// shot. Successful fires debit ordnance, apply deterministic
+    /// damage, and advance the attacker's reload clock by
+    /// `combat::reload_minutes`. Sunk targets are flagged immediately
+    /// so subsequent sub-ticks short-circuit. Positions are linear-
+    /// interpolated between hour-start (`ship.position`) and projected
+    /// hour-end (`position + velocity * 1h`); this matches the linear
+    /// assumption already used by `combat::min_distance_over_tick`.
+    fn run_sub_tick_combat(&mut self, engagements: &[(ShipId, ShipId)]) {
+        if engagements.is_empty() {
+            return;
+        }
+        let hour_start = self.sim_minute;
+        // Cache hour-start position + velocity per participant.
+        // Avoids repeated borrowck dances inside the sub-tick loop.
+        type StartState = ((f32, f32), (f32, f32));
+        let mut start: SecondaryMap<ShipId, StartState> = SecondaryMap::new();
+        for &(a, t) in engagements {
+            for id in [a, t] {
+                if start.contains_key(id) {
+                    continue;
+                }
+                if let Some(s) = self.ships.get(id) {
+                    start.insert(id, ((s.position.x, s.position.y), s.velocity()));
+                }
+            }
+        }
+        for step in 0..crate::combat::SUB_TICKS_PER_HOUR {
+            let now = hour_start + step * crate::combat::MINUTES_PER_SUB_TICK;
+            let dt_h = (step * crate::combat::MINUTES_PER_SUB_TICK) as f32 / 60.0;
+            for &(attacker_id, target_id) in engagements {
+                // Read attacker state and gate.
+                let (cannons, seasoned_ratio, next_fire, a_start, a_vel) =
+                    match (self.ships.get(attacker_id), start.get(attacker_id)) {
+                        (Some(a), Some(&(p, v))) => {
+                            if a.state == ShipState::Sunk {
+                                continue;
+                            }
+                            (
+                                self.ship_types.get(a.ship_type).stats.cannons,
+                                a.seasoned_ratio(),
+                                a.next_fire_at_minute,
+                                p,
+                                v,
+                            )
+                        }
+                        _ => continue,
+                    };
+                if cannons == 0 || next_fire > now {
+                    continue;
+                }
+                let (t_start, t_vel) = match (self.ships.get(target_id), start.get(target_id)) {
+                    (Some(t), Some(&(p, v))) => {
+                        if t.state == ShipState::Sunk {
+                            continue;
+                        }
+                        (p, v)
+                    }
+                    _ => continue,
+                };
+                // Interpolated positions at this sub-tick.
+                let a_pos = (a_start.0 + a_vel.0 * dt_h, a_start.1 + a_vel.1 * dt_h);
+                let t_pos = (t_start.0 + t_vel.0 * dt_h, t_start.1 + t_vel.1 * dt_h);
+                let dx = a_pos.0 - t_pos.0;
+                let dy = a_pos.1 - t_pos.1;
+                let range = (dx * dx + dy * dy).sqrt();
+                if range > crate::combat::CANNON_RANGE_NM {
+                    continue;
+                }
+                let (powder_need, shot_need) = crate::combat::broadside_supply_cost(cannons);
+                let fired = match self.ships.get_mut(attacker_id) {
+                    Some(a) => {
+                        let have_p = a.cargo.get(crate::goods::ids::GUNPOWDER);
+                        let have_s = a.cargo.get(crate::goods::ids::CANNON_SHOT);
+                        if have_p < powder_need || have_s < shot_need {
+                            false
+                        } else {
+                            a.cargo.remove(crate::goods::ids::GUNPOWDER, powder_need);
+                            a.cargo.remove(crate::goods::ids::CANNON_SHOT, shot_need);
+                            a.next_fire_at_minute =
+                                now + crate::combat::reload_minutes(seasoned_ratio);
+                            true
+                        }
+                    }
+                    None => false,
+                };
+                if !fired {
+                    continue;
+                }
+                let (hull_dmg, rig_dmg) = crate::combat::compute_broadside_damage(cannons, range);
+                if let Some(target_ship) = self.ships.get_mut(target_id) {
+                    target_ship.hull_integrity = (target_ship.hull_integrity - hull_dmg).max(0.0);
+                    target_ship.rigging_integrity =
+                        (target_ship.rigging_integrity - rig_dmg).max(0.0);
+                    if target_ship.hull_integrity <= 0.0 && target_ship.state != ShipState::Sunk {
+                        target_ship.state = ShipState::Sunk;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Resolves a single boarding intent. Extracted from the old
+    /// in-line Resolution Phase loop so Phase 4 §3b can run all
+    /// boardings *after* the sub-tick combat exchange (so this hour's
+    /// rigging damage is visible to the boarding-gate test).
+    #[allow(clippy::too_many_lines)]
+    fn resolve_boarding(&mut self, attacker: ShipId, tgt: ShipId) {
+        let attacker_id = attacker;
+        // ── original Step 8 boarding body, unchanged ──
+        let (a_pos, a_vel, a_crew, a_morale, a_min_crew) = match self.ships.get(attacker_id) {
+            Some(a) => {
+                let stats = &self.ship_types.get(a.ship_type).stats;
+                (
+                    a.position,
+                    a.velocity(),
+                    a.crew_alive,
+                    a.morale,
+                    stats.crew_min(),
+                )
+            }
+            None => return,
+        };
+        let (t_pos, t_vel, t_crew, t_morale, t_rig_frac) = match self.ships.get(tgt) {
+            Some(t) => {
+                if t.state == ShipState::Sunk {
+                    return;
+                }
+                let stats = &self.ship_types.get(t.ship_type).stats;
+                let frac = if stats.rigging_integrity_max > 0.0 {
+                    (t.rigging_integrity / stats.rigging_integrity_max).clamp(0.0, 1.0)
+                } else {
+                    1.0
+                };
+                (t.position, t.velocity(), t.crew_alive, t.morale, frac)
+            }
+            None => return,
+        };
+        // Re-gate range and rigging — same checks the
+        // AI applied, repeated here in case another
+        // command in this drain bumped either ship.
+        let range = crate::combat::min_distance_over_tick(
+            (a_pos.x, a_pos.y),
+            a_vel,
+            (t_pos.x, t_pos.y),
+            t_vel,
+        );
+        if range > crate::combat::BOARDING_RANGE_NM {
+            return;
+        }
+        if t_rig_frac >= crate::combat::BOARDING_RIGGING_THRESHOLD {
+            return;
+        }
+        if a_crew < 2 || t_crew == 0 {
+            return;
+        }
+        let outcome = crate::combat::resolve_boarding(a_crew, a_morale, t_crew, t_morale);
+        // Apply attacker losses (pro-rata across
+        // seasoned/unseasoned — boarding cuts down
+        // veteran and landsman alike).
+        if let Some(a) = self.ships.get_mut(attacker_id) {
+            a.apply_crew_losses(outcome.attacker_losses);
+        }
+        // Apply defender losses.
+        if let Some(t) = self.ships.get_mut(tgt) {
+            t.apply_crew_losses(outcome.defender_losses);
+        }
+        if !outcome.attacker_wins {
+            // Defender holds the deck. Boarders fall
+            // back; no transfer, no flag change.
+            return;
+        }
+        // Step 11.a: prize outcome. Historical pattern
+        // (Rediker, Earle): pirates almost never kept
+        // captured hulls — they stripped cargo, took
+        // any silver, and either released the prize
+        // (after a hostage scare), sank her, or sailed
+        // her to a friendly haven to sell. Only rarely
+        // did a prize join the fleet, and then only if
+        // she was a real upgrade. Old behavior — "every
+        // prize becomes a pirate" — produced runaway
+        // pirate growth in long benches.
+        let a_surviving = self
+            .ships
+            .get(attacker_id)
+            .map(|a| a.crew_alive)
+            .unwrap_or(0);
+
+        // Compute prize value (cargo + hull bounty)
+        // before mutating either ship. Cargo is valued
+        // at a flat wholesale ~20 pesos/ton (close to
+        // average bench prices for bulk goods like
+        // sugar/molasses); hull bounty scales with
+        // current hull integrity to reflect sale value
+        // at a pirate haven.
+        let (target_cargo_tons, target_hull, target_hull_max) = match self.ships.get(tgt) {
+            Some(t) => {
+                let stats = &self.ship_types.get(t.ship_type).stats;
+                (
+                    t.cargo.total_tons(),
+                    t.hull_integrity,
+                    stats.hull_integrity_max,
+                )
+            }
+            None => (0.0, 0.0, 0.0),
+        };
+        let cargo_silver = target_cargo_tons * 20.0;
+        let hull_bounty = target_hull * 8.0;
+
+        // Decide outcome. Real-upgrade check first
+        // (a 200-ton fluyt is no upgrade for a 60-ton
+        // sloop pirate); then crew-spareable check;
+        // then the weighted roll.
+        let attacker_hull_max = self
+            .ships
+            .get(attacker_id)
+            .map(|a| self.ship_types.get(a.ship_type).stats.hull_integrity_max)
+            .unwrap_or(0.0);
+        let could_upgrade = target_hull_max > attacker_hull_max * 1.2;
+        let prize_crew = ((a_surviving as f32) * crate::combat::PRIZE_CREW_SPLIT).round() as u16;
+        let attacker_after = a_surviving.saturating_sub(prize_crew);
+        let can_spare_crew = attacker_after >= a_min_crew && prize_crew >= 2;
+
+        let roll = combat_rng_step(&mut self.combat_rng_state);
+        // Outcome weights (sum to 1.0):
+        //   take    : 0.05 (only if real upgrade + crew spareable)
+        //   sell    : 0.30 (silver bonus, prize sunk)
+        //   sink    : 0.50 (default — cargo stripped, hull released/burned)
+        //   release : 0.15 (cargo stripped, target lives to trade again)
+        let take = could_upgrade && can_spare_crew && roll < 0.05;
+        let sell = !take && roll < 0.35;
+        let release = !take && !sell && roll >= 0.85;
+        // (sink is the default if none of the above)
+
+        // Apply stripped cargo + silver to attacker
+        // (and clear from target unless we're taking it).
+        if !take {
+            if let Some(a) = self.ships.get_mut(attacker_id) {
+                let bonus = if sell {
+                    cargo_silver + hull_bounty
+                } else {
+                    cargo_silver
+                };
+                a.silver += bonus;
+                a.morale = (a.morale + crate::ship::MORALE_GAIN_PRIZE_TAKEN).clamp(0.0, 1.0);
+            }
+            if let Some(t) = self.ships.get_mut(tgt) {
+                t.cargo = crate::cargo::Cargo::new();
+                t.silver = (t.silver * 0.1).max(0.0); // boarders took most of it
+            }
+        }
+
+        if take {
+            // Real upgrade — flip the prize. This is
+            // the *only* outcome that adds to the
+            // pirate fleet.
+            self.prizes_taken += 1;
+            let new_faction = self.ships.get(attacker_id).map(|a| a.faction);
+            // Detach the prize crew from the attacker
+            // pro-rata over seasoned (veterans split with
+            // the rest of the boarding party). Note:
+            // `prize_crew` was computed against
+            // `a_surviving` (post-melee), and the attacker
+            // already had `attacker_losses` applied above,
+            // so `crew_alive` here equals `a_surviving` —
+            // the detach below leaves it at `attacker_after`.
+            let (detached, detached_seasoned) = match self.ships.get_mut(attacker_id) {
+                Some(a) => {
+                    let d = a.detach_prize_crew(prize_crew);
+                    a.morale = (a.morale + crate::ship::MORALE_GAIN_PRIZE_TAKEN).clamp(0.0, 1.0);
+                    d
+                }
+                None => (0, 0),
+            };
+            debug_assert_eq!(
+                self.ships.get(attacker_id).map(|a| a.crew_alive),
+                Some(attacker_after),
+                "detach_prize_crew should leave attacker at attacker_after"
+            );
+            if let Some(t) = self.ships.get_mut(tgt) {
+                t.crew_alive = t.crew_alive.saturating_add(detached);
+                t.crew_seasoned = t.crew_seasoned.saturating_add(detached_seasoned);
+                t.policy = ShipPolicy::Pirate;
+                if let Some(f) = new_faction {
+                    t.faction = f;
+                }
+                t.morale = 0.8;
+                t.speed = 0.0;
+                t.nav.waypoints.clear();
+            }
+            if let Some(ai) = self.ship_ais.get_mut(tgt) {
+                ai.goal.destination = None;
+                ai.goal.dest_port = None;
+                ai.goal.pursue_target = None;
+                ai.goal.flee_from = None;
+            }
+        } else if sell || (!release) {
+            // Sell-at-haven and sink-as-default both
+            // result in the prize being removed from
+            // the world (we don't model the actual
+            // voyage to a pirate haven yet). The
+            // distinction lives in `prizes_sold` vs
+            // `prizes_sunk` for bench reporting.
+            if sell {
+                self.prizes_sold += 1;
+            } else {
+                self.prizes_sunk += 1;
+            }
+            if let Some(t) = self.ships.get_mut(tgt) {
+                t.hull_integrity = 0.0;
+                t.rigging_integrity = 0.0;
+                t.state = ShipState::Sunk;
+            }
+        } else {
+            // release — target survives, returns to
+            // trade with empty holds. The captain re-
+            // plans next tick (cargo is gone, but the
+            // hull and crew live).
+            self.prizes_released += 1;
         }
     }
 }
