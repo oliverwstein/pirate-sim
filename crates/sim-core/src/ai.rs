@@ -1030,6 +1030,7 @@ impl<'a> ShipBtContext<'a> {
             self.stats,
             provision_budget_days,
             home_bias,
+            Some(self.rng),
         );
         let plan = match plan {
             Some(p) => p,

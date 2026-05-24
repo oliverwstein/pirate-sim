@@ -1639,3 +1639,64 @@ cores.
 - Could chunk ships into batches with `par_chunks` to reduce
   per-task overhead for short ticks; not obviously worth the
   added complexity yet.
+
+---
+
+## Phase 7 — Stochastic trade destination selection (2025)
+
+**Context.** Eyeballing the visualizer after Phase 6 showed an
+obvious pathology: every ship at a given port picked the same
+"best" destination on the same tick, then they all sailed
+together, all arrived together, all sold into the same port at
+once. This is a direct consequence of strict argmax in
+`find_best_trade` — the planner is deterministic given the
+world state, so two ships looking at identical state make
+identical choices.
+
+**Fix.** `find_best_trade` now takes an optional `&mut SimRng`.
+
+- `rng = None` → strict argmax (existing behavior; preserved
+  for unit tests that want deterministic outcomes).
+- `rng = Some(_)` → softmax-sample over every candidate clearing
+  `MIN_PROFIT_THRESHOLD_PESOS_PER_TON`, weighted by
+  `exp((score - max_score) / TRADE_CHOICE_TEMPERATURE_PESOS_PER_TON)`.
+
+**Temperature tuning.** T = 10 pesos/ton:
+
+```
+score lead over runner-up    top option mass
+        0                          ~50%   (ties split evenly)
+       10                          ~73%
+       30                          ~95%
+       50                          ~99%
+```
+
+Strong opportunities still dominate; the change matters when
+several candidates are within a few pesos/ton of each other,
+which is exactly when the stampede pathology fires.
+
+**Plumbing.** `act_buy_best` passes `Some(self.rng)` from the
+behavior-tree context. Each ShipAI has its own seeded
+`SimRng`, so per-ship choices are deterministic given the seed
+and the world state — fleet-level stochasticity emerges from
+the *combination* of independent RNG streams, not from any
+global random source.
+
+**Calibration result.** `bench_trade` bankruptcies dropped from
+**36 → 14** (-61%). Spreading destinations across the fleet
+keeps the "best" port's stockpile from being drained in a single
+tick, which keeps prices healthier downstream and lets more
+voyages clear.
+
+**Perf cost.** AI phase avg 0.78 ms → 1.21 ms (+55%), max
+11.6 ms → 29.4 ms; wall time 595 ms → 909 ms (+53%) on
+bench_ai_tick (503-ship historical fleet, 720 ticks). Root
+cause: ships now visit a more diverse set of destinations, so
+the A* pathfind cache is hit less often and more fresh paths
+are computed per tick. The calibration win justifies the cost;
+if pathfind churn becomes problematic at larger fleet sizes,
+caching trade plans for K ticks (e.g. re-evaluate every 3-5
+dock visits) is the cleanest follow-up.
+
+**Validation.** 192 tests pass; clippy clean; bench_pathfind
+unchanged.

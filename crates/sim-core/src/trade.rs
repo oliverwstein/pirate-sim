@@ -58,6 +58,24 @@ const ONWARD_LOOKAHEAD_WEIGHT: f32 = 0.15;
 /// a dead-end loses to a marginal first leg into a working circuit.
 const DEAD_END_PENALTY_PESOS_PER_TON: f32 = 1.5;
 
+/// Temperature (pesos/ton) for the softmax distribution over
+/// candidate trades. When `find_best_trade` is called with an RNG,
+/// it samples from `exp((score - max_score) / TEMPERATURE)` over all
+/// candidates clearing the profit threshold, rather than picking the
+/// strict argmax. This breaks ties that would otherwise stampede
+/// every same-port ship to the same destination on the same tick.
+///
+/// At T = 10:
+///   - A 0-peso lead over the runner-up gives the top option ~50%
+///     mass (ties split evenly).
+///   - A 10-peso lead → top option ~73%.
+///   - A 30-peso lead → top option ~95%.
+///   - A 50-peso lead → top option ~99%.
+///
+/// I.e., strong opportunities still dominate; weak / similar
+/// alternatives draw real probability.
+pub const TRADE_CHOICE_TEMPERATURE_PESOS_PER_TON: f32 = 10.0;
+
 /// A planned trade leg: which good to buy, where to take it.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TradePlan {
@@ -108,6 +126,16 @@ pub struct HomeBias {
 /// a hypothetical C two ports out. The onward profit enters the
 /// scoring with `ONWARD_LOOKAHEAD_WEIGHT`, and destinations with no
 /// profitable onward leg are penalized by `DEAD_END_PENALTY_PESOS_PER_TON`.
+/// **Stochastic choice (postmortem #N).** If `rng` is `Some`, the
+/// planner softmax-samples over all candidates clearing
+/// `MIN_PROFIT_THRESHOLD_PESOS_PER_TON`, weighted by
+/// `exp((score - max_score) / TRADE_CHOICE_TEMPERATURE_PESOS_PER_TON)`.
+/// This decorrelates same-port same-tick decisions across a fleet
+/// (ships no longer all stampede to the single best destination).
+/// If `rng` is `None`, returns the strict argmax — the legacy
+/// behavior, used by tests that want deterministic single-ship
+/// outcomes.
+#[allow(clippy::too_many_arguments)]
 pub fn find_best_trade(
     origin_idx: usize,
     ports: &[Port],
@@ -116,6 +144,7 @@ pub fn find_best_trade(
     stats: &ShipStats,
     provision_days_budget: f32,
     home_bias: Option<HomeBias>,
+    rng: Option<&mut crate::sim_rng::SimRng>,
 ) -> Option<TradePlan> {
     if origin_idx >= ports.len() || origin_idx >= markets.len() {
         return None;
@@ -123,7 +152,11 @@ pub fn find_best_trade(
     let origin = &ports[origin_idx];
     let origin_market = &markets[origin_idx];
 
-    let mut best: Option<(TradePlan, f32)> = None; // (plan, score)
+    // Collect every viable candidate. `best` (argmax over score) is
+    // tracked alongside so the `rng = None` path returns exactly the
+    // same plan as before the stochastic refactor.
+    let mut best: Option<(TradePlan, f32)> = None;
+    let mut candidates: Vec<(TradePlan, f32)> = Vec::new();
     for good in goods.iter() {
         let buy_p = origin_market.buy_price(good.id, goods);
         // Refuse to even consider goods the origin is dry on — saves
@@ -190,24 +223,57 @@ pub fn find_best_trade(
 
             let score = profit + ONWARD_LOOKAHEAD_WEIGHT * onward_profit + bonus;
 
-            if profit > MIN_PROFIT_THRESHOLD_PESOS_PER_TON
-                && best.as_ref().is_none_or(|(_, s)| score > *s)
-            {
-                best = Some((
-                    TradePlan {
-                        good: good.id,
-                        dest_port: dest_idx,
-                        // Report the unbiased first-leg margin — the
-                        // score is internal to the planner; analytics
-                        // and ROI math want the raw per-ton profit.
-                        estimated_profit_per_ton: profit,
-                    },
-                    score,
-                ));
+            if profit > MIN_PROFIT_THRESHOLD_PESOS_PER_TON {
+                let plan = TradePlan {
+                    good: good.id,
+                    dest_port: dest_idx,
+                    // Report the unbiased first-leg margin — the
+                    // score is internal to the planner; analytics
+                    // and ROI math want the raw per-ton profit.
+                    estimated_profit_per_ton: profit,
+                };
+                if best.as_ref().is_none_or(|(_, s)| score > *s) {
+                    best = Some((plan, score));
+                }
+                candidates.push((plan, score));
             }
         }
     }
-    best.map(|(p, _)| p)
+
+    let (best_plan, max_score) = best?;
+
+    let rng = match rng {
+        Some(r) => r,
+        // Legacy deterministic path: argmax wins.
+        None => return Some(best_plan),
+    };
+
+    // Softmax sample over candidates. Subtracting `max_score` keeps
+    // the exponentials in [0, 1] for numerical stability. With T =
+    // 10 pesos/ton (the default), the top option still wins ~half
+    // the time on a flat tie and ~95% on a 30-peso lead, but the
+    // mass on near-equivalent alternatives is enough to decorrelate
+    // same-port stampedes.
+    let temp = TRADE_CHOICE_TEMPERATURE_PESOS_PER_TON.max(0.01);
+    let weights: Vec<f32> = candidates
+        .iter()
+        .map(|(_, s)| ((s - max_score) / temp).exp())
+        .collect();
+    let total: f32 = weights.iter().sum();
+    if !(total.is_finite() && total > 0.0) {
+        // Degenerate / NaN — fall back to argmax.
+        return Some(best_plan);
+    }
+    let mut threshold = rng.uniform_f32() * total;
+    for ((plan, _), w) in candidates.iter().zip(weights.iter()) {
+        threshold -= *w;
+        if threshold <= 0.0 {
+            return Some(*plan);
+        }
+    }
+    // Floating-point rounding — fall back to the last candidate
+    // (mathematically guaranteed to have had nonzero mass).
+    Some(candidates.last().map(|(p, _)| *p).unwrap_or(best_plan))
 }
 
 /// Single-leg search used by both the public `find_best_trade` (when
@@ -310,6 +376,7 @@ mod tests {
             &stats,
             full_budget(&stats),
             None,
+            None,
         )
         .expect("arbitrage should exist");
         assert_eq!(plan.dest_port, 1);
@@ -336,6 +403,7 @@ mod tests {
             &goods,
             &stats,
             full_budget(&stats),
+            None,
             None
         )
         .is_none());
@@ -362,6 +430,7 @@ mod tests {
             &goods,
             &stats,
             full_budget(&stats),
+            None,
             None
         )
         .is_none());
@@ -390,6 +459,7 @@ mod tests {
             &goods,
             &stats,
             full_budget(&stats),
+            None,
             None
         )
         .is_none());
@@ -466,6 +536,7 @@ mod tests {
             &goods,
             &stats,
             full_budget(&stats),
+            None,
             None,
         )
         .expect("at least one profitable first leg exists");
