@@ -360,6 +360,10 @@ fn main() {
             "Prize outcomes: {} taken (flipped to pirate), {} sold at haven, {} sunk, {} released",
             world.prizes_taken, world.prizes_sold, world.prizes_sunk, world.prizes_released,
         );
+        println!(
+            "Prize tow:      {} still in tow at end-of-run, {} orphaned (victor sank en route); arrived-and-sold tows are counted in `sold at haven` above",
+            world.prizes_in_tow, world.prizes_orphaned,
+        );
         // Step 10.b: non-combat attrition breakdown. Storm/foundering/
         // fire counters are sinkings only; storm damage that didn't
         // sink the hull lives in `weather.hazards.counters.storms_damaged`.

@@ -261,6 +261,19 @@ pub struct Ship {
     /// fire/disengage/re-fire thrash that would otherwise emerge from
     /// see_prey re-targeting the same ship next tick.
     pub disengaged_until_minute: u64,
+    /// Phase 4 §3c-2b: when set, this ship is a captured prize in tow
+    /// to `Some(victor_id)`. Its AI still runs normally, but a pre-AI
+    /// pass each tick copies the victor's `goal.destination` /
+    /// `goal.dest_port` into this ship's goal so the prize sails to
+    /// the same port as her captor. On docking, a post-AI pass pays
+    /// the victor `cargo_silver + hull_bounty` and despawns the prize
+    /// (state = Sunk, `prizes_sold` ++). If the victor sinks en route,
+    /// the prize is orphaned (`prize_owner` is cleared, the ship
+    /// continues with its last-known destination under its own AI;
+    /// captor's faction was already stamped at capture). `None` for
+    /// normal ships and for prizes resolved through `take` / `sink` /
+    /// `release` (those outcomes do not use the tow path).
+    pub prize_owner: Option<crate::types::ShipId>,
 }
 
 /// What the ship is doing while docked. Used by the docking sequence in
@@ -310,6 +323,7 @@ impl Ship {
             engaged_with: None,
             engagement_started_at_minute: 0,
             disengaged_until_minute: 0,
+            prize_owner: None,
         }
     }
 
@@ -372,6 +386,7 @@ impl Ship {
             engaged_with: None,
             engagement_started_at_minute: 0,
             disengaged_until_minute: 0,
+            prize_owner: None,
         }
     }
 
@@ -420,6 +435,7 @@ impl Ship {
             engaged_with: None,
             engagement_started_at_minute: 0,
             disengaged_until_minute: 0,
+            prize_owner: None,
         }
     }
 

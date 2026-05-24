@@ -84,6 +84,13 @@ pub struct World {
     pub prizes_sold: u32,
     pub prizes_sunk: u32,
     pub prizes_released: u32,
+    /// Phase 4 §3c-2b: prizes currently sailing to port under tow
+    /// (`prize_owner = Some(victor)`). Counter is incremented on
+    /// successful tow setup in `resolve_prize_action` and decremented
+    /// when the prize either docks (rolls into `prizes_sold`) or is
+    /// orphaned by a victor sinking (`prizes_orphaned`).
+    pub prizes_in_tow: u32,
+    pub prizes_orphaned: u32,
     /// Step 11.a: deterministic RNG for stochastic combat outcomes
     /// (prize handling, future morale rolls, etc.). Seeded once at
     /// `World::load`; same world state → same outcome trace.
@@ -169,6 +176,8 @@ impl World {
             prizes_sold: 0,
             prizes_sunk: 0,
             prizes_released: 0,
+            prizes_in_tow: 0,
+            prizes_orphaned: 0,
             combat_rng_state: 0x5052_495A_4520_5247_u64 ^ 0x9E37_79B9_7F4A_7C15,
             spatial: SpatialHash::new(),
             commands: Vec::new(),
@@ -604,6 +613,59 @@ impl World {
         // ordering for determinism across all three phases below.
         let ids: Vec<ShipId> = self.ships.keys().collect();
 
+        // ─── §3c-2b: Copy-owner-nav pass ─────────────────────────────
+        // Before any ship makes an AI decision this tick, propagate
+        // each victor's current destination/dest_port into every prize
+        // they have in tow. The prize will then run its normal AI tick
+        // — `act_sail` will plan a route to the same port. If the
+        // victor has sunk between ticks (no entry in `self.ships`), the
+        // prize is orphaned: clear `prize_owner` and let her continue
+        // with her last-known destination under her own (now-pirate)
+        // colors. This is the "no rescue from beyond the grave" rule.
+        let owner_goals: SecondaryMap<ShipId, (Option<crate::types::Position>, Option<usize>)> = {
+            let mut m = SecondaryMap::new();
+            for id in ids.iter().copied() {
+                if let Some(ai) = self.ship_ais.get(id) {
+                    m.insert(id, (ai.goal.destination, ai.goal.dest_port));
+                }
+            }
+            m
+        };
+        for id in ids.iter().copied() {
+            let owner = match self.ships.get(id).and_then(|s| s.prize_owner) {
+                Some(o) => o,
+                None => continue,
+            };
+            // Owner gone (sunk between ticks) → orphan.
+            if !self.ships.contains_key(owner) {
+                if let Some(s) = self.ships.get_mut(id) {
+                    s.prize_owner = None;
+                }
+                self.prizes_in_tow = self.prizes_in_tow.saturating_sub(1);
+                self.prizes_orphaned += 1;
+                continue;
+            }
+            // Owner has no plan yet (e.g., just docked / replanning).
+            // Leave the prize's current goal untouched this tick.
+            let Some(&(dest, dest_port)) = owner_goals.get(owner) else {
+                continue;
+            };
+            if dest.is_none() && dest_port.is_none() {
+                continue;
+            }
+            if let Some(ai) = self.ship_ais.get_mut(id) {
+                if ai.goal.destination != dest || ai.goal.dest_port != dest_port {
+                    ai.goal.destination = dest;
+                    ai.goal.dest_port = dest_port;
+                    // Invalidate any cached waypoints — the new port
+                    // forces a fresh A* on the next `act_sail` tick.
+                    if let Some(s) = self.ships.get_mut(id) {
+                        s.nav.waypoints.clear();
+                    }
+                }
+            }
+        }
+
         // ─── AI Phase (read-only over other ships) ───────────────────
         // Each ship's AI ticks against the pre-tick world snapshot
         // (`snapshots` + `spatial`) and pushes its intents into
@@ -891,6 +953,53 @@ impl World {
             } else {
                 ship.speed = 0.0;
             }
+        }
+
+        // ─── §3c-2b: Pay-at-port pass ────────────────────────────────
+        // Any prize-in-tow that finished her voyage this tick (i.e.,
+        // her AI docked her at her owner's destination port) settles:
+        // the victor receives `cargo_silver + hull_bounty` from her
+        // holds + hull, and the prize is marked Sunk so the Cleanup
+        // phase below despawns her. If the victor sank earlier this
+        // tick, payment is forfeited — the prize simply sinks
+        // (orphan-after-docking is a vanishingly rare race; the dock
+        // arrival itself means the orphan-detection pass above didn't
+        // fire this tick because the victor was still alive at AI Phase
+        // start). Mirrors the cargo_silver / hull_bounty formulae used
+        // in `resolve_prize_action` for instant-sell.
+        let arrived: Vec<ShipId> = self
+            .ships
+            .iter()
+            .filter_map(|(id, s)| {
+                if s.state == ShipState::Docked && s.prize_owner.is_some() {
+                    Some(id)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for id in arrived {
+            let (owner, cargo_silver, hull_bounty) = match self.ships.get(id) {
+                Some(p) => {
+                    let owner = p.prize_owner.expect("filtered to Some");
+                    let cargo_silver = p.cargo.total_tons() * 20.0;
+                    let hull_bounty = p.hull_integrity * 8.0;
+                    (owner, cargo_silver, hull_bounty)
+                }
+                None => continue,
+            };
+            if let Some(a) = self.ships.get_mut(owner) {
+                a.silver += cargo_silver + hull_bounty;
+                a.morale = (a.morale + crate::ship::MORALE_GAIN_PRIZE_TAKEN).clamp(0.0, 1.0);
+            }
+            if let Some(p) = self.ships.get_mut(id) {
+                p.prize_owner = None;
+                p.hull_integrity = 0.0;
+                p.rigging_integrity = 0.0;
+                p.state = ShipState::Sunk;
+            }
+            self.prizes_in_tow = self.prizes_in_tow.saturating_sub(1);
+            self.prizes_sold += 1;
         }
 
         // Phase 4 §3c-1: clear engagements that hit a terminal
@@ -1250,13 +1359,30 @@ impl World {
         //   sink    : 0.50 (default — cargo stripped, hull released/burned)
         //   release : 0.15 (cargo stripped, target lives to trade again)
         let take = could_upgrade && can_spare_crew && roll < 0.05;
-        let sell = !take && roll < 0.35;
+        let mut sell = !take && roll < 0.35;
         let release = !take && !sell && roll >= 0.85;
         // (sink is the default if none of the above)
 
+        // §3c-2b: if we picked `sell`, try the tow path first. We need
+        // a skeleton crew to sail the prize to port; if the victor
+        // can't spare one we fall through to instant-sell behavior.
+        let tow_crew = ((a_surviving as f32) * crate::combat::PRIZE_TOW_CREW_SPLIT)
+            .round()
+            .max(2.0) as u16;
+        let attacker_after_tow = a_surviving.saturating_sub(tow_crew);
+        let can_spare_tow = attacker_after_tow >= a_min_crew && tow_crew >= 2;
+        let sell_tow = sell && can_spare_tow;
+        // Instant-sell is the fallback when we picked sell but cannot
+        // spare crew for a skeleton.
+        let sell_instant = sell && !sell_tow;
+        // Keep `sell` true for backward-compatible code paths below
+        // that pay silver / sink the prize — those should only run
+        // for sell_instant.
+        sell = sell_instant;
+
         // Apply stripped cargo + silver to attacker
         // (and clear from target unless we're taking it).
-        if !take {
+        if !take && !sell_tow {
             if let Some(a) = self.ships.get_mut(attacker_id) {
                 let bonus = if sell {
                     cargo_silver + hull_bounty
@@ -1309,6 +1435,48 @@ impl World {
                 t.morale = 0.8;
                 t.speed = 0.0;
                 t.nav.waypoints.clear();
+            }
+            if let Some(ai) = self.ship_ais.get_mut(tgt) {
+                ai.goal.destination = None;
+                ai.goal.dest_port = None;
+                ai.goal.pursue_target = None;
+                ai.goal.flee_from = None;
+            }
+        } else if sell_tow {
+            // §3c-2b: prize sails to victor's port as a tow.
+            // Detach a skeleton prize crew from the victor, flip
+            // policy + faction so allies don't engage her, clear
+            // engagement + waypoints + destination (the pre-AI
+            // copy-owner pass will populate them from the victor
+            // each tick), and stamp `prize_owner`. Cargo + silver
+            // stay aboard and settle on arrival.
+            self.prizes_in_tow += 1;
+            let new_faction = self.ships.get(attacker_id).map(|a| a.faction);
+            let (detached, detached_seasoned) = match self.ships.get_mut(attacker_id) {
+                Some(a) => {
+                    let d = a.detach_prize_crew(tow_crew);
+                    a.morale = (a.morale + crate::ship::MORALE_GAIN_PRIZE_TAKEN).clamp(0.0, 1.0);
+                    d
+                }
+                None => (0, 0),
+            };
+            debug_assert_eq!(
+                self.ships.get(attacker_id).map(|a| a.crew_alive),
+                Some(attacker_after_tow),
+                "detach_prize_crew should leave attacker at attacker_after_tow"
+            );
+            if let Some(t) = self.ships.get_mut(tgt) {
+                t.crew_alive = t.crew_alive.saturating_add(detached);
+                t.crew_seasoned = t.crew_seasoned.saturating_add(detached_seasoned);
+                t.policy = ShipPolicy::Pirate;
+                if let Some(f) = new_faction {
+                    t.faction = f;
+                }
+                t.morale = 0.7;
+                t.speed = 0.0;
+                t.nav.waypoints.clear();
+                t.engaged_with = None;
+                t.prize_owner = Some(attacker_id);
             }
             if let Some(ai) = self.ship_ais.get_mut(tgt) {
                 ai.goal.destination = None;

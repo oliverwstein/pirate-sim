@@ -92,6 +92,15 @@ pub const WINNER_CASUALTY_RATE: f32 = 0.20;
 /// giving the prize enough hands to make port.
 pub const PRIZE_CREW_SPLIT: f32 = 0.5;
 
+/// Phase 4 §3c-2b: fraction of the victor's surviving crew transferred
+/// to a *tow* prize (the `sell` outcome — prize sails to the victor's
+/// port and sells on arrival). Smaller than `PRIZE_CREW_SPLIT` because
+/// the tow prize only needs enough hands to sail, not to fight. If the
+/// victor cannot spare even this many crew, `resolve_prize_action`
+/// falls back to the instant-sell behavior (cargo stripped + prize
+/// sunk, silver paid immediately).
+pub const PRIZE_TOW_CREW_SPLIT: f32 = 0.20;
+
 /// Minimum closest approach (NM) between two line segments over a unit
 /// tick. Both ships are modeled as travelling at constant velocity for
 /// the duration of the tick — a good approximation for the 1-hour

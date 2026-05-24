@@ -1195,3 +1195,30 @@ Final engaged-subtree priority: **strike → board → disengage → fight → f
 **Open question.** `act_board` currently still calls `maybe_fire_at` even when it has ordnance, which means a pirate with a healthy magazine and crippled prey will fire a softening broadside *and* attempt to board on the same tick. That's historically accurate (fire-and-board) but it does mean the boarding gate can fail (rigging may regenerate? no — actually it doesn't, but range may open if the target sails away after the broadside). In v1 we accept this — `maybe_board` re-gates `BOARDING_RANGE_NM` on the same tick using the *commanded* attacker velocity, so if the steer-toward-target keeps us in range, the board still fires.
 
 **Future work.** §3d (forts), §3e (calibration sweep), §3c-2b (Follow voyage), Phase 5 (Relations Matrix + naval boarders).
+
+---
+
+### Phase 4 §3c-2b — Prize tow via destination mirroring
+
+**Problem.** `resolve_prize_action`'s `sell` outcome was an instant-resolve: the prize despawned in place and the victor pocketed `cargo_silver + hull_bounty` immediately. That's a tolerable abstraction for sinkings but completely skips the period-canonical "prize sails to friendly port under a skeleton crew, sells, captor gets a share" arc — the one moment where pirate economics is most legible.
+
+**Design pivot from earlier draft.** The original spec called for a `follow_target` field plus a Follow BT branch with station-keeping math. Discarded as overkill: the prize doesn't need to formation-sail with her captor, she just needs to end up at the same port. Settled on the much simpler rule: **prize copies owner's destination each tick, runs her own AI, sells on dock.**
+
+**Implementation.**
+- `Ship.prize_owner: Option<ShipId>` added near the engagement fields. `None` for normal ships and for `take` / `sink` / `release` outcomes.
+- `combat::PRIZE_TOW_CREW_SPLIT = 0.20` (smaller than the 0.50 used for `take` — sailing only, no fighting).
+- `World.prizes_in_tow` / `prizes_orphaned` counters added.
+- `resolve_prize_action` sell branch split into `sell_tow` and `sell_instant`. Tow is chosen when the victor can spare `tow_crew` while staying ≥ `crew_min`. If not, the existing instant-sell behavior runs unchanged.
+- Two new passes in `tick_hourly_ai_and_physics`:
+  - **Pre-AI copy-owner-nav pass.** After the `ids` snapshot, build a `SecondaryMap<ShipId, (destination, dest_port)>` from every ship's current goal. Then for each ship with `prize_owner = Some(v)`: if `v` is gone, clear `prize_owner` + bump `prizes_orphaned`; else copy `v`'s goal into the prize's. Waypoints are cleared on change so `act_sail` re-routes.
+  - **Post-physics pay-at-port pass.** Scan for `state == Docked && prize_owner.is_some()`. Pay the victor `cargo_silver + hull_bounty` (same formulae as instant-sell), bump morale, mark the prize Sunk so the Cleanup phase reaps her, increment `prizes_sold`.
+
+**Orphan rule.** Settled on a universal "no rescue from beyond the grave": if the victor sinks, the prize's `prize_owner` is cleared and she continues with her last-known destination under her own (now-pirate, since the policy/faction were already flipped at capture) colors. No silver is paid. This is historically defensible (a prize crew with no captor would absolutely sell their own loot at the nearest friendly port — but we don't yet model that, so the loot just rides into oblivion when she eventually sinks or is engaged). Web-searched several period sources; the no-rescue rule was the cleanest invariant.
+
+**Scope limit.** `take` outcome stays instant flip-to-pirate in place. The user's "share a destination" intent technically applies to all prize voyages, but `take` is much rarer (0.05 weight, gated on hull upgrade) and the existing flip-in-place gives the new pirate captain a free re-plan, which is fine. Revisit in Phase 5 if it becomes a bottleneck.
+
+**Calibration shift.** 730d bench_trade 89 → **105 bankrupt** (~18% regression, well below the 118 ceiling that triggered the symmetric-engagement rewrite). The capital dip is real: a sell that used to pay out in tick T now pays in tick T + (voyage length), so victors run their wages owed up before the bonus lands. At end of run: 9 prizes still in tow, 1 orphaned, 2 instant-sold (crew-spare failure), 20 sunk, 8 released. Acceptable trade for the much richer narrative payoff.
+
+**Combat test fixture updated.** `pirate_boards_dismasted_merchant_and_resolves_prize` now also counts `prizes_in_tow` toward total outcomes and branches on `prize_owner` to recognize the tow case (cargo intact, policy flipped, prize_owner set) as distinct from `take` (cargo intact, policy flipped, no prize_owner) and `release` (cargo stripped, original policy).
+
+**Open question / future work.** The orphaning rule could be softened (prize crew "switches sides" to whichever faction's port is closest, sells under their own name) but that needs a port-affinity model that doesn't exist yet. Defer.

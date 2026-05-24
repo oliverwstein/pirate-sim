@@ -216,9 +216,14 @@ fn pirate_boards_dismasted_merchant_and_resolves_prize() {
 
     world.tick();
 
-    // Some prize outcome must have been recorded.
-    let total_outcomes =
-        world.prizes_taken + world.prizes_sold + world.prizes_sunk + world.prizes_released;
+    // Some prize outcome must have been recorded. §3c-2b: a sell roll
+    // now places the prize *in tow* rather than instantly sinking her,
+    // so `prizes_in_tow` counts toward the outcome tally.
+    let total_outcomes = world.prizes_taken
+        + world.prizes_sold
+        + world.prizes_sunk
+        + world.prizes_released
+        + world.prizes_in_tow;
     assert!(
         total_outcomes >= 1,
         "boarding should have produced at least one prize outcome, counters were 0"
@@ -234,19 +239,26 @@ fn pirate_boards_dismasted_merchant_and_resolves_prize() {
     assert!(pirate_after.crew_alive < pirate_stats.crew_typical());
 
     if let Some(merch) = world.ships.get(merchant_id) {
-        // If the merchant survived, it must be either released (still
-        // a merchant) or taken (flag flipped, faction inherited). In
-        // either case its cargo should have been stripped of sugar.
+        // §3c-2b: a `sell` outcome now sets the prize in tow rather
+        // than instant-selling. In that case the prize is still in
+        // the world with cargo intact, `prize_owner == Some(pirate)`,
+        // policy flipped to Pirate. Other surviving outcomes are
+        // `take` (flag flipped, cargo intact) and `release` (cargo
+        // stripped, original policy). Sink/instant-sell would have
+        // removed the ship from the world (handled in the `else`).
         let sugar_left = merch.cargo.get(SUGAR);
-        assert!(
-            sugar_left == 0.0,
-            "merchant's cargo should be stripped after the boarding (sugar={})",
-            sugar_left
-        );
-        if merch.policy == ShipPolicy::Pirate {
+        if merch.prize_owner == Some(pirate_id) {
+            assert_eq!(world.prizes_in_tow, 1);
+            assert_eq!(merch.policy, ShipPolicy::Pirate);
+        } else if merch.policy == ShipPolicy::Pirate {
             assert_eq!(world.prizes_taken, 1);
         } else {
             assert_eq!(world.prizes_released, 1);
+            assert!(
+                sugar_left == 0.0,
+                "released merchant's cargo should be stripped (sugar={})",
+                sugar_left
+            );
         }
     } else {
         // Ship gone: must have been sunk or sold (both reaped).
