@@ -238,6 +238,29 @@ pub struct Ship {
     /// "ready immediately"; a fresh ship can fire on its first hour.
     /// Updated to `current_minute + reload_minutes` on every fire.
     pub next_fire_at_minute: u64,
+    /// Phase 4 §3c-1 (symmetric redesign): the other ship this one is
+    /// currently engaged with. `Some(_)` flips on the first landed
+    /// broadside (mutually set on both ships via `World::engage`) and
+    /// clears on counterpart sunk / reaped, or on either side
+    /// tactically deciding to disengage (BT emits
+    /// `Command::Disengage`).
+    ///
+    /// While engaged, the BT's Engaged subtree is the top-priority
+    /// selector, branching each hour between disengage, pursue+fire,
+    /// flee+fire, and hold. There is no Attacker/Defender role — both
+    /// ships make symmetric tactical judgments from their own world
+    /// view (cellular-automaton style).
+    pub engaged_with: Option<crate::types::ShipId>,
+    /// Phase 4 §3c-1: the absolute `World::sim_minute` at which the
+    /// current engagement began. Used by surrender / prize heuristics
+    /// in later §3c sub-commits; for now just a record.
+    pub engagement_started_at_minute: u64,
+    /// Phase 4 §3c-1: cooldown stamp written by `Command::Disengage`.
+    /// While `sim_minute < disengaged_until_minute`, `World::engage`
+    /// refuses to set `engaged_with` on this ship, preventing the
+    /// fire/disengage/re-fire thrash that would otherwise emerge from
+    /// see_prey re-targeting the same ship next tick.
+    pub disengaged_until_minute: u64,
 }
 
 /// What the ship is doing while docked. Used by the docking sequence in
@@ -284,6 +307,9 @@ impl Ship {
             teredo_damage: 0.0,
             age_days: 0,
             next_fire_at_minute: 0,
+            engaged_with: None,
+            engagement_started_at_minute: 0,
+            disengaged_until_minute: 0,
         }
     }
 
@@ -343,6 +369,9 @@ impl Ship {
             teredo_damage: 0.0,
             age_days: 0,
             next_fire_at_minute: 0,
+            engaged_with: None,
+            engagement_started_at_minute: 0,
+            disengaged_until_minute: 0,
         }
     }
 
@@ -388,6 +417,9 @@ impl Ship {
             teredo_damage: 0.0,
             age_days: 0,
             next_fire_at_minute: 0,
+            engaged_with: None,
+            engagement_started_at_minute: 0,
+            disengaged_until_minute: 0,
         }
     }
 

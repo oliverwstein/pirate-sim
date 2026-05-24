@@ -1130,3 +1130,23 @@ New private helper `best_single_leg_excluding(origin, exclude, ...)` factored ou
 ### §3 — Sub-tick combat (next up)
 
 Pending; planning notes in `planning/phase-4-plan.md §3`.
+
+### §3c-1 — Symmetric engagement (CA-style per-hour tactical judgment)
+
+**Problem.** The initial §3c-1 implementation used a role-based design: the ship that opened fire became `Attacker`, the other `Defender`, and the engaged subtree branched on role. Two issues emerged: (1) the rigid role lock did not match the historical pattern where each captain re-evaluates fight/flee each hour from his own view, and (2) calibration regressed — `bench_trade 730` jumped from 85 baseline to 118 bankrupt, primarily because merchants tagged "Defender" were stuck in `FleeAndFire` even after the pirate had exhausted ordnance and was no longer a threat.
+
+**Alternatives considered.**
+- *Keep roles but add role-swap heuristics.* Rejected — adds complexity to preserve a label that does not earn its keep; the resulting logic would just be `should_fight`/`should_flee` reading role state.
+- *Drop the engaged branch entirely and lean on `see_threat`/`see_prey`.* Rejected — that's what the old code effectively did (the engaged branches were dead code in practice), and it gave no way to express "I commit to staying in this fight even though you're momentarily out of range" or to gate disengage on a cooldown.
+
+**Decision.** Symmetric engagement, no role enum. `engage(a, b)` is a mutual flip gated by a `disengaged_until_minute` cooldown. The engaged subtree is itself a Selector with priority-ordered conditions evaluated every hour from each ship's own snapshot: `should_disengage` → `should_fight` → `should_flee` → `hold`. A new `ShipCommand::Disengage { other }` clears both ships' `engaged_with` and stamps a 60-minute cooldown on both, preventing thrashing.
+
+`ShipSnapshot` was extended with `hull_frac` and `cannons` so the heuristics can compare strengths from world view alone.
+
+**Results.** Colosseum: scenarios 1/2/4/5 now end with `DEFENDER ESCAPED` at h65–h81 (merchants break off once pirates exhaust ordnance and pick `should_disengage`); scenario 3 still ends `TARGET SUNK` h12 (24-gun vs bark — expected). `bench_trade 730` = 100 bankrupt — above 85 baseline but well below the 118 role-based regression, within tolerance for §3c-1 (further calibration in §3.6).
+
+**BT framework pitfall (caught mid-validation).** While validating, the engaged branches appeared to never re-evaluate — `COND_IS_ENGAGED` was checked once at hour 0 and then never again, even though `engage()` was firing correctly. Root cause: the Selector in `bt.rs` has memory via `state.running_child[depth]`. When a child returns `Status::Running`, that child index is *cached* and re-entered next tick, **skipping higher-priority siblings entirely** until the cached child returns Success/Failure. `act_pursue` and `act_flee` were returning `Running`, so the BT never climbed back up to re-check `IS_ENGAGED`.
+
+**Fix.** `act_pursue` and `act_flee` now return `Status::Success` after pushing their intents. This forces a full top-down re-evaluation each tick — true CA-style judgment. Dock-tree actions that genuinely need multi-tick state (`act_resupply`, `act_careen`) keep `Running` deliberately. *This is the silent assumption to remember: in this codebase, any BT leaf that should be reconsidered every tick must return Success, not Running. Returning Running is a commitment to multi-tick state, not a polite "still working" signal.* The old role-based engaged branches were dead code masked by exactly this bug — `see_threat`/`see_prey` in the default subtree happened to produce roughly the right behavior, so no one noticed.
+
+**Future work.** §3c-2 (Strike + prize), §3c-3 (boarding integration), §3d (forts), §3e (calibration sweep — likely needs to revisit `should_disengage` thresholds and the "outnumbered" rule once Phase 5's relations matrix replaces the ShipPolicy hostile-proxy).

@@ -411,7 +411,9 @@ fn main() {
     if world.ships.len() > n_ships {
         let mut counts: std::collections::BTreeMap<&str, u32> = std::collections::BTreeMap::new();
         for &id in ship_ids.iter().skip(n_ships) {
-            let ship = &world.ships[id];
+            let Some(ship) = world.ships.get(id) else {
+                continue;
+            };
             let name = world.ship_types.get(ship.ship_type).name.as_str();
             *counts.entry(name).or_insert(0) += 1;
         }

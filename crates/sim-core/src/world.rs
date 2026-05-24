@@ -573,6 +573,12 @@ impl World {
                         } else {
                             1.0
                         },
+                        hull_frac: if stats.hull_integrity_max > 0.0 {
+                            (ship.hull_integrity / stats.hull_integrity_max).clamp(0.0, 1.0)
+                        } else {
+                            1.0
+                        },
+                        cannons: stats.cannons,
                     },
                 );
             }
@@ -671,6 +677,21 @@ impl World {
                 }
                 crate::command::ShipCommand::AttemptBoard { target: tgt } => {
                     boardings.push((attacker, tgt));
+                }
+                // Phase 4 §3c-1 (symmetric redesign): mutually clear
+                // engagement flags and stamp a 60-minute cooldown on
+                // both sides so the next fired broadside this hour
+                // does not immediately re-engage them. Silent no-op if
+                // either ship is gone or the pair is no longer
+                // engaged (idempotent).
+                crate::command::ShipCommand::Disengage { other } => {
+                    let cooldown_until = self.sim_minute + 60;
+                    for x in [attacker, other] {
+                        if let Some(s) = self.ships.get_mut(x) {
+                            s.engaged_with = None;
+                            s.disengaged_until_minute = cooldown_until;
+                        }
+                    }
                 }
             }
         }
@@ -835,6 +856,14 @@ impl World {
             }
         }
 
+        // Phase 4 §3c-1: clear engagements that hit a terminal
+        // condition this hour (counterpart sunk, defender escaped).
+        // Runs after physics so the post-physics range/rigging values
+        // are what the escape check sees; runs before Cleanup so a
+        // ship sunk this hour is still visible with `state == Sunk`
+        // for the counterpart-gone check.
+        self.check_engagement_terminations();
+
         // Step 8: Cleanup Phase. Reap any ships marked Sunk this tick
         // (by broadside hull breach or by burning a captured prize).
         // Removing from `ships` bumps the SlotMap generation, so the
@@ -962,6 +991,76 @@ impl World {
                     if target_ship.hull_integrity <= 0.0 && target_ship.state != ShipState::Sunk {
                         target_ship.state = ShipState::Sunk;
                     }
+                }
+                // Phase 4 §3c-1: any landed broadside mutually engages
+                // both ships if they are not already locked into a
+                // different engagement. First-engaged wins — a third
+                // ship that fires later does not pull either party out
+                // of the active duel. Skipped if the target sank on
+                // this fire (no point engaging a wreck).
+                let target_alive = self
+                    .ships
+                    .get(target_id)
+                    .map(|t| t.state != ShipState::Sunk)
+                    .unwrap_or(false);
+                if target_alive {
+                    self.engage(attacker_id, target_id);
+                }
+            }
+        }
+    }
+
+    /// Phase 4 §3c-1 (symmetric redesign): mutually flip both ships
+    /// into an engagement. No role distinction — both parties make
+    /// independent tactical decisions each hour via the BT's engaged
+    /// subtree (disengage / pursue+fire / flee+fire / hold).
+    ///
+    /// First-engaged wins: if either ship already has
+    /// `engaged_with == Some(_)` (pointing at any ship, including a
+    /// different one), its state is left alone — the existing
+    /// engagement keeps priority until it clears.
+    ///
+    /// Disengage cooldown: a ship within its `disengaged_until_minute`
+    /// window is not re-engaged here, so a tactical Disengage
+    /// commitment is not undone by the next stray broadside.
+    fn engage(&mut self, firer_id: ShipId, victim_id: ShipId) {
+        let now = self.sim_minute;
+        for (a_id, b_id) in [(firer_id, victim_id), (victim_id, firer_id)] {
+            if let Some(a) = self.ships.get_mut(a_id) {
+                if a.engaged_with.is_none() && now >= a.disengaged_until_minute {
+                    a.engaged_with = Some(b_id);
+                    a.engagement_started_at_minute = now;
+                }
+            }
+        }
+    }
+
+    /// Phase 4 §3c-1 (symmetric redesign): clear stale engagement
+    /// flags. Runs once per hour after the Mutation/Physics Phase, so
+    /// positions/rigging/state reflect this hour's outcomes.
+    ///
+    /// Only one terminal condition is handled here: **counterpart
+    /// gone** (sunk or reaped). All other engagement ends — out of
+    /// ordnance, escape, lost contact — are now tactical-judgment
+    /// decisions made each hour by the BT's engaged subtree, which
+    /// emits `Command::Disengage` to mutually clear the flag.
+    fn check_engagement_terminations(&mut self) {
+        let ids: Vec<ShipId> = self.ships.keys().collect();
+        for id in ids {
+            let other_id = match self.ships.get(id) {
+                Some(s) => match s.engaged_with {
+                    Some(o) => o,
+                    None => continue,
+                },
+                None => continue,
+            };
+            let other_dead = match self.ships.get(other_id) {
+                None => true,
+                Some(o) => o.state == ShipState::Sunk,
+            };
+            if other_dead {
+                if let Some(s) = self.ships.get_mut(id) {
+                    s.engaged_with = None;
                 }
             }
         }

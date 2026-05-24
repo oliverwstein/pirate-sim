@@ -174,54 +174,68 @@ next_fire_at = now + reload_minutes(participant)
 
 The §3b sub-tick fire loop made one thing obvious in the colosseum: without an engagement concept, combat sputters out. The AI re-decides every hour, no party commits to the chase, no party considers surrender, and a fleeing ship simply drifts out of range until next-hour AI silently disengages. §3.4 fixes this by making "engagement" a real state expressed through the BT (no hardcoded override), and by defining the terminal conditions under which an engagement ends.
 
-#### 3.4.1 Engagement state
+#### 3.4.1 Engagement state (symmetric — no roles)
 
 New fields on `Ship`:
 
 ```rust
 pub engaged_with: Option<ShipId>,
-pub engagement_role: EngagementRole, // Attacker | Defender | NotEngaged
 pub engagement_started_at_minute: u64,
-pub follow_target: Option<ShipId>,   // prize ships following their captor
+pub disengaged_until_minute: u64,    // cooldown gate against immediate re-engage
+pub follow_target: Option<ShipId>,   // prize ships following their captor (§3c-2)
 ```
 
-Mutually set on the first landed broadside (or first `AttemptBoard`). The ship that opened fire (or initiated the boarding attempt) becomes `Attacker`; the other becomes `Defender`. Forts entering combat with a ship also set the ship's engagement (fort is `Attacker`-equivalent — no engaged-with `ShipId` needed since forts are immobile).
+There is **no `EngagementRole`**. Engagement is a symmetric mutual flag set on the first landed broadside (or first `AttemptBoard`). Both ships simply know "I am currently engaged with `other`". The two parties may have very different *tactical postures* (one closing, one fleeing, one boarding-bound) but those postures are decided each hour by each ship's BT from its own snapshot of the world — never imposed by a role label set at engagement onset.
 
-#### 3.4.2 BT extension (no override)
+Rationale: a role-based design (Attacker/Defender locked at first fire) forced a rigid asymmetry that did not match the historical CA pattern, broke bench_trade calibration, and made the engaged subtree dead code in practice. The symmetric design lets each ship judge each hour whether it prefers to fight, flee, disengage, or hold — which is what real captains did.
 
-The ship BT gains a high-priority `Engaged` branch at the top of its selector:
+`engage(a, b)` performs a mutual flip, gated by both ships' `disengaged_until_minute` cooldown. Forts entering combat with a ship also set the ship's engagement (fort side is immobile and needs no `engaged_with`).
+
+#### 3.4.2 BT extension (symmetric engaged subtree)
+
+The ship BT gains a high-priority engaged branch at the top of its selector. The subtree is itself a Selector whose ordered options each ship re-evaluates **every hour** from its own snapshot:
 
 ```
 Selector
-├─ engaged?
-│   └─ engaged_subtree
-│       ├─ should_surrender? → Strike
-│       ├─ can_board?         → AttemptBoard
-│       ├─ role == Attacker   → PursueAndFire (steer to close, FireBroadside)
-│       └─ role == Defender   → FleeAndFire   (steer to open, FireBroadside)
-├─ follow_target.is_some()? → Follow (match leader speed + station)
+├─ Sequence
+│   ├─ IS_ENGAGED?
+│   └─ Selector
+│       ├─ Sequence(SHOULD_DISENGAGE? → Disengage)
+│       ├─ Sequence(SHOULD_FIGHT?     → PursueAndFire)   // sets pursue_target = engaged_with
+│       ├─ Sequence(SHOULD_FLEE?      → FleeAndFire)     // sets flee_from   = engaged_with
+│       └─ Hold                                          // fallback: maintain station
+├─ follow_target.is_some()? → Follow (match leader speed + station, §3c-2)
 └─ default subtree (trade / patrol / loiter)
 ```
 
-The "engagement lock" is **emergent**, not imperative: as long as `engaged_with.is_some()`, the engaged branch wins the selector. No imperative override of the AI. This keeps the flyweight BT pattern intact.
+The "engagement lock" is **emergent**, not imperative: as long as `engaged_with.is_some()`, the engaged branch wins the selector. The three judgment conditions are checked in priority order each tick and the first that fires drives behavior:
+
+- **`should_disengage`** — lost contact (counterpart snapshot gone), OR out of ordnance with no viable boarding option, OR own hull < 30% while target hull > 70% (clear losing position), OR outnumbered (visible hostiles > visible allies + 1, by-policy proxy until Phase 5 relations matrix).
+- **`should_fight`** — have ordnance AND (firepower edge OR speed edge OR target rigging crippled). Sets `goal.pursue_target = engaged_with` so `act_pursue` closes.
+- **`should_flee`** — fall-through when engaged but not winning and not catastrophically losing. Sets `goal.flee_from = engaged_with` so `act_flee` opens range.
+- **`hold`** — final fallback; rare in practice.
+
+> **BT framework note (lesson from §3c-1 implementation):** the Selector in `bt.rs` has memory via `state.running_child[depth]`. A child returning `Status::Running` is *cached* and re-entered next tick, skipping higher-priority siblings. For the engaged subtree to truly re-evaluate top-down each hour (CA-style), `act_pursue` and `act_flee` must return `Status::Success`, not `Running`. Dock-tree actions that genuinely need multi-tick state (`act_resupply`, `act_careen`) keep `Running`. See `planning/development-log.md`.
 
 #### 3.4.3 Firing cadence (clarification)
 
-Unchanged from §3b: the BT emits **one `FireBroadside` intent per hour per attacker** ("I intend to keep firing this hour"). The actual cannon discharges happen on the 5-min sub-tick gated by `reload_minutes(seasoned_ratio)`, range, and ordnance. The BT decides *what to do*; the sub-tick decides *when cannons can physically fire*.
+Unchanged from §3b: the BT emits **one `FireBroadside` intent per hour per ship** ("I intend to keep firing this hour"). The actual cannon discharges happen on the 5-min sub-tick gated by `reload_minutes(seasoned_ratio)`, range, and ordnance. The BT decides *what to do*; the sub-tick decides *when cannons can physically fire*. Because both ships in an engagement may choose `should_fight`, both will emit `FireBroadside` and the sub-tick exchange is naturally bilateral.
 
 #### 3.4.4 Terminal conditions
 
 The engagement ends (clearing `engaged_with` for both ships) on the first of:
 
-1. **Sink** — hull ≤ 0. No prize. Crew loss handled by existing morale/casualty path.
-2. **Strike (surrender)** — defender's BT emits `Strike` when `morale × hull_fraction < strike_threshold` AND defender cannot outrun attacker (`defender.effective_speed ≤ attacker.effective_speed`). Triggers §3.4a prize handling.
-3. **Boarded** — `resolve_boarding` returns a winner. Winner's BT runs the same §3.4a victor decision tree on the loser.
-4. **Escape** — `range > escape_threshold_nm` AND `defender.effective_speed > attacker.effective_speed` for `K_ESCAPE_HOURS` consecutive hours. Both ships clear engagement; defender resumes normal AI; attacker re-enters its default subtree (which may re-engage another target or resume trade).
+1. **Sink** — hull ≤ 0. Counterpart's `check_engagement_terminations` clears its `engaged_with` when the other ship is gone/sunk. No prize.
+2. **Disengage (mutual or unilateral)** — either ship emits `ShipCommand::Disengage { other }`. Resolution clears `engaged_with` on *both* ships and stamps `disengaged_until_minute = sim_minute + 60` on both, preventing immediate re-engagement. The fleeing party then opens range under its `FleeAndFire`/normal-AI logic.
+3. **Strike (surrender)** — §3c-2. A ship's BT emits `Strike` when its own state has collapsed (`morale × hull_fraction < strike_threshold`) AND it cannot outrun the counterpart. Triggers §3.4a prize handling.
+4. **Boarded** — §3c-3. `resolve_boarding` returns a winner. Winner's BT runs the §3.4a victor decision tree on the loser.
 
-Constants (initial values, subject to calibration in §3.6):
-- `strike_threshold = 0.15` (morale × hull-fraction)
-- `escape_threshold_nm = 4.0`
-- `K_ESCAPE_HOURS = 2`
+Note: there is no explicit "escape" terminal. Escape is now an *emergent* consequence of one party choosing `Disengage` (or simply outrunning the other while both stay engaged until ordnance runs dry and the slower side picks `should_disengage`). The 60-minute cooldown prevents engagement thrashing without baking in a fixed "K hours of distance" rule.
+
+Constants (current values, subject to calibration in §3.6):
+- `ESCAPE_THRESHOLD_NM = 4.0` — tactical input to `should_disengage`/`should_flee` heuristics (range above which "lost contact" can fire).
+- `disengage cooldown = 60 minutes`.
+- `strike_threshold = 0.15` (morale × hull-fraction) — §3c-2.
 
 #### 3.4a Prize mechanics
 
@@ -278,7 +292,7 @@ Drop the anchor hack from `examples/colosseum.rs`. Each scenario now spawns two 
 
 Implement in three sub-commits (each green on fmt/clippy/test):
 
-- **§3c-1**: Engagement state (fields + EngagementRole), BT `Engaged` branch, sink + escape terminal conditions. Colosseum drops anchor; scenarios resolve as Sunk or Escaped.
+- **§3c-1**: Symmetric engagement state (`engaged_with`, `engagement_started_at_minute`, `disengaged_until_minute` — no role enum), `IS_ENGAGED` + nested-Selector engaged subtree with `should_disengage`/`should_fight`/`should_flee`/`hold` heuristics, `Disengage` command + 60-min cooldown, sink terminal condition. Colosseum drops anchor; scenarios resolve as Sunk or as mutual-Disengage (emergent escape).
 - **§3c-2**: `Strike` command + surrender condition + `PrizeAction` decision tree + Follow BT branch + prize-sells-at-port. Colosseum shows Surrendered outcomes.
 - **§3c-3**: Boarding integrates with PrizeAction (boarding victor runs same decision tree). `AttemptBoard` becomes a legitimate engaged-subtree choice when rigging conditions permit.
 

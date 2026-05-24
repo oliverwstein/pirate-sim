@@ -230,6 +230,16 @@ pub const MINUTES_PER_SUB_TICK: u64 = 5;
 /// Phase 4 §3b: number of sub-tick steps per hourly tick.
 pub const SUB_TICKS_PER_HOUR: u64 = 12;
 
+// ── Phase 4 §3c-1: tactical-judgment threshold ──────────────────────────
+
+/// Range (NM) beyond which a ship may consider the engaged counterpart
+/// to be "opening" rather than "closing". Used by tactical-judgment
+/// conditions in `ai.rs` (e.g., a slower defender that has already
+/// pulled past this threshold and is faster may safely break off).
+/// Tuned to roughly two cannon ranges so a single tack outside the
+/// fight envelope does not count as a real opening.
+pub const ESCAPE_THRESHOLD_NM: f32 = 4.0;
+
 #[cfg(test)]
 mod tests {
     use super::*;

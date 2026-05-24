@@ -44,4 +44,13 @@ pub enum ShipCommand {
     /// below `stats.crew_min()` — burns the prize instead
     /// (`target.state = Sunk`). Loser flees if it survives.
     AttemptBoard { target: ShipId },
+    /// Phase 4 §3c-1 (symmetric redesign): voluntarily break off an
+    /// active engagement with `other`. Resolved by the world by
+    /// mutually clearing `engaged_with` on both ships and stamping a
+    /// short cooldown (`disengaged_until_minute`) so the pair does not
+    /// immediately re-engage on the next fired broadside. Either party
+    /// can emit this — the decision is purely tactical (out of
+    /// ordnance, badly outclassed, outnumbered, or lost visual
+    /// contact). See `ai.rs::COND_SHOULD_DISENGAGE`.
+    Disengage { other: ShipId },
 }

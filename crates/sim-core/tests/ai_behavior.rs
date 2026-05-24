@@ -32,6 +32,11 @@ fn apply_commands(ship: &mut Ship, commands: &[(ShipId, ShipCommand)]) {
                 // Step 8: same — boarding resolution lives in the
                 // world. Single-ship tests just confirm the intent.
             }
+            ShipCommand::Disengage { .. } => {
+                // Phase 4 §3c-1: engagement-flag mutation lives in
+                // the world. Single-ship tests just confirm the
+                // intent.
+            }
         }
     }
 }
@@ -896,6 +901,8 @@ fn pirate_sees_and_pursues_merchant_in_range() {
             cargo_capacity_tons: stats.cargo_capacity_tons + 50.0,
             velocity: (0.0, 0.0),
             rigging_frac: 1.0,
+            hull_frac: 1.0,
+            cannons: 0,
         },
     );
     // Pirate also in the snapshot (matching the per-tick map shape).
@@ -909,6 +916,8 @@ fn pirate_sees_and_pursues_merchant_in_range() {
             cargo_capacity_tons: stats.cargo_capacity_tons,
             velocity: (0.0, 0.0),
             rigging_frac: 1.0,
+            hull_frac: 1.0,
+            cannons: 0,
         },
     );
     let mut spatial = SpatialHash::new();
@@ -977,6 +986,8 @@ fn merchant_flees_when_pirate_in_range() {
             cargo_capacity_tons: stats.cargo_capacity_tons,
             velocity: (0.0, 0.0),
             rigging_frac: 1.0,
+            hull_frac: 1.0,
+            cannons: 0,
         },
     );
     snapshots.insert(
@@ -989,6 +1000,8 @@ fn merchant_flees_when_pirate_in_range() {
             cargo_capacity_tons: stats.cargo_capacity_tons,
             velocity: (0.0, 0.0),
             rigging_frac: 1.0,
+            hull_frac: 1.0,
+            cannons: 0,
         },
     );
     let mut spatial = SpatialHash::new();
@@ -1043,6 +1056,8 @@ fn pirate_ignores_other_pirate() {
             cargo_capacity_tons: stats.cargo_capacity_tons + 100.0,
             velocity: (0.0, 0.0),
             rigging_frac: 1.0,
+            hull_frac: 1.0,
+            cannons: 0,
         },
     );
     snapshots.insert(
@@ -1055,6 +1070,8 @@ fn pirate_ignores_other_pirate() {
             cargo_capacity_tons: stats.cargo_capacity_tons,
             velocity: (0.0, 0.0),
             rigging_frac: 1.0,
+            hull_frac: 1.0,
+            cannons: 0,
         },
     );
     let mut spatial = SpatialHash::new();

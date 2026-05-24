@@ -41,6 +41,12 @@ const ACT_SELL_ALL: usize = 6;
 const ACT_BUY_BEST: usize = 7;
 const ACT_PURSUE: usize = 8;
 const ACT_FLEE: usize = 9;
+// Phase 4 §3c-1 (symmetric redesign): engaged-subtree leaf actions.
+// ACT_DISENGAGE emits Command::Disengage to mutually clear the
+// engagement flag and start a cooldown. ACT_HOLD is a no-op (no Steer
+// command; the ship coasts on its previous heading while it reloads).
+const ACT_DISENGAGE: usize = 10;
+const ACT_HOLD: usize = 11;
 
 // --- Condition IDs ---
 const COND_IS_DOCKED: usize = 0;
@@ -50,6 +56,18 @@ const COND_IS_SAILING_PIRATE: usize = 3;
 const COND_IS_SAILING_MERCHANT: usize = 4;
 const COND_SEE_PREY: usize = 5;
 const COND_SEE_THREAT: usize = 6;
+// Phase 4 §3c-1 (symmetric redesign): engaged-subtree conditions.
+// COND_IS_ENGAGED gates the whole engaged subtree; the three tactical
+// conditions below answer "what should I do this hour?" using only
+// own state plus visible-ship snapshots (CA-style — every ship makes
+// its own decision, no roles, no global authority). Each tactical
+// condition also writes `goal.pursue_target` / `goal.flee_from` as a
+// side effect so the existing ACT_PURSUE / ACT_FLEE handlers reach
+// the engaged counterpart.
+const COND_IS_ENGAGED: usize = 7;
+const COND_SHOULD_DISENGAGE: usize = 8;
+const COND_SHOULD_FIGHT: usize = 9;
+const COND_SHOULD_FLEE: usize = 10;
 
 /// Step 6: visual range (NM) at which a captain can identify another
 /// ship — her flag, her trim, her freeboard (loaded vs light). Sized
@@ -166,7 +184,45 @@ fn build_ship_bt() -> Behavior {
         // not pursue or flee — pirates loitering at Tortuga ignore
         // passing merchants, and a merchant at the dock can't run.
         Behavior::Sequence(vec![Behavior::Condition(COND_IS_DOCKED), dock_tree]),
-        // Priority 2 (Step 6): A sailing pirate that sees prey chases
+        // Priority 2 (Phase 4 §3c-1, symmetric redesign): engaged
+        // subtree. Top-priority because once shots have been
+        // exchanged the ship is in mortal danger and trade / patrol
+        // can wait. Inside the subtree, four tactical branches are
+        // tried in order each hour:
+        //   1. Disengage — out of ordnance, badly outclassed,
+        //      outnumbered, or lost contact: emit Disengage to
+        //      mutually clear the flag and earn a cooldown.
+        //   2. Fight — firepower / speed / hull advantage: pursue
+        //      and broadside the engaged counterpart. Pirates may
+        //      also attempt to board via the existing maybe_board
+        //      path inside ACT_PURSUE.
+        //   3. Flee — slower, weaker, or low on shot but not yet
+        //      ready to disengage: flee toward the nearest port and
+        //      bark back with stern chasers.
+        //   4. Hold — default: no Steer command; ship coasts on its
+        //      previous course while it reloads.
+        // Both parties run this same selector — there is no Attacker
+        // / Defender distinction. Tactical truth is local: each ship
+        // decides from its own state and the snapshots it can see.
+        Behavior::Sequence(vec![
+            Behavior::Condition(COND_IS_ENGAGED),
+            Behavior::Selector(vec![
+                Behavior::Sequence(vec![
+                    Behavior::Condition(COND_SHOULD_DISENGAGE),
+                    Behavior::Action(ACT_DISENGAGE),
+                ]),
+                Behavior::Sequence(vec![
+                    Behavior::Condition(COND_SHOULD_FIGHT),
+                    Behavior::Action(ACT_PURSUE),
+                ]),
+                Behavior::Sequence(vec![
+                    Behavior::Condition(COND_SHOULD_FLEE),
+                    Behavior::Action(ACT_FLEE),
+                ]),
+                Behavior::Action(ACT_HOLD),
+            ]),
+        ]),
+        // Priority 4 (Step 6): A sailing pirate that sees prey chases
         // it. Side effect: `see_prey` records / refreshes the target
         // id in `goal.pursue_target`; `act_pursue` reads truth-position
         // from the per-tick snapshot. Above trade because hunting is
@@ -434,6 +490,16 @@ pub struct ShipSnapshot {
     /// `stats.rigging_integrity_max`. Used by Step 8 boarding-gate:
     /// a target with healthy rigging can outrun grapples.
     pub rigging_frac: f32,
+    /// Current hull integrity, as a fraction of
+    /// `stats.hull_integrity_max`. Used by §3c-1 tactical-judgment
+    /// conditions to compare own hull state against the engaged
+    /// counterpart (e.g., disengage if I'm under 30% and they're over
+    /// 70%).
+    pub hull_frac: f32,
+    /// Number of broadside cannons. Used by §3c-1 tactical-judgment
+    /// conditions to compare firepower against the engaged
+    /// counterpart without consulting the ship-type registry.
+    pub cannons: u16,
 }
 
 /// Simple xorshift64 RNG — deterministic and fast.
@@ -989,7 +1055,15 @@ impl<'a> ShipBtContext<'a> {
         if self.ship.policy == ShipPolicy::Pirate {
             self.maybe_board(target_id, target.position, attacker_vel, target);
         }
-        Status::Running
+        // Phase 4 §3c-1 (symmetric redesign): return Success rather
+        // than Running so the outer BT Selector resets its memory
+        // each tick. The engaged subtree must be free to preempt on
+        // the next hour (e.g., switch from Fight to Disengage once
+        // ordnance runs out). Returning Running would pin the
+        // Selector at this child forever, masking the engaged
+        // branch's higher priority. CA-style re-evaluation requires
+        // a fresh selector pass each hour.
+        Status::Success
     }
 
     fn act_flee(&mut self) -> Status {
@@ -1064,7 +1138,9 @@ impl<'a> ShipBtContext<'a> {
         // off a pursuit.
         let attacker_vel = velocity_from(heading, speed);
         self.maybe_fire_at(threat_id, threat.position, attacker_vel, threat.velocity);
-        Status::Running
+        // See `act_pursue`: return Success so the BT Selector
+        // re-evaluates priorities from the top each tick.
+        Status::Success
     }
 
     /// Step 7: emit a `FireBroadside` if the target's *closest approach*
@@ -1243,6 +1319,181 @@ impl<'a> ShipBtContext<'a> {
             false
         }
     }
+
+    // ── Phase 4 §3c-1 (symmetric redesign): engaged-subtree leaves ──
+
+    /// Action: mutually clear the engagement with `engaged_with` by
+    /// emitting `Command::Disengage`. Also clears local goal pointers
+    /// so the next tick's normal selector branches start clean. If
+    /// `engaged_with` is somehow unset, falls through harmlessly.
+    fn act_disengage(&mut self) -> Status {
+        let Some(other) = self.ship.engaged_with else {
+            return Status::Failure;
+        };
+        self.commands
+            .push((self.me, ShipCommand::Disengage { other }));
+        // Drop stale pursue/flee targets so the next tick re-evaluates
+        // see_prey / see_threat freshly rather than locking back on
+        // the just-disengaged ship inside the cooldown window.
+        if self.goal.pursue_target == Some(other) {
+            self.goal.pursue_target = None;
+        }
+        if self.goal.flee_from == Some(other) {
+            self.goal.flee_from = None;
+        }
+        Status::Success
+    }
+
+    /// Action: hold station — emit no Steer command. The ship coasts
+    /// on its previous heading and speed (physics integrates the last
+    /// commanded velocity). This is the default for an engaged ship
+    /// that has no compelling fight, flee, or disengage decision —
+    /// typically because it is mid-reload and waiting for the next
+    /// sub-tick fire window.
+    fn act_hold(&mut self) -> Status {
+        Status::Success
+    }
+
+    /// Tactical condition: should this ship break off the engagement
+    /// this hour?
+    ///
+    /// True if any of:
+    ///   * **Lost contact** — engaged counterpart is not in the
+    ///     snapshot map (sailed out of visual range, docked, or
+    ///     reaped). No point keeping the flag set.
+    ///   * **Out of ordnance with no boarding option** — cannot fire
+    ///     a broadside this hour AND either I'm not a Pirate or the
+    ///     target's rigging is still healthy enough to outrun a
+    ///     grapple.
+    ///   * **Badly outclassed** — my hull is below 30% while the
+    ///     target's is above 70%. Time to live to fight another day.
+    ///   * **Outnumbered** — counting hostile (different-policy)
+    ///     vs allied (same-policy) ships within visual range, the
+    ///     hostiles outnumber my allies by more than one. The
+    ///     engaged counterpart counts as one hostile.
+    fn should_disengage(&self) -> bool {
+        let Some(other) = self.ship.engaged_with else {
+            return false;
+        };
+        // Lost contact.
+        let Some(other_snap) = self.snapshots.get(other) else {
+            return true;
+        };
+
+        // Out of ordnance + no realistic board option.
+        let no_fire = if self.stats.cannons == 0 {
+            true
+        } else {
+            let (need_p, need_s) = crate::combat::broadside_supply_cost(self.stats.cannons);
+            self.ship.cargo.get(crate::goods::ids::GUNPOWDER) < need_p
+                || self.ship.cargo.get(crate::goods::ids::CANNON_SHOT) < need_s
+        };
+        let can_board = self.ship.policy == ShipPolicy::Pirate
+            && self.ship.crew_alive >= 2
+            && other_snap.rigging_frac < crate::combat::BOARDING_RIGGING_THRESHOLD;
+        if no_fire && !can_board {
+            return true;
+        }
+
+        // Badly outclassed.
+        let my_hull_frac = if self.stats.hull_integrity_max > 0.0 {
+            (self.ship.hull_integrity / self.stats.hull_integrity_max).clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        if my_hull_frac < 0.3 && other_snap.hull_frac > 0.7 {
+            return true;
+        }
+
+        // Outnumbered. Walk visible neighbours (cheap — handful of
+        // ships per tick at sea); count by policy. The engaged
+        // counterpart shows up in the hostile tally.
+        let mut hostiles: u16 = 0;
+        let mut allies: u16 = 0;
+        for nbr_id in self
+            .spatial
+            .neighbors(self.ship.position, VISUAL_RANGE_NM, |id| id != self.me)
+        {
+            let Some(snap) = self.snapshots.get(nbr_id) else {
+                continue;
+            };
+            if snap.policy == self.ship.policy {
+                allies += 1;
+            } else {
+                hostiles += 1;
+            }
+        }
+        if hostiles > allies + 1 {
+            return true;
+        }
+
+        false
+    }
+
+    /// Tactical condition: should this ship press the attack this
+    /// hour? True if it has ordnance AND at least one of:
+    ///   * firepower advantage (own cannons ≥ target cannons),
+    ///   * speed advantage (own effective speed > target effective
+    ///     speed — can dictate the range),
+    ///   * target's rigging already crippled (can close to board for
+    ///     pirates; safe to slug for everyone).
+    ///
+    /// Side effect on success: sets `goal.pursue_target = engaged_with`
+    /// so `act_pursue` (which reads from `goal.pursue_target`) steers
+    /// at and fires on the engaged counterpart.
+    fn should_fight(&mut self) -> bool {
+        let Some(other) = self.ship.engaged_with else {
+            return false;
+        };
+        let Some(other_snap) = self.snapshots.get(other) else {
+            return false;
+        };
+
+        // Need at least one broadside's worth of magazine.
+        if self.stats.cannons == 0 {
+            return false;
+        }
+        let (need_p, need_s) = crate::combat::broadside_supply_cost(self.stats.cannons);
+        if self.ship.cargo.get(crate::goods::ids::GUNPOWDER) < need_p
+            || self.ship.cargo.get(crate::goods::ids::CANNON_SHOT) < need_s
+        {
+            return false;
+        }
+
+        let firepower_edge = self.stats.cannons >= other_snap.cannons;
+        let my_eff_speed = self.stats.speed_max
+            * (self.ship.rigging_integrity / self.stats.rigging_integrity_max).max(0.0);
+        let their_eff_speed = other_snap.max_speed * other_snap.rigging_frac.max(0.0);
+        let speed_edge = my_eff_speed > their_eff_speed;
+        let prey_crippled = other_snap.rigging_frac < crate::combat::BOARDING_RIGGING_THRESHOLD;
+
+        if firepower_edge || speed_edge || prey_crippled {
+            self.goal.pursue_target = Some(other);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Tactical condition: should this ship flee while still firing
+    /// back? True whenever the ship is engaged and has not chosen to
+    /// fight (the BT tries `should_fight` first). The ordnance check
+    /// is skipped: a magazine-empty merchant should still run rather
+    /// than sit and reload while the pirate closes — and `act_flee`
+    /// gracefully no-ops on the back-fire if there's no shot left.
+    ///
+    /// Side effect on success: sets `goal.flee_from = engaged_with`
+    /// so `act_flee` heads away from the engaged counterpart.
+    fn should_flee(&mut self) -> bool {
+        let Some(other) = self.ship.engaged_with else {
+            return false;
+        };
+        if self.snapshots.get(other).is_none() {
+            return false;
+        }
+        self.goal.flee_from = Some(other);
+        true
+    }
 }
 
 impl<'a> BtContext for ShipBtContext<'a> {
@@ -1258,6 +1509,8 @@ impl<'a> BtContext for ShipBtContext<'a> {
             ACT_DIVERT_TO_PORT => self.act_divert_to_port(),
             ACT_PURSUE => self.act_pursue(),
             ACT_FLEE => self.act_flee(),
+            ACT_DISENGAGE => self.act_disengage(),
+            ACT_HOLD => self.act_hold(),
             _ => Status::Failure,
         }
     }
@@ -1295,6 +1548,17 @@ impl<'a> BtContext for ShipBtContext<'a> {
             }
             COND_SEE_PREY => self.see_prey(),
             COND_SEE_THREAT => self.see_threat(),
+            // Phase 4 §3c-1 (symmetric redesign): gate for the entire
+            // engaged subtree. Only true while sailing — a docked
+            // ship cannot be mid-fight (engagement clears via
+            // counterpart-gone if the other side docks too; if not,
+            // the next tactical pass will Disengage on lost-contact).
+            COND_IS_ENGAGED => {
+                self.ship.state == ShipState::Sailing && self.ship.engaged_with.is_some()
+            }
+            COND_SHOULD_DISENGAGE => self.should_disengage(),
+            COND_SHOULD_FIGHT => self.should_fight(),
+            COND_SHOULD_FLEE => self.should_flee(),
             _ => false,
         };
         if result {
