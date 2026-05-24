@@ -1578,4 +1578,56 @@ mod tests {
         let expected_debt = stats.rigging_integrity_max * RIGGING_REPAIR_COST_PESOS_PER_HP;
         assert!((ship.debt - expected_debt).abs() < 1e-3);
     }
+
+    #[test]
+    fn apply_crew_losses_pro_rata_preserves_invariant() {
+        let mut ship = Ship::new(Position::ZERO, ShipState::Sailing);
+        ship.crew_alive = 100;
+        ship.crew_seasoned = 40;
+        ship.apply_crew_losses(50);
+        assert_eq!(ship.crew_alive, 50);
+        // 40/100 of 50 = 20 seasoned losses → 20 seasoned remain.
+        assert_eq!(ship.crew_seasoned, 20);
+        assert!(ship.crew_seasoned <= ship.crew_alive);
+    }
+
+    #[test]
+    fn apply_crew_losses_saturates_at_alive_and_zeroes_seasoned() {
+        let mut ship = Ship::new(Position::ZERO, ShipState::Sailing);
+        ship.crew_alive = 20;
+        ship.crew_seasoned = 5;
+        ship.apply_crew_losses(999);
+        assert_eq!(ship.crew_alive, 0);
+        assert_eq!(ship.crew_seasoned, 0);
+    }
+
+    #[test]
+    fn detach_prize_crew_returns_pro_rata_split() {
+        let mut ship = Ship::new(Position::ZERO, ShipState::Sailing);
+        ship.crew_alive = 50;
+        ship.crew_seasoned = 20;
+        let (alive, seasoned) = ship.detach_prize_crew(10);
+        assert_eq!(alive, 10);
+        // 20/50 of 10 = 4 seasoned detached → 16 seasoned remain.
+        assert_eq!(seasoned, 4);
+        assert_eq!(ship.crew_alive, 40);
+        assert_eq!(ship.crew_seasoned, 16);
+        assert!(ship.crew_seasoned <= ship.crew_alive);
+    }
+
+    #[test]
+    fn seasoned_ratio_handles_empty_crew() {
+        let mut ship = Ship::new(Position::ZERO, ShipState::Sailing);
+        ship.crew_alive = 0;
+        ship.crew_seasoned = 0;
+        assert_eq!(ship.seasoned_ratio(), 0.0);
+    }
+
+    #[test]
+    fn seasoned_ratio_is_a_proper_fraction() {
+        let mut ship = Ship::new(Position::ZERO, ShipState::Sailing);
+        ship.crew_alive = 80;
+        ship.crew_seasoned = 20;
+        assert!((ship.seasoned_ratio() - 0.25).abs() < 1e-4);
+    }
 }

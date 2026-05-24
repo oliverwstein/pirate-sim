@@ -397,3 +397,74 @@ fn sim_minute_advances_60_per_hour() {
         start + 24 * sim_core::world::MINUTES_PER_HOUR
     );
 }
+
+/// A2 (postmortem §3.2): hiring from a port with both seasoned and
+/// unseasoned hands draws seasoned first and the ship's
+/// `crew_seasoned` count matches exactly how many of the drawn sailors
+/// were seasoned. This is the only thing keeping `crew_seasoned` from
+/// silently drifting to zero across a fleet's lifetime.
+#[test]
+fn hiring_draws_seasoned_first_and_tracks_count() {
+    use sim_core::ai::ShipAI;
+    use sim_core::port::Faction;
+    use sim_core::ship::{Ship, ShipState};
+
+    let mut world = fresh_world();
+
+    // Pick port 0 as the hiring port and hand-set a known split:
+    // 3 seasoned + 100 unseasoned, well above any per-day cap so the
+    // hire is capped only by the daily cap (5/day at full morale).
+    let port_idx = 0usize;
+    {
+        let demo = world
+            .demographics
+            .get_mut(port_idx)
+            .expect("port 0 should have demographics");
+        demo.seasoned = 3;
+        demo.unseasoned = 100;
+    }
+    let port_pos = world.ports[port_idx].position;
+
+    // Place a freshly-built sloop in Hiring at that port with 0 crew.
+    let mut hull = Ship::seeded_at_port(port_pos, port_idx, Faction::England);
+    hull.state = ShipState::Hiring;
+    hull.crew_alive = 0;
+    hull.crew_seasoned = 0;
+    hull.silver = 10_000.0;
+    hull.nav.docked_at_port = None;
+    let id = world.add_ship(hull, ShipAI::with_seed(1));
+
+    // `tick_daily_hiring` only fires when the day-of-year changes,
+    // and `World::load` initializes `last_hire_day` to the current
+    // day. We need to roll the clock forward by 24 hourly ticks to
+    // cross into a new day and trigger one hire pass.
+    for _ in 0..48 {
+        world.tick();
+    }
+
+    let ship = world.ships.get(id).expect("hiring ship should survive");
+    // Per-day cap is 5; over 48 hours we cross one day boundary, so
+    // up to 5 sailors should have been drawn (one day of hiring).
+    // Critical invariant: of however many were drawn, the *seasoned*
+    // count must equal min(drawn, initial_seasoned_pool=3). The pool
+    // was 3 seasoned + 100 unseasoned, so any draw ≥ 3 should have
+    // exactly 3 seasoned in `crew_seasoned`.
+    assert!(
+        ship.crew_alive >= 3,
+        "expected at least 3 hires after a day rollover, got {}",
+        ship.crew_alive
+    );
+    let expected_seasoned = 3u16.min(ship.crew_alive);
+    assert_eq!(
+        ship.crew_seasoned, expected_seasoned,
+        "seasoned-first draw should have taken all {} seasoned hands before any unseasoned",
+        expected_seasoned
+    );
+    assert!(ship.crew_seasoned <= ship.crew_alive);
+
+    let demo = &world.demographics[port_idx];
+    assert_eq!(demo.seasoned, 0, "seasoned pool should be drained");
+    // Unseasoned pool drained by (drawn - seasoned_drawn).
+    let expected_unseasoned_left = 100u32 - (ship.crew_alive as u32 - expected_seasoned as u32);
+    assert_eq!(demo.unseasoned, expected_unseasoned_left);
+}

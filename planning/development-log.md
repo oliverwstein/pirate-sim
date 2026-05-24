@@ -1222,3 +1222,21 @@ Final engaged-subtree priority: **strike → board → disengage → fight → f
 **Combat test fixture updated.** `pirate_boards_dismasted_merchant_and_resolves_prize` now also counts `prizes_in_tow` toward total outcomes and branches on `prize_owner` to recognize the tow case (cargo intact, policy flipped, prize_owner set) as distinct from `take` (cargo intact, policy flipped, no prize_owner) and `release` (cargo stripped, original policy).
 
 **Open question / future work.** The orphaning rule could be softened (prize crew "switches sides" to whichever faction's port is closest, sells under their own name) but that needs a port-affinity model that doesn't exist yet. Defer.
+
+---
+
+### Post-Phase-3 cleanup A2 — `crew_seasoned` invariant + tests
+
+**Status going in.** The `crew_seasoned: u16` field was already on `Ship` from earlier work, alongside pro-rata `apply_crew_losses` / `detach_prize_crew` helpers and a `seasoned_ratio()` accessor. The hiring loop in `tick_daily_hiring` was already drawing seasoned-first from the port pool and incrementing `ship.crew_seasoned` in lockstep with `ship.crew_alive`. Combat call sites (`world.rs:1274, 1278`) use the pro-rata helpers. So the postmortem A2 work was almost entirely already-done — but had **no tests**, which meant any regression to the invariant `crew_seasoned <= crew_alive` would have gone silent.
+
+**One deliberate departure from the postmortem spec.** Postmortem §3.2 said "Initialize to 0 on `Ship::new`; shipyard build initializes 0 (hull only)." The current code does the *opposite* for `Ship::new` and `Ship::seeded_at_port_typed`: they seed `crew_seasoned = crew_typical()` (100% seasoned). The in-source comments document the reasoning: "Seed-fleet ships are fully crewed (no Hiring loop) and are assumed to be veteran crews — bench fleets represent established merchant captains." Setting these to 0 would mean every ship at simulation start is staffed by complete greenhorns, which would dominate the bench_trade economy with mutinies and crew-induced sail-handling losses the moment crew modifiers land in Phase 5. Calibration-wise the current default is the right one; only `Ship::freshly_built` (shipyard hull launch) initializes to 0, which matches the postmortem intent for *new* hulls. Leaving as-is.
+
+**What A2 added.**
+- 5 unit tests in `ship.rs` covering: pro-rata casualties (`apply_crew_losses_pro_rata_preserves_invariant`), saturation at full crew loss (`apply_crew_losses_saturates_at_alive_and_zeroes_seasoned`), prize-crew detach pro-rata (`detach_prize_crew_returns_pro_rata_split`), `seasoned_ratio` on empty crew, and `seasoned_ratio` as a proper fraction.
+- 1 integration test in `combat.rs` (`hiring_draws_seasoned_first_and_tracks_count`): hand-sets a port pool to `(3 seasoned, 100 unseasoned)`, plants a `state == Hiring` ship at that port with empty crew, advances 48 hourly ticks to cross a day boundary, and asserts that the ship's `crew_seasoned` ends up exactly equal to `min(crew_alive, 3)` — i.e., all seasoned hands were drawn before any unseasoned. Total tests: 174 → **180**.
+
+**Test fixture gotcha worth recording.** `World::tick` advances 1 *hour*, not 1 day. The daily hiring path is gated on a day-of-year change (`if today == self.last_hire_day { return; }`), and `last_hire_day` is initialized to the world's load-time day. So the first 24-hour window often doesn't fire any hiring at all, because the day-of-year check is evaluated *before* `advance_hours(1)`. The test loops 48 ticks to guarantee a crossing. Other future hiring tests should follow the same pattern (or expose `tick_daily_hiring` as `pub(crate)` for direct invocation).
+
+**No calibration impact.** This is a test-only change plus already-shipped helpers. bench_trade not re-run.
+
+**Next.** A1 — clean three-phase split of `tick_hourly_ai_and_physics`.
