@@ -1349,3 +1349,37 @@ test will fail, which is the prompt to revisit the size choice).
 **Validation.** 188 tests pass; clippy clean; `bench_trade` 82 vs 80
 bankruptcies (within centavo-rounding noise from Phase 1 + new iteration
 order influencing per-port settlement order).
+
+---
+
+## DOD Refactor — Phase 3: SpatialHash flat-vec (2026-05)
+
+**Context.** External review flagged that `SpatialHash` used
+`BTreeMap<(i32,i32), Vec<(ShipId, Position)>>`. BTrees are cache-unfriendly
+(node-jumping on lookup) and the per-cell `Vec` adds another heap
+indirection on every query. With ~500 ships querying every tick, this is
+a hot path.
+
+**Alternatives considered.**
+1. *Lazy sort inside `neighbors(&mut self, …)`.* Simple but pushes a `&mut`
+   requirement through every caller. AI ticks hold concurrent borrows on
+   `World`; demanding `&mut spatial` broke compilation in `ai.rs`.
+2. *Keep BTreeMap, swap inner `Vec` for `SmallVec`.* Half-measure that
+   leaves the BTree pointer-chasing in place.
+3. *Flat `Vec<Entry>` with explicit `finalize()`.* Chosen. One sort per
+   tick, then all queries are `&self` binary searches over a contiguous
+   buffer. Deterministic via a total order on `(cell, ship_id)`.
+
+**Resolution.** `SpatialHash` is now `Vec<Entry { cell, id, pos }>`.
+Build phase calls `clear()` → many `insert()` → exactly one `finalize()`.
+Queries use `partition_point` to locate each of the 9 neighbour cells
+in O(log n) and then scan the contiguous slice. A `debug_assert` in
+`neighbors()` catches missing `finalize()` calls in dev.
+
+The single integration point in `world.rs` adds one `self.spatial.finalize();`
+call after the per-tick build loop. Test helpers in `ai_behavior.rs` were
+updated to call `finalize()` after their inserts.
+
+**Validation.** 189 tests pass; clippy clean; `bench_trade` 82
+bankruptcies (identical to Phase 2 baseline); `bench_pathfind` 1406/1406
+routes ok, 1.36 ms avg.

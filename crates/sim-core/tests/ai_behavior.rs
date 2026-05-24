@@ -68,7 +68,8 @@ fn tick_ai(ai: &mut ShipAI, ship: &mut Ship, stats: &ShipStats, wind: &WindVecto
     let goods = GoodsRegistry::starter();
     let mut commands: Vec<(ShipId, ShipCommand)> = Vec::new();
     let snapshots: SecondaryMap<ShipId, ShipSnapshot> = SecondaryMap::new();
-    let spatial = SpatialHash::new();
+    let mut spatial = SpatialHash::new();
+    spatial.finalize();
     let me = dummy_id();
     {
         let mut inputs = ShipTickInputs {
@@ -106,7 +107,8 @@ fn tick_ai_with_markets(
     let harbors = HarborMap::empty();
     let mut commands: Vec<(ShipId, ShipCommand)> = Vec::new();
     let snapshots: SecondaryMap<ShipId, ShipSnapshot> = SecondaryMap::new();
-    let spatial = SpatialHash::new();
+    let mut spatial = SpatialHash::new();
+    spatial.finalize();
     let me = dummy_id();
     {
         let mut inputs = ShipTickInputs {
@@ -928,6 +930,7 @@ fn pirate_sees_and_pursues_merchant_in_range() {
     let mut spatial = SpatialHash::new();
     spatial.insert(pirate_id, pirate.position);
     spatial.insert(merchant_id, merchant_pos);
+    spatial.finalize();
 
     let mut ai = ShipAI::with_seed(42);
     let cmds = tick_ai_with_snapshots(
@@ -1012,6 +1015,7 @@ fn merchant_flees_when_pirate_in_range() {
     let mut spatial = SpatialHash::new();
     spatial.insert(merchant_id, merchant.position);
     spatial.insert(pirate_id, pirate_pos);
+    spatial.finalize();
 
     let mut ai = ShipAI::with_seed(7);
     let cmds = tick_ai_with_snapshots(
@@ -1082,6 +1086,7 @@ fn pirate_ignores_other_pirate() {
     let mut spatial = SpatialHash::new();
     spatial.insert(p1, me.position);
     spatial.insert(p2, other_pos);
+    spatial.finalize();
 
     let mut ai = ShipAI::with_seed(13);
     let _ = tick_ai_with_snapshots(
@@ -1157,6 +1162,7 @@ fn engaged_pirate_with_no_powder_boards_crippled_prey() {
     let mut spatial = SpatialHash::new();
     spatial.insert(pirate_id, pirate.position);
     spatial.insert(merchant_id, merchant_pos);
+    spatial.finalize();
 
     let mut ai = ShipAI::with_seed(7);
     let cmds = tick_ai_with_snapshots(

@@ -599,6 +599,10 @@ impl World {
                 );
             }
         }
+        // Sort the spatial index once now that all inserts are done.
+        // `neighbors` is then a `&self` query; this lets AI code hold
+        // a `&SpatialHash` alongside other `&self` borrows on `World`.
+        self.spatial.finalize();
 
         // Post-Phase-3 cleanup (postmortem §1/§3.1): the AI Phase, the
         // Resolution Phase, and the Mutation/Physics Phase are now three
