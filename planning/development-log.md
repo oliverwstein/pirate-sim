@@ -1150,3 +1150,29 @@ Pending; planning notes in `planning/phase-4-plan.md §3`.
 **Fix.** `act_pursue` and `act_flee` now return `Status::Success` after pushing their intents. This forces a full top-down re-evaluation each tick — true CA-style judgment. Dock-tree actions that genuinely need multi-tick state (`act_resupply`, `act_careen`) keep `Running` deliberately. *This is the silent assumption to remember: in this codebase, any BT leaf that should be reconsidered every tick must return Success, not Running. Returning Running is a commitment to multi-tick state, not a polite "still working" signal.* The old role-based engaged branches were dead code masked by exactly this bug — `see_threat`/`see_prey` in the default subtree happened to produce roughly the right behavior, so no one noticed.
 
 **Future work.** §3c-2 (Strike + prize), §3c-3 (boarding integration), §3d (forts), §3e (calibration sweep — likely needs to revisit `should_disengage` thresholds and the "outnumbered" rule once Phase 5's relations matrix replaces the ShipPolicy hostile-proxy).
+
+### §3c-2 (minimal) — Strike colors + shared prize resolver
+
+**Problem.** §3c-1 gave ships `should_disengage`, but a ship that is hopelessly beaten — torn rigging, half its crew dead, morale collapsed, counterpart faster — should *surrender* rather than try to break off into a hail of fire. The existing boarding-victory path already had a take/sell/sink/release prize roll, but it was bolted to `resolve_boarding`; surrender-without-boarding had no path through the world resolver.
+
+**Alternatives considered.**
+- *Full §3c-2 per the original plan (Follow BT branch + prize sails with victor to port + sells on arrival).* Rejected for this commit — meaningful scope creep (touches movement/physics, station-keeping, port-trigger sells), and we want to see Strike alone behave in bench_trade before investing in the follow voyage.
+- *Reuse `Disengage` and have the world infer surrender from low morale.* Rejected — violates the principle that the AI decides intent and the world resolves it. Surrender is a distinct intent and deserves its own command.
+
+**Decision.**
+- New `ShipCommand::Strike { to: ShipId }`. Issuer = prize; `to` = victor.
+- New `COND_SHOULD_STRIKE` + `ACT_STRIKE` in `ai.rs`. Priority *above* `should_disengage` in the engaged-subtree Selector — a hopelessly beaten ship surrenders cleanly rather than trying to break contact.
+- `should_strike` fires when *both*: (a) `morale × hull_fraction < STRIKE_THRESHOLD` (0.15), and (b) cannot outrun the counterpart (own effective speed ≤ counterpart's, *or* own rigging is below the boarding threshold).
+- New `STRIKE_THRESHOLD = 0.15` constant in `combat.rs`.
+- Extracted the boarding-victory prize block (~140 lines) into `World::resolve_prize_action(victor, prize)`. The boarding path now just calls it; the new Strike resolution in the command-drain loop also calls it (deferred to after the drain to avoid double-borrowing `self`).
+- The instant-despawn model for take/sell/sink/release is preserved — *no* follow voyage in this commit. Take still flips the prize to `Pirate` policy in-place; sell/sink set hull=0 → Sunk; release leaves the target afloat with cargo stripped.
+
+**Results.**
+- 173 tests pass, fmt + clippy clean.
+- Colosseum: same 5 scenarios produce the same outcomes (4× DEFENDER ESCAPED, 1× TARGET SUNK) — none of them stress the strike condition cleanly. The `PRIZE SURRENDERED` verdict is wired and will fire when a scenario does trigger it.
+- `bench_trade 730d`: **89 bankrupt** (down from 100 after §3c-1; baseline 85, tolerance ≤95). Prize ledger shows 74 prize events total (5 taken, 26 sold, 33 sunk, 10 released) — Strike is doing real work in the broader sim, letting beaten merchants surrender (preserving capital that would otherwise be lost to sinking).
+
+**Future work.**
+- §3c-2b: Follow BT branch + `follow_target` field + prize physically sails with victor and sells when victor reaches friendly port. Replaces the instant `take`/`sell` despawn with a real voyage.
+- Calibration: 89 bankrupt is in tolerance but worth revisiting once §3d (forts) and §3e (calibration sweep) land — Strike may be too generous, and `STRIKE_THRESHOLD` 0.15 is unvalidated.
+- Open question: should ships of certain factions (Navy, Privateer with Letter of Marque) be forbidden from striking? In Phase 5 (Relations Matrix) the surrender decision will gain a "honor of the flag" gate. For now any policy can strike.

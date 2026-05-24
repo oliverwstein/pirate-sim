@@ -658,6 +658,7 @@ impl World {
         // is AI-tick (i.e., ShipId) order.
         let mut engagements: Vec<(ShipId, ShipId)> = Vec::new();
         let mut boardings: Vec<(ShipId, ShipId)> = Vec::new();
+        let mut strikes: Vec<(ShipId, ShipId)> = Vec::new();
         for (attacker, cmd) in self.commands.drain(..) {
             match cmd {
                 crate::command::ShipCommand::Steer { heading, speed } => {
@@ -693,6 +694,22 @@ impl World {
                         }
                     }
                 }
+                crate::command::ShipCommand::Strike { to } => {
+                    // Phase 4 §3c-2: the issuing ship surrenders to
+                    // `to`. Clear engagement on both immediately so
+                    // any later command this hour does not re-fire
+                    // on a struck prize, then defer the prize-action
+                    // resolution to after the drain (cannot
+                    // double-borrow `self` inside the drain loop).
+                    let prize_id = attacker;
+                    let victor_id = to;
+                    for x in [prize_id, victor_id] {
+                        if let Some(s) = self.ships.get_mut(x) {
+                            s.engaged_with = None;
+                        }
+                    }
+                    strikes.push((victor_id, prize_id));
+                }
             }
         }
 
@@ -705,6 +722,26 @@ impl World {
         // gate. See the original Step 8 implementation below.
         for (attacker, tgt) in boardings {
             self.resolve_boarding(attacker, tgt);
+        }
+        // Phase 4 §3c-2: Strike surrenders. Resolved *after* sub-tick
+        // combat and boarding so a ship that has already sunk this
+        // hour is correctly skipped. Engagement was already cleared
+        // when the command was drained; this pass dispatches the
+        // surrendered hull through the shared prize resolver.
+        for (victor_id, prize_id) in strikes {
+            let prize_alive = self
+                .ships
+                .get(prize_id)
+                .map(|s| s.state != ShipState::Sunk)
+                .unwrap_or(false);
+            let victor_alive = self
+                .ships
+                .get(victor_id)
+                .map(|s| s.state != ShipState::Sunk)
+                .unwrap_or(false);
+            if prize_alive && victor_alive {
+                self.resolve_prize_action(victor_id, prize_id);
+            }
         }
         // ─── Mutation / Physics Phase ────────────────────────────────
         // Per-ship state updates that depend on the world *after*
@@ -1074,7 +1111,7 @@ impl World {
     fn resolve_boarding(&mut self, attacker: ShipId, tgt: ShipId) {
         let attacker_id = attacker;
         // ── original Step 8 boarding body, unchanged ──
-        let (a_pos, a_vel, a_crew, a_morale, a_min_crew) = match self.ships.get(attacker_id) {
+        let (a_pos, a_vel, a_crew, a_morale, _a_min_crew) = match self.ships.get(attacker_id) {
             Some(a) => {
                 let stats = &self.ship_types.get(a.ship_type).stats;
                 (
@@ -1136,6 +1173,23 @@ impl World {
             // back; no transfer, no flag change.
             return;
         }
+        // Phase 4 §3c-2: prize outcome is shared between boarding-victory
+        // and Strike-surrender paths. Delegate to the unified resolver.
+        self.resolve_prize_action(attacker_id, tgt);
+    }
+
+    /// Phase 4 §3c-2: shared prize-action resolver. Called by
+    /// `resolve_boarding` after the attacker wins on deck *and* by the
+    /// `Strike` command resolution (surrender without boarding). Decides
+    /// take / sell / sink / release using the historical-weighted roll
+    /// and applies all state changes (cargo transfer, silver bonus,
+    /// crew detachment, flag flip, prize ledger). The caller is
+    /// responsible for clearing `engaged_with` on both ships and for
+    /// any boarding-specific crew losses *before* invoking this helper.
+    #[allow(clippy::too_many_lines)]
+    fn resolve_prize_action(&mut self, victor: ShipId, prize: ShipId) {
+        let attacker_id = victor;
+        let tgt = prize;
         // Step 11.a: prize outcome. Historical pattern
         // (Rediker, Earle): pirates almost never kept
         // captured hulls — they stripped cargo, took
@@ -1146,11 +1200,13 @@ impl World {
         // she was a real upgrade. Old behavior — "every
         // prize becomes a pirate" — produced runaway
         // pirate growth in long benches.
-        let a_surviving = self
-            .ships
-            .get(attacker_id)
-            .map(|a| a.crew_alive)
-            .unwrap_or(0);
+        let (a_surviving, a_min_crew) = match self.ships.get(attacker_id) {
+            Some(a) => {
+                let stats = &self.ship_types.get(a.ship_type).stats;
+                (a.crew_alive, stats.crew_min())
+            }
+            None => return,
+        };
 
         // Compute prize value (cargo + hull bounty)
         // before mutating either ship. Cargo is valued

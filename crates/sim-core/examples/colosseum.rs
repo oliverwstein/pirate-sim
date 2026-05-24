@@ -107,6 +107,7 @@ enum Outcome {
     AttackerSunk,
     TargetSunk,
     Escaped,
+    Surrendered,
     TimeCap,
 }
 
@@ -311,6 +312,8 @@ fn run_scenario(scen: &Scenario) {
     let (tgt_per_p, _) = broadside_supply_cost(tgt_stats.cannons);
 
     let mut outcome: Option<(Outcome, u32)> = None;
+    let prize_baseline =
+        world.prizes_taken + world.prizes_sold + world.prizes_sunk + world.prizes_released;
 
     for hour in 1..=MAX_HOURS {
         let range_pre = range_between(&world, atk, tgt).unwrap_or(f32::INFINITY);
@@ -392,9 +395,17 @@ fn run_scenario(scen: &Scenario) {
         let tgt_eng = world.ships.get(tgt).and_then(|s| s.engaged_with).is_some();
         if hour >= 2 && !atk_eng && !tgt_eng && hours_in_range > 0 {
             // Saw combat earlier this run, now mutually disengaged →
-            // escape (or, in §3c-2/§3c-3, a surrender/board cleared
-            // by transfer of ship).
-            outcome = Some((Outcome::Escaped, hour));
+            // escape *or* surrender (Phase 4 §3c-2: Strike triggers
+            // the prize resolver, which increments the prize ledger).
+            // Sniff the ledger delta to disambiguate.
+            let prize_now =
+                world.prizes_taken + world.prizes_sold + world.prizes_sunk + world.prizes_released;
+            let outcome_kind = if prize_now > prize_baseline {
+                Outcome::Surrendered
+            } else {
+                Outcome::Escaped
+            };
+            outcome = Some((outcome_kind, hour));
             break;
         }
     }
@@ -405,6 +416,7 @@ fn run_scenario(scen: &Scenario) {
         Outcome::AttackerSunk => "ATTACKER SUNK",
         Outcome::TargetSunk => "TARGET SUNK",
         Outcome::Escaped => "DEFENDER ESCAPED",
+        Outcome::Surrendered => "PRIZE SURRENDERED",
         Outcome::TimeCap => "TIME CAP",
     };
     println!();

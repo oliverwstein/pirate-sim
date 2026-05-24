@@ -37,6 +37,11 @@ fn apply_commands(ship: &mut Ship, commands: &[(ShipId, ShipCommand)]) {
                 // the world. Single-ship tests just confirm the
                 // intent.
             }
+            ShipCommand::Strike { .. } => {
+                // Phase 4 §3c-2: surrender + prize handling lives in
+                // the world. Single-ship tests just confirm the
+                // intent.
+            }
         }
     }
 }

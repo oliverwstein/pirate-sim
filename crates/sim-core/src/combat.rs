@@ -240,6 +240,17 @@ pub const SUB_TICKS_PER_HOUR: u64 = 12;
 /// fight envelope does not count as a real opening.
 pub const ESCAPE_THRESHOLD_NM: f32 = 4.0;
 
+// ── Phase 4 §3c-2: surrender threshold ──────────────────────────────────
+
+/// Composite threshold on `morale × hull_fraction` below which a ship's
+/// captain considers striking colors (surrender). At 0.15 this fires
+/// for, e.g., 30% morale with 50% hull, or 50% morale with 30% hull —
+/// both consistent with the historical "fight is lost, save the crew"
+/// inflection. Combined in `ai.rs::should_strike` with a "cannot
+/// outrun the counterpart" gate so a fast, lightly-damaged ship still
+/// tries to escape before surrendering.
+pub const STRIKE_THRESHOLD: f32 = 0.15;
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -53,4 +53,12 @@ pub enum ShipCommand {
     /// ordnance, badly outclassed, outnumbered, or lost visual
     /// contact). See `ai.rs::COND_SHOULD_DISENGAGE`.
     Disengage { other: ShipId },
+    /// Phase 4 §3c-2: strike colors (surrender) to `to`. The issuing
+    /// ship is the prize; `to` is the victor. Resolved by clearing
+    /// both ships' `engaged_with` and dispatching the surrendered
+    /// hull to the shared prize-action resolver (take / sell / sink /
+    /// release). Unlike `Disengage`, there is no cooldown — the prize
+    /// is being handled, not just broken-off. See
+    /// `ai.rs::COND_SHOULD_STRIKE`.
+    Strike { to: ShipId },
 }

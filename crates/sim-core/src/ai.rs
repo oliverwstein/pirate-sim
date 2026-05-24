@@ -47,6 +47,12 @@ const ACT_FLEE: usize = 9;
 // command; the ship coasts on its previous heading while it reloads).
 const ACT_DISENGAGE: usize = 10;
 const ACT_HOLD: usize = 11;
+// Phase 4 §3c-2: ACT_STRIKE emits Command::Strike { to: engaged_with }
+// — the surrendering ship is the prize, and the victor is its current
+// engagement counterpart. The world's command resolver dispatches the
+// surrendered hull through the shared prize-action machinery (take /
+// sell / sink / release).
+const ACT_STRIKE: usize = 12;
 
 // --- Condition IDs ---
 const COND_IS_DOCKED: usize = 0;
@@ -68,6 +74,13 @@ const COND_IS_ENGAGED: usize = 7;
 const COND_SHOULD_DISENGAGE: usize = 8;
 const COND_SHOULD_FIGHT: usize = 9;
 const COND_SHOULD_FLEE: usize = 10;
+// Phase 4 §3c-2: COND_SHOULD_STRIKE fires when the ship's own
+// morale × hull_frac has collapsed below the strike threshold AND it
+// is in no position to outrun the counterpart (catastrophic hull, no
+// ordnance, or counterpart visibly stronger). Priority is *above*
+// disengage so a hopelessly-beaten ship surrenders rather than tries
+// to break off into a hail of fire.
+const COND_SHOULD_STRIKE: usize = 11;
 
 /// Step 6: visual range (NM) at which a captain can identify another
 /// ship — her flag, her trim, her freeboard (loaded vs light). Sized
@@ -207,6 +220,10 @@ fn build_ship_bt() -> Behavior {
         Behavior::Sequence(vec![
             Behavior::Condition(COND_IS_ENGAGED),
             Behavior::Selector(vec![
+                Behavior::Sequence(vec![
+                    Behavior::Condition(COND_SHOULD_STRIKE),
+                    Behavior::Action(ACT_STRIKE),
+                ]),
                 Behavior::Sequence(vec![
                     Behavior::Condition(COND_SHOULD_DISENGAGE),
                     Behavior::Action(ACT_DISENGAGE),
@@ -1354,6 +1371,77 @@ impl<'a> ShipBtContext<'a> {
         Status::Success
     }
 
+    /// Action (Phase 4 §3c-2): strike colors — emit `Strike { to: other }`
+    /// where `other` is the current engagement counterpart. World
+    /// resolution clears engagement on both ships and dispatches the
+    /// surrendered hull through the shared prize-action machinery.
+    /// Also clears any stale pursue/flee target on this ship so post-
+    /// resolution (if the prize is `release`'d) it does not immediately
+    /// try to re-engage its captor.
+    fn act_strike(&mut self) -> Status {
+        let Some(other) = self.ship.engaged_with else {
+            return Status::Failure;
+        };
+        self.commands
+            .push((self.me, ShipCommand::Strike { to: other }));
+        if self.goal.pursue_target == Some(other) {
+            self.goal.pursue_target = None;
+        }
+        if self.goal.flee_from == Some(other) {
+            self.goal.flee_from = None;
+        }
+        Status::Success
+    }
+
+    /// Tactical condition (Phase 4 §3c-2): should this ship strike
+    /// colors this hour?
+    ///
+    /// True when *both* of the following hold:
+    ///   * **Position is hopeless** — `morale × hull_fraction` has
+    ///     fallen below `STRIKE_THRESHOLD` (0.15). Captures the
+    ///     "fight is lost, save the crew" inflection.
+    ///   * **Cannot outrun the counterpart** — own effective speed
+    ///     (`speed_max × rigging_frac`) is no greater than the
+    ///     counterpart's, *or* own rigging is itself crippled below
+    ///     the boarding threshold (the rigging is so torn that even a
+    ///     theoretically-faster hull cannot run).
+    ///
+    /// Priority is above `should_disengage` and `should_flee` so a
+    /// catastrophically beaten ship surrenders cleanly rather than
+    /// trying to disengage under fire or limp away.
+    fn should_strike(&self) -> bool {
+        let Some(other) = self.ship.engaged_with else {
+            return false;
+        };
+        let Some(other_snap) = self.snapshots.get(other) else {
+            return false;
+        };
+
+        let hull_frac = if self.stats.hull_integrity_max > 0.0 {
+            (self.ship.hull_integrity / self.stats.hull_integrity_max).clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        let composite = self.ship.morale * hull_frac;
+        if composite >= crate::combat::STRIKE_THRESHOLD {
+            return false;
+        }
+
+        let my_rig_frac = if self.stats.rigging_integrity_max > 0.0 {
+            (self.ship.rigging_integrity / self.stats.rigging_integrity_max).clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        if my_rig_frac < crate::combat::BOARDING_RIGGING_THRESHOLD {
+            // Rigging is so torn the hull cannot run regardless of nominal speed.
+            return true;
+        }
+
+        let my_eff_speed = self.stats.speed_max * my_rig_frac;
+        let their_eff_speed = other_snap.max_speed * other_snap.rigging_frac.max(0.0);
+        my_eff_speed <= their_eff_speed
+    }
+
     /// Tactical condition: should this ship break off the engagement
     /// this hour?
     ///
@@ -1511,6 +1599,7 @@ impl<'a> BtContext for ShipBtContext<'a> {
             ACT_FLEE => self.act_flee(),
             ACT_DISENGAGE => self.act_disengage(),
             ACT_HOLD => self.act_hold(),
+            ACT_STRIKE => self.act_strike(),
             _ => Status::Failure,
         }
     }
@@ -1559,6 +1648,7 @@ impl<'a> BtContext for ShipBtContext<'a> {
             COND_SHOULD_DISENGAGE => self.should_disengage(),
             COND_SHOULD_FIGHT => self.should_fight(),
             COND_SHOULD_FLEE => self.should_flee(),
+            COND_SHOULD_STRIKE => self.should_strike(),
             _ => false,
         };
         if result {
