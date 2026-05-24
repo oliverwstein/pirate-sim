@@ -1240,3 +1240,32 @@ Final engaged-subtree priority: **strike → board → disengage → fight → f
 **No calibration impact.** This is a test-only change plus already-shipped helpers. bench_trade not re-run.
 
 **Next.** A1 — clean three-phase split of `tick_hourly_ai_and_physics`.
+
+---
+
+## 2025-XX-XX — Phase 5 prep: diplomacy.md gaps filled
+
+**Context.** Before drafting the Phase 5 plan (Relations Matrix + Letters of Marque + war cycle + port BTs), wanted to close the 9 research gaps flagged in `planning/research/diplomacy.md` lines 682–701. Most were Wikipedia rate-limit failures from the original research pass; a few were areas where secondary literature was vague on specific simulation-relevant numbers.
+
+**What was done.** Background research agent (`diplomacy-gaps`) executed a focused pass and produced `planning/research/diplomacy-gaps.md` (~59KB). Of the 9 gaps:
+
+- **Fully filled:** GAP 4 (Western Design fleet composition).
+- **Substantially filled:** GAPs 1, 3, 6, 7 — including a detailed Modyford commission timeline (1664 anti-privateer proclamation → reversal within weeks; the 1668/1669/1670 commissions to Morgan; the Treaty of Madrid lag-failure timeline with specific weeks; the Morgan/Byndloss/Tortuga kickback arrangement post-1675).
+- **Partially filled:** GAPs 2, 5, 8, 9 — best-available web sources exhausted; remaining detail would require book-level sources (Pares 1936, Haring 1910, Pestana 2017, Rediker 2004, Lane 1998, Calendars of State Papers Colonial).
+
+**Simulation-actionable numbers extracted** (see `diplomacy-gaps.md` "CROSS-CUTTING SIMULATION PARAMETERS"):
+
+- **Communication lag:** war declaration Europe→Jamaica central 8 wk, range 4–16 wk; treaty news similar.
+- **Bond:** standard English privateer bond £1,500.
+- **Prize split (Porto Bello, 1668):** ~10% Crown Admiralty Tenth + ~10% governor commission fee + ~5% admiral + ~75% owners/crew. (Residual: whether Modyford's 10% was *the* Admiralty Tenth diverted locally vs. an additional fee is still ambiguous — flag for design decision.)
+- **Bribery rates:** small ops £20–100, major (ship + cargo) several thousand £, Kidd's failed cache £14,000.
+- **Force sizes:** Western Design 38 ships / 8,000 troops; Morgan/Panama 30+ ships / ~2,000; Cartagena 1697 10+ naval / 1,850; typical buccaneer fleet 3–15 ships.
+
+**Design implications already visible (to be folded into Phase 5 plan):**
+
+1. **Communication lag is THE mechanic** that makes "No Peace Beyond the Line" emerge naturally — if treaty effects arrive in the Caribbean with a 4–16 week stochastic delay, the gap between metropolitan policy and local reality writes itself.
+2. **Governor commission fees are separate from Crown Admiralty Tenth** — suggests Port struct needs both a faction-level "Crown share %" and a port-level "governor's cut %", configurable per-governor (Modyford = 10%, others lower).
+3. **Modyford reversal pattern** (issuing anti-privateer order, then reversing under economic pressure) is the canonical example of *Port BT vs. Faction BT* conflict — supports modeling governor as a semi-autonomous agent with their own utility function (local revenue, personal wealth), not a deterministic relay of metropolitan policy.
+4. **Byndloss/Tortuga kickback** justifies modeling commissions as a *tradeable* mechanic: when a governor's own faction is at peace, captains can still buy commissions from foreign governors at currently-warring factions, with intermediary fees.
+
+**Next.** Draft `planning/phase-5-plan.md` — likely split into 5a (Static Relations + LoM substrate, unblocks Forts) and 5b (Dynamic diplomacy, Port BT, communication lag).
