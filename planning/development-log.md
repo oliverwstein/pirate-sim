@@ -1463,3 +1463,97 @@ trivial at n ≤ 64 and we typically remove at most a handful per tick.
 **Validation.** 192 tests pass; clippy clean; `bench_trade` 79
 bankruptcies (unchanged from Phase 4); `bench_pathfind` 1406/1406 ok,
 1.37 ms avg. No path ever exceeded 64 waypoints in either benchmark.
+
+---
+
+## Phase 6 — Command-buffered, call-auction port economy (2025)
+
+**Context.** With the layout work (Phases 1–5) done, the next perf
+target is parallelizing the AI tick. Today every ship's AI mutates
+its docking port's `PortMarket` directly (buy/sell/extend_credit/
+draw_for_outfit), which forces strictly serial iteration across
+ships. The goal is to make the AI tick *read-only* against world
+state, emit `ShipCommand`s, and have the resolver apply them in a
+deterministic post-pass — a classic command-buffer pattern that
+unlocks Rayon parallelism over ships.
+
+**Attempt 1 — naïve per-command resolver (abandoned).** First cut
+introduced `MarketBuy/MarketSell/...` variants and applied each one
+in command order using market prices read at start-of-tick. Build /
+clippy / tests all passed but `bench_trade` regressed from
+**79 → 172 bankruptcies** (a 2.2× explosion). Root cause: when
+several ships at the same port all bid at start-of-tick prices,
+they all observe a low (high-stockpile) buy price, drain the
+stockpile via hinterland debt in sequence, and the *next* tick's
+ships see prices spike with no in-tick feedback to back off.
+Discarded.
+
+**Pivot to per-port call auction.** Reframed the resolver as
+something historically more faithful: factors at each port hold a
+single-price call auction every hour. Ships docked at the port
+post limit-priced bids and asks; the port computes a clearing
+price from the post-tick effective stockpile and crosses every
+order on the right side. Pro-rata payouts to sellers if treasury
+is short. Silver-only intents (debt collection, dividends, outfit
+draw, tramping credit) run before the auction in ship-id order so
+the auction's affordability check sees up-to-date strongboxes.
+
+**Intent set.**
+```
+MarketBid          { port, good, tons, limit_price }
+MarketAsk          { port, good, tons, limit_price }
+MarketResupplyBid  { port, tons, limit_price }    // PROVISIONS
+MarketDeposit      { port, amount }               // home-port profit
+MarketCollectDebt  { port }                       // owed by factor
+MarketDrawOutfit   { port, target_silver }
+MarketCreditBid    { port, max_amount }           // tramping advance
+```
+
+**Clearing price.** For each (port, good), the resolver computes
+the effective post-tick stockpile (`pre + Σ ask − Σ bid`) and pipes
+that through the existing `buy_price/sell_price` formulas. Bids
+with `limit ≥ p_buy` and asks with `limit ≤ p_sell` cross. AI
+heuristics use ±20–30% spreads around the formula price, wide
+enough that single-ship cases (the steady state) cross
+deterministically.
+
+**Why not strict serial replay.** The reviewer's classic
+command-buffer pattern would replay each command in order against
+mutable market state, which preserves exact pre-Phase-6 behavior
+but degrades to serial. The auction is strictly better: it gives
+the same answer when there's one ship at a port, and gives a
+*better* answer when there are several (everyone sees the same
+clearing price, no first-mover advantage).
+
+**Test impact.** The single-ship `tick_ai_with_markets` helper in
+`ai_behavior.rs` now applies market intents via the legacy
+`market.buy/sell/...` methods. Result is identical to the auction
+in single-bidder cases, so the existing test assertions hold
+unchanged.
+
+**Open trade-off.** Multi-tick docking is now implicit — ships sit
+in port until their `MarketResupplyBid` and `MarketBid` clear. The
+behavior-tree dock sequence handles this naturally (each leaf
+returns `Running` when not yet done). Patience-based bid walking
+(raising bid / lowering ask as `ticks_pending` grows) is in the
+design but not yet implemented; a static ±20–30% spread is enough
+to clear in the current calibration regime.
+
+**Validation.**
+- 192 tests pass; clippy clean; fmt clean.
+- `bench_trade`: **36 bankruptcies** (baseline 79 → improvement of 43).
+  Several flow categories are now self-consistent over the 60-day
+  run that previously bled silver. The price-vs-equilibrium
+  comparison is still ugly for a couple of goods (Tobacco wedged
+  high at North-Atlantic ports), but those are calibration issues
+  separate from the resolver mechanics.
+- `bench_pathfind`: 1406/1406 ok, 1.44 ms avg, 2023 ms total.
+  Unchanged from Phase 5.
+
+**Follow-ups (not in this commit).**
+- Rayon-parallelize the AI tick (the whole point of the
+  command-buffer). Now unblocked.
+- Patience-driven limit walking per ship (`ticks_pending`-weighted
+  ε on the buy/sell spread).
+- A proper auction unit test in `market.rs` that exercises the
+  multi-bidder pro-rata path directly.

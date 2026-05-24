@@ -139,7 +139,7 @@ const REPLAN_DISTANCE_NM: f32 = 25.0;
 /// to top up provisions at any foreign port, plus a modest reserve
 /// for incidentals (pilotage fees, minor repairs). All silver above
 /// this is paid out to the owner port on docking.
-const HOME_PORT_FLOAT_SILVER: crate::money::Pesos = crate::money::Pesos::from_pesos(500);
+pub const HOME_PORT_FLOAT_SILVER: crate::money::Pesos = crate::money::Pesos::from_pesos(500);
 
 /// Phase 4 §1.3: how many full broadsides' worth of powder / shot a
 /// merchant ship aims to keep aboard. 20 ≈ a long convoy's worth of
@@ -182,19 +182,19 @@ pub fn ordnance_target(ship: &Ship, stats: &ShipStats) -> (f32, f32) {
 /// to this many times the estimated cost of one full outbound hold.
 /// Gives a cushion for partial-cargo top-ups at intermediate ports
 /// and small contingencies en route.
-const OUTFIT_DRAW_MULTIPLE: f32 = 2.0;
+pub const OUTFIT_DRAW_MULTIPLE: f32 = 2.0;
 
 /// No single outfit draw can take more than this fraction of the home
 /// port's silver. Prevents a busy yard's working capital from being
 /// drained by one ship's outbound cargo.
-const OUTFIT_PORT_FRACTION_CAP: f32 = 0.2;
+pub const OUTFIT_PORT_FRACTION_CAP: f32 = 0.2;
 
 /// Tramping credit: at any non-home port, a captain with no silver
 /// but a profitable arbitrage opportunity may draw against the port
 /// factor (consigned cargo / freight charter) up to this fraction of
 /// the port's treasury. Booked as ship debt and repaid at the next
 /// docking from sale proceeds.
-const TRAMP_PORT_FRACTION_CAP: f32 = 0.10;
+pub const TRAMP_PORT_FRACTION_CAP: f32 = 0.10;
 
 /// Build the ship AI behavior tree.
 fn build_ship_bt() -> Behavior {
@@ -478,7 +478,7 @@ pub struct ShipTickInputs<'a> {
     pub ports: &'a [Port],
     pub harbors: &'a HarborMap,
     pub pathfind: Option<&'a PathfindContext<'a>>,
-    pub markets: &'a mut [PortMarket],
+    pub markets: &'a [PortMarket],
     pub goods: &'a GoodsRegistry,
     /// Output buffer for `ShipCommand`s emitted this tick. Owned by the
     /// world and drained by the Resolution Phase.
@@ -564,7 +564,7 @@ pub struct ShipBtContext<'a> {
     harbors: &'a HarborMap,
     rng: &'a mut SimRng,
     pathfind: Option<&'a PathfindContext<'a>>,
-    markets: &'a mut [PortMarket],
+    markets: &'a [PortMarket],
     goods: &'a GoodsRegistry,
     commands: &'a mut Vec<(ShipId, ShipCommand)>,
     snapshots: &'a SecondaryMap<ShipId, ShipSnapshot>,
@@ -672,9 +672,17 @@ impl<'a> ShipBtContext<'a> {
             // Fungible: it doesn't matter which port originally
             // advanced the credit; the merchant network settles
             // it via bills of exchange between correspondents.
+            //
+            // Phase 6: emitted as `MarketCollectDebt` intent; the
+            // world's auction-pass resolver mutates ship + treasury
+            // in ship-id order (silver-only ops happen before bids
+            // and asks clear, so subsequent same-tick trade pricing
+            // sees the post-debt ship balance — matching the old
+            // mutate-in-place semantics).
             if let Some(idx) = port_idx {
-                if idx < self.markets.len() {
-                    self.markets[idx].collect_debt(self.ship, HOME_PORT_FLOAT_SILVER);
+                if idx < self.markets.len() && self.ship.debt.is_positive() {
+                    self.commands
+                        .push((self.me, ShipCommand::MarketCollectDebt { port: idx }));
                 }
             }
             // Home-port settlement: if this is the owner port,
@@ -683,11 +691,24 @@ impl<'a> ShipBtContext<'a> {
             // the port treasury (dividend to shareholders);
             // the ship keeps just enough to cover provisions
             // and incidentals at the next port of call.
+            //
+            // Phase 6: surplus is computed at AI-tick read-time
+            // (matches the value the resolver will see after the
+            // earlier CollectDebt pass at the same port in the
+            // same tick — since CollectDebt only reduces silver,
+            // a positive surplus here is conservative).
             if let (Some(idx), Some(owner)) = (port_idx, self.ship.owner_port) {
                 if idx == owner && idx < self.markets.len() {
-                    let paid =
-                        self.markets[idx].deposit_owner_profit(self.ship, HOME_PORT_FLOAT_SILVER);
-                    self.ship.lifetime_dividends += paid;
+                    let surplus = (self.ship.silver - HOME_PORT_FLOAT_SILVER).max_zero();
+                    if surplus.is_positive() {
+                        self.commands.push((
+                            self.me,
+                            ShipCommand::MarketDeposit {
+                                port: idx,
+                                amount: surplus,
+                            },
+                        ));
+                    }
                 }
             }
             return Status::Success;
@@ -753,12 +774,15 @@ impl<'a> ShipBtContext<'a> {
 
     fn act_resupply(&mut self) -> Status {
         self.ship.dock_action = DockAction::Resupplying;
+        // Phase 6: emit a provisions bid (and any credit-advance bid
+        // we need to fund it) and let the world's auction pass do the
+        // actual transfer. Status is Running while we still need
+        // provisions and the port can sell them; Success otherwise.
         let done = match self.ship.nav.docked_at_port {
-            Some(idx) if idx < self.markets.len() => {
-                self.ship
-                    .tick_resupply_at_market(self.stats, &mut self.markets[idx], self.goods)
-            }
-            // Unknown / out-of-range port — fall back to free resupply.
+            Some(idx) if idx < self.markets.len() => self.tick_resupply_bid(idx),
+            // Unknown / out-of-range port — fall back to free resupply
+            // (matches the pre-Phase-6 behavior for test ports beyond
+            // the markets slice).
             _ => self.ship.tick_resupply(self.stats),
         };
         if done {
@@ -767,6 +791,67 @@ impl<'a> ShipBtContext<'a> {
         } else {
             Status::Running
         }
+    }
+
+    /// Phase 6: emit per-tick resupply intent. Returns `true` when the
+    /// AI judges the resupply phase complete (full / market dry /
+    /// nothing to bid with). Mirrors the predicate logic of the
+    /// pre-Phase-6 `Ship::tick_resupply_at_market`, but emits
+    /// `MarketResupplyBid` (+ optional `MarketCreditBid`) instead of
+    /// mutating ship/market state directly.
+    fn tick_resupply_bid(&mut self, idx: usize) -> bool {
+        let provisions_id = crate::goods::ids::PROVISIONS;
+        let space = (self.stats.provision_capacity - self.ship.provisions).max(0.0);
+        if space <= 0.0 {
+            return true;
+        }
+        let market = &self.markets[idx];
+        let stockpile = market.stockpile.get(provisions_id);
+        if stockpile <= 0.0 {
+            return true;
+        }
+        let unit_price = market.buy_price(provisions_id, self.goods).max(0.0001);
+        let hour_bill =
+            crate::money::Pesos::from_pesos_f32(unit_price * crate::ship::RESUPPLY_RATE_PER_HOUR);
+        // Chandler credit bid: if we can't pay cash but have debt
+        // headroom, ask the chandler to advance one hour's bill.
+        // Resolver caps by liquidity and ship debt headroom.
+        if self.ship.silver < hour_bill && self.ship.debt < crate::ship::MAX_SHIP_DEBT {
+            self.commands.push((
+                self.me,
+                ShipCommand::MarketCreditBid {
+                    port: idx,
+                    max_amount: hour_bill,
+                },
+            ));
+        }
+        let desired = crate::ship::RESUPPLY_RATE_PER_HOUR
+            .min(space)
+            .min(stockpile);
+        if desired <= 0.0 {
+            return true;
+        }
+        // Limit price: pay up to a moderate premium over the formula
+        // price (the formula already prices scarcity; the cushion
+        // keeps the bid from being filtered out by an in-tick price
+        // tick from concurrent buys).
+        let limit = unit_price * 1.2;
+        self.commands.push((
+            self.me,
+            ShipCommand::MarketResupplyBid {
+                port: idx,
+                tons: desired,
+                limit_price: limit,
+            },
+        ));
+        // Done predicate is *predictive* — true means "don't tick
+        // again next AI hour": ship is full, or the port has nothing
+        // more to sell, or we're so broke we couldn't even bid for a
+        // tiny slice next tick.
+        let full = self.ship.provisions + desired >= self.stats.provision_capacity - 1e-4;
+        let market_dry = (stockpile - desired) <= 0.0;
+        let broke = self.ship.silver.as_pesos_f32() + hour_bill.as_pesos_f32() < unit_price * 0.05;
+        full || market_dry || broke
     }
 
     fn act_careen(&mut self) -> Status {
@@ -822,28 +907,24 @@ impl<'a> ShipBtContext<'a> {
         // Sell every ton of cargo we arrived with at the docked port's
         // market. Silent no-op when docked_at_port isn't set or is out of
         // range (test ports beyond the markets slice).
+        //
+        // Phase 6: emits one `MarketAsk` per good above the keep-line.
+        // The world's auction pass clears them at a single per-good
+        // price derived from the post-tick effective stockpile, with
+        // pro-rata seller payouts if the port treasury can't cover.
+        // Returns Success once nothing remains above the keep-line —
+        // multi-tick behavior emerges when the auction doesn't fill
+        // all asks in one go (rare, but possible at illiquid ports).
         let Some(idx) = self.ship.nav.docked_at_port else {
             return Status::Success;
         };
         if idx >= self.markets.len() {
             return Status::Success;
         }
-        // Step 7 + Phase 4 §1.3: gunner's stores are bookkept separately
-        // from the supercargo's trade hold. Sell only what's *over* the
-        // policy-and-armament-appropriate magazine target; refill any
-        // shortfall after.
-        //
-        // Targets scale with cannon count: 20 broadsides/gun for
-        // merchants (defensive reserve), 40 for pirates (offensive
-        // budget). With `POWDER_TONS_PER_GUN = 0.01` and `SHOT_TONS_PER_GUN
-        // = 0.01`, this works out to 0.2 t/gun powder & shot for a
-        // merchant, 0.4 t/gun for a pirate — i.e., 1.6 t each on an
-        // 8-gun sloop merchant, 9.6 t each on a 24-gun pirate ship.
-        // Historically defensible: a typical merchant carried 5–10
-        // broadsides' worth aboard, a privateer 30+.
         let (powder_keep, shot_keep) = ordnance_target(self.ship, self.stats);
-        let market = &mut self.markets[idx];
+        let market = &self.markets[idx];
         let entries: Vec<(crate::goods::GoodId, f32)> = self.ship.cargo.iter().collect();
+        let mut anything_remaining = false;
         for (gid, tons) in entries {
             if tons <= 0.0 {
                 continue;
@@ -856,28 +937,36 @@ impl<'a> ShipBtContext<'a> {
                 tons
             };
             if sellable > 0.0 {
-                // Best-effort: ignore "port out of silver" by
-                // selling whatever the port can afford. For
-                // v1 we just attempt the full amount; if the
-                // port can't pay, the cargo stays aboard and
-                // we'll try again on the next leg.
-                let _ = market.sell(self.ship, gid, sellable, self.goods);
+                anything_remaining = true;
+                let unit = market.sell_price(gid, self.goods);
+                // Accept any price down to 80% of the formula sell
+                // price — gives the auction headroom to absorb same-
+                // tick concurrent sells without dropping every ask.
+                let limit = (unit * 0.8).max(0.01);
+                self.commands.push((
+                    self.me,
+                    ShipCommand::MarketAsk {
+                        port: idx,
+                        good: gid,
+                        tons: sellable,
+                        limit_price: limit,
+                    },
+                ));
             }
         }
-        // Top up any shortfall below the magazine target. Best-effort:
-        // if the port has none in stock or the ship is broke, the
-        // ship sails with whatever it has — combat AI silently skips
-        // firing when the magazine runs dry.
         self.replenish_ordnance(idx, powder_keep, shot_keep);
+        // Even if the auction only partially fills, returning Success
+        // here lets the dock sequence advance into buy/careen/undock.
+        // The unfilled remainder gets re-asked next tick if the ship
+        // stays docked (which it usually does — careen takes hours).
+        let _ = anything_remaining;
         Status::Success
     }
 
-    /// Step 7: buy gunpowder / cannon shot from the docked market up to
-    /// the per-policy target tonnage. Best-effort: stops at whatever the
-    /// port can supply or the ship can afford. Called from `act_sell_all`
-    /// so re-stocking happens before the trade-pick buy fills the hold.
+    /// Phase 6: emit buy bids for gunpowder / cannon shot up to the
+    /// per-policy target tonnage. Auction-cleared.
     fn replenish_ordnance(&mut self, market_idx: usize, powder_target: f32, shot_target: f32) {
-        let market = &mut self.markets[market_idx];
+        let market = &self.markets[market_idx];
         for (good, target) in [
             (crate::goods::ids::GUNPOWDER, powder_target),
             (crate::goods::ids::CANNON_SHOT, shot_target),
@@ -893,38 +982,41 @@ impl<'a> ShipBtContext<'a> {
             let cargo_room = self.stats.cargo_capacity_tons - self.ship.cargo.total_tons();
             let tons = want.min(affordable).min(in_stock).min(cargo_room).max(0.0);
             if tons > 0.0 {
-                let _ = market.buy(self.ship, self.stats, good, tons, self.goods);
+                let limit = unit * 1.2;
+                self.commands.push((
+                    self.me,
+                    ShipCommand::MarketBid {
+                        port: market_idx,
+                        good,
+                        tons,
+                        limit_price: limit,
+                    },
+                ));
             }
         }
     }
 
     fn act_buy_best(&mut self) -> Status {
-        // Pick the best (good, dest) and load up. Sets the
+        // Pick the best (good, dest) and emit bids. Sets the
         // ship's destination as a side effect so ACT_UNDOCK
         // has somewhere to go.
+        //
+        // Phase 6: emits MarketDrawOutfit (owner port only), then
+        // MarketCreditBid (tramping), then MarketBid for the chosen
+        // good. The world's auction pass clears the bid at a single
+        // per-good price; silver-only ops (outfit/credit) run before
+        // the auction so the ship's silver is updated before the
+        // limit-price check filters the bid.
         let Some(idx) = self.ship.nav.docked_at_port else {
             return Status::Success;
         };
         if idx >= self.markets.len() {
             return Status::Success;
         }
-        // Reachability budget: assume we leave with a full
-        // provisions hold. The trade planner uses this to
-        // skip destinations we can't physically reach.
         let daily = self.stats.daily_provision_consumption().max(1e-6);
         let provision_budget_days = self.stats.provision_capacity / daily;
-        // Home bias: as the ship's strongbox swells above the
-        // operating float, increase its pull toward home. This
-        // models the supercargo's fiduciary duty to settle
-        // proceeds with the owners — a ship sitting on a fat
-        // purse won't keep chasing marginal arbitrage forever.
         let home_bias = self.ship.owner_port.map(|home_idx| {
             let surplus = (self.ship.silver - HOME_PORT_FLOAT_SILVER).max_zero();
-            // Roughly: a ship sitting on +5k surplus pulls
-            // toward home with a 25 peso/ton bias, fully
-            // dominating ordinary arbitrage. The cap of 200
-            // ensures a flush ship will home-in even against
-            // the fattest opportunistic margin.
             crate::trade::HomeBias {
                 home_port: home_idx,
                 bias_pesos_per_ton: (surplus.as_pesos_f32() / 200.0).min(200.0),
@@ -944,57 +1036,92 @@ impl<'a> ShipBtContext<'a> {
             None => return Status::Success,
         };
 
-        // Buy as many tons as we can afford, that fit in the
-        // hold, and that the port can supply.
-        let market = &mut self.markets[idx];
+        let market = &self.markets[idx];
         let unit = market.buy_price(plan.good, self.goods).max(0.0001);
         let cargo_room = self.stats.cargo_capacity_tons - self.ship.cargo.total_tons();
+        let want_tons = cargo_room.min(market.stockpile.get(plan.good));
 
-        // Outfitting draw: if this is the owner port, top the
-        // ship's strongbox up from the port treasury before
-        // computing what we can afford. Historically the
-        // outbound cargo was paid for with capital drawn from
-        // the home-port owners, not from cash earned on prior
-        // voyages — those proceeds were settled on arrival.
+        // Outfit draw bid (owner port only). Resolver caps by
+        // OUTFIT_PORT_FRACTION_CAP × treasury.
         if let Some(owner) = self.ship.owner_port {
             if owner == idx {
-                let want_tons = cargo_room.min(market.stockpile.get(plan.good));
                 let target =
                     crate::money::Pesos::from_pesos_f32(unit * want_tons * OUTFIT_DRAW_MULTIPLE);
-                market.draw_for_outfit(self.ship, target, OUTFIT_PORT_FRACTION_CAP);
+                if target > self.ship.silver {
+                    self.commands.push((
+                        self.me,
+                        ShipCommand::MarketDrawOutfit {
+                            port: idx,
+                            target_silver: target,
+                        },
+                    ));
+                }
             }
         }
 
-        // Tramping / freight credit: at any other port, if we
-        // still can't load anything meaningful (too little
-        // silver for the hold space we have), take cargo on
-        // consignment from the local factor. Booked as debt;
-        // repaid out of the sale proceeds at the destination.
-        let want_tons = cargo_room.min(market.stockpile.get(plan.good));
+        // Tramping / freight credit bid: if we still can't load
+        // anything meaningful, ask the local factor for an advance.
         let need_silver = crate::money::Pesos::from_pesos_f32(unit * want_tons);
         if self.ship.silver < need_silver
             && self.ship.debt < crate::ship::MAX_SHIP_DEBT
             && want_tons > 0.0
         {
-            let shortfall = need_silver - self.ship.silver;
-            market.extend_credit(
-                self.ship,
-                shortfall,
-                TRAMP_PORT_FRACTION_CAP,
-                crate::ship::MAX_SHIP_DEBT,
-            );
+            let shortfall = (need_silver - self.ship.silver).max_zero();
+            if shortfall.is_positive() {
+                self.commands.push((
+                    self.me,
+                    ShipCommand::MarketCreditBid {
+                        port: idx,
+                        max_amount: shortfall,
+                    },
+                ));
+            }
         }
 
-        let affordable = self.ship.silver.as_pesos_f32() / unit;
+        // Main trade bid. Affordability is computed against the AI-
+        // tick read of ship.silver *plus* any in-tick credit/outfit
+        // ask above — those run before bids in the resolver, so by
+        // the time the bid clears the silver picture matches what we
+        // assume here.
+        let assumed_silver = self.ship.silver
+            + self
+                .ship
+                .owner_port
+                .filter(|o| *o == idx)
+                .map(|_| {
+                    let target = crate::money::Pesos::from_pesos_f32(
+                        unit * want_tons * OUTFIT_DRAW_MULTIPLE,
+                    );
+                    (target - self.ship.silver).max_zero()
+                })
+                .unwrap_or(crate::money::Pesos::ZERO)
+            + if self.ship.silver < need_silver
+                && self.ship.debt < crate::ship::MAX_SHIP_DEBT
+                && want_tons > 0.0
+            {
+                (need_silver - self.ship.silver).max_zero()
+            } else {
+                crate::money::Pesos::ZERO
+            };
+        let affordable = assumed_silver.as_pesos_f32() / unit;
         let in_stock = market.stockpile.get(plan.good);
         let tons = cargo_room.min(affordable).min(in_stock).max(0.0);
         if tons > 0.0 {
-            let _ = market.buy(self.ship, self.stats, plan.good, tons, self.goods);
+            // Headroom premium: pay up to 30% above formula price so
+            // concurrent same-tick buys don't push the clearing price
+            // out of reach.
+            let limit = unit * 1.3;
+            self.commands.push((
+                self.me,
+                ShipCommand::MarketBid {
+                    port: idx,
+                    good: plan.good,
+                    tons,
+                    limit_price: limit,
+                },
+            ));
         }
 
-        // Always set the destination — even when the buy fell
-        // through (broke / no room) — so the ship still sails
-        // to the chosen port and tries selling/buying again.
         self.assign_destination_port(plan.dest_port);
         Status::Success
     }

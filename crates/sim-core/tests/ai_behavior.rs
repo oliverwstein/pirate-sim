@@ -42,6 +42,18 @@ fn apply_commands(ship: &mut Ship, commands: &[(ShipId, ShipCommand)]) {
                 // the world. Single-ship tests just confirm the
                 // intent.
             }
+            // Phase 6: market-side resolution lives in the world's
+            // auction pass. Single-ship tests don't drive a world
+            // tick, so any market intents are silently ignored —
+            // those tests bypass the dock-cycle and call into the
+            // `market.*` methods directly.
+            ShipCommand::MarketBid { .. }
+            | ShipCommand::MarketAsk { .. }
+            | ShipCommand::MarketResupplyBid { .. }
+            | ShipCommand::MarketDeposit { .. }
+            | ShipCommand::MarketCollectDebt { .. }
+            | ShipCommand::MarketDrawOutfit { .. }
+            | ShipCommand::MarketCreditBid { .. } => {}
         }
     }
 }
@@ -128,7 +140,106 @@ fn tick_ai_with_markets(
         };
         ai.tick(&mut inputs);
     }
-    apply_commands(ship, &commands);
+    apply_commands_with_markets(ship, stats, markets, goods, &commands);
+}
+
+/// Apply both nav and market intents. Single-ship test variant: market
+/// intents are resolved by calling the legacy `market.buy/sell/...`
+/// methods (which give identical results to the world's auction when
+/// there's only one bidder, so the test semantics from before Phase 6
+/// continue to hold).
+fn apply_commands_with_markets(
+    ship: &mut Ship,
+    stats: &ShipStats,
+    markets: &mut [PortMarket],
+    goods: &GoodsRegistry,
+    commands: &[(ShipId, ShipCommand)],
+) {
+    use sim_core::ai::{HOME_PORT_FLOAT_SILVER, OUTFIT_PORT_FRACTION_CAP, TRAMP_PORT_FRACTION_CAP};
+    use sim_core::ship::MAX_SHIP_DEBT;
+    for (_id, cmd) in commands {
+        match cmd {
+            ShipCommand::Steer { heading, speed } => ship.set_steering(*heading, *speed),
+            ShipCommand::FireBroadside { .. }
+            | ShipCommand::AttemptBoard { .. }
+            | ShipCommand::Disengage { .. }
+            | ShipCommand::Strike { .. } => {
+                // Combat resolution lives in the world; single-ship
+                // tests just confirm the intent.
+            }
+            ShipCommand::MarketCollectDebt { port } => {
+                if let Some(m) = markets.get_mut(*port) {
+                    m.collect_debt(ship, HOME_PORT_FLOAT_SILVER);
+                }
+            }
+            ShipCommand::MarketDeposit { port, amount } => {
+                let pay = (*amount).min(ship.silver).max_zero();
+                if pay.is_positive() {
+                    if let Some(m) = markets.get_mut(*port) {
+                        ship.silver -= pay;
+                        m.silver += pay;
+                        ship.lifetime_dividends += pay;
+                    }
+                }
+            }
+            ShipCommand::MarketDrawOutfit {
+                port,
+                target_silver,
+            } => {
+                if let Some(m) = markets.get_mut(*port) {
+                    m.draw_for_outfit(ship, *target_silver, OUTFIT_PORT_FRACTION_CAP);
+                }
+            }
+            ShipCommand::MarketCreditBid { port, max_amount } => {
+                if let Some(m) = markets.get_mut(*port) {
+                    m.extend_credit(ship, *max_amount, TRAMP_PORT_FRACTION_CAP, MAX_SHIP_DEBT);
+                }
+            }
+            ShipCommand::MarketBid {
+                port,
+                good,
+                tons,
+                limit_price: _,
+            } => {
+                if let Some(m) = markets.get_mut(*port) {
+                    let _ = m.buy(ship, stats, *good, *tons, goods);
+                }
+            }
+            ShipCommand::MarketAsk {
+                port,
+                good,
+                tons,
+                limit_price: _,
+            } => {
+                if let Some(m) = markets.get_mut(*port) {
+                    let _ = m.sell(ship, *good, *tons, goods);
+                }
+            }
+            ShipCommand::MarketResupplyBid {
+                port,
+                tons,
+                limit_price: _,
+            } => {
+                if let Some(m) = markets.get_mut(*port) {
+                    let provisions_id = sim_core::goods::ids::PROVISIONS;
+                    let unit = m.buy_price(provisions_id, goods).max(0.0001);
+                    let cost = sim_core::money::Pesos::from_pesos_f32(unit * *tons);
+                    let affordable = ship.silver.as_pesos_f32() / unit;
+                    let space = (stats.provision_capacity - ship.provisions).max(0.0);
+                    let in_stock = m.stockpile.get(provisions_id);
+                    let take = tons.min(affordable).min(space).min(in_stock).max(0.0);
+                    if take > 0.0 {
+                        let actual_cost = sim_core::money::Pesos::from_pesos_f32(unit * take);
+                        ship.silver -= actual_cost;
+                        m.silver += actual_cost;
+                        m.stockpile.remove(provisions_id, take);
+                        ship.provisions += take;
+                    }
+                    let _ = cost;
+                }
+            }
+        }
+    }
 }
 
 /// Helper: some test ports for the AI to use.

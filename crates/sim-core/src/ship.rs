@@ -857,7 +857,7 @@ impl Ship {
 }
 
 /// Tons of provisions taken on per hour while resupplying at a port.
-const RESUPPLY_RATE_PER_HOUR: f32 = 0.5;
+pub const RESUPPLY_RATE_PER_HOUR: f32 = 0.5;
 
 /// Fouling points removed per hour while careening at a port.
 const CAREEN_RATE_PER_HOUR: f32 = 3.0;

@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use slotmap::{SecondaryMap, SlotMap};
+use slotmap::{Key, SecondaryMap, SlotMap};
 
 use crate::ai::{ShipAI, ShipSnapshot};
 use crate::coastline::{CoastlineMap, LandMesh};
@@ -20,6 +20,20 @@ use crate::sim_rng::SimRng;
 use crate::spatial::SpatialHash;
 use crate::types::{ShipId, SimDate};
 use crate::weather::WeatherSystem;
+
+/// Phase 6: per-port single-price call auction record.
+struct AuctionBid {
+    ship_id: ShipId,
+    tons: f32,
+    limit_price: f32,
+    /// Resupply bids fill into `ship.provisions` instead of cargo.
+    is_resupply: bool,
+}
+struct AuctionAsk {
+    ship_id: ShipId,
+    tons: f32,
+    limit_price: f32,
+}
 
 pub struct World {
     pub map: MapSystem,
@@ -706,7 +720,7 @@ impl World {
                 ports: &self.ports,
                 harbors: &self.harbors,
                 pathfind: Some(&pathfind),
-                markets: &mut self.markets,
+                markets: &self.markets,
                 goods: &self.goods,
                 commands: &mut self.commands,
                 day_of_year: self.date.day_of_year,
@@ -733,6 +747,12 @@ impl World {
         let mut engagements: Vec<(ShipId, ShipId)> = Vec::new();
         let mut boardings: Vec<(ShipId, ShipId)> = Vec::new();
         let mut strikes: Vec<(ShipId, ShipId)> = Vec::new();
+        // Phase 6: market intents collected during the drain are
+        // resolved by `clear_markets` below as a per-port single-price
+        // call auction. Held as `(ship_id, command)` pairs so the
+        // auction can preserve deterministic ship-id ordering for any
+        // tiebreaks (pro-rata allocation, silver-only op ordering).
+        let mut market_intents: Vec<(ShipId, crate::command::ShipCommand)> = Vec::new();
         for (attacker, cmd) in self.commands.drain(..) {
             match cmd {
                 crate::command::ShipCommand::Steer { heading, speed } => {
@@ -784,6 +804,18 @@ impl World {
                     }
                     strikes.push((victor_id, prize_id));
                 }
+                // Phase 6: market intents are deferred to the per-port
+                // call auction below (`clear_markets`). Preserve the
+                // ship-id so the auction sees deterministic ordering.
+                m @ (crate::command::ShipCommand::MarketBid { .. }
+                | crate::command::ShipCommand::MarketAsk { .. }
+                | crate::command::ShipCommand::MarketResupplyBid { .. }
+                | crate::command::ShipCommand::MarketDeposit { .. }
+                | crate::command::ShipCommand::MarketCollectDebt { .. }
+                | crate::command::ShipCommand::MarketDrawOutfit { .. }
+                | crate::command::ShipCommand::MarketCreditBid { .. }) => {
+                    market_intents.push((attacker, m));
+                }
             }
         }
 
@@ -816,6 +848,16 @@ impl World {
             if prize_alive && victor_alive {
                 self.resolve_prize_action(victor_id, prize_id);
             }
+        }
+
+        // Phase 6: per-port single-price call-auction over the market
+        // intents that were emitted (and deferred) during the AI Phase.
+        // This is where ships actually transact: pre-existing
+        // ship-side mutation has already happened (none, in fact, for
+        // these intents), and now the resolver applies clearing prices,
+        // fills, and port-side ledger movement in one deterministic pass.
+        if !market_intents.is_empty() {
+            self.clear_markets(market_intents);
         }
         // ─── Mutation / Physics Phase ────────────────────────────────
         // Per-ship state updates that depend on the world *after*
@@ -1060,6 +1102,354 @@ impl World {
     /// interpolated between hour-start (`ship.position`) and projected
     /// hour-end (`position + velocity * 1h`); this matches the linear
     /// assumption already used by `combat::min_distance_over_tick`.
+    /// Phase 6: drain market intents emitted by the AI Phase and resolve
+    /// them as a per-port single-price call auction.
+    ///
+    /// Determinism: ports processed in port-index order; within each
+    /// port, silver-only operations (debt collection, profit deposit,
+    /// outfit draw, credit advance) play through in ship-id order
+    /// against the live treasury; then each good with bids and/or asks
+    /// is cleared at a *single* price derived from the post-tick
+    /// effective stockpile, with pro-rata seller payouts when the
+    /// port can't fully cover. This eliminates the "first-bidder gets
+    /// the start-of-tick price" artifact of sequential resolution.
+    fn clear_markets(&mut self, intents: Vec<(ShipId, crate::command::ShipCommand)>) {
+        use crate::command::ShipCommand;
+        use std::collections::BTreeMap;
+
+        // Bucket intents by port. BTreeMap iteration is port-index
+        // ordered, which is the deterministic processing order.
+        let mut by_port: BTreeMap<usize, Vec<(ShipId, ShipCommand)>> = BTreeMap::new();
+        for (id, cmd) in intents {
+            let port = match &cmd {
+                ShipCommand::MarketBid { port, .. }
+                | ShipCommand::MarketAsk { port, .. }
+                | ShipCommand::MarketResupplyBid { port, .. }
+                | ShipCommand::MarketDeposit { port, .. }
+                | ShipCommand::MarketCollectDebt { port }
+                | ShipCommand::MarketDrawOutfit { port, .. }
+                | ShipCommand::MarketCreditBid { port, .. } => *port,
+                _ => continue,
+            };
+            by_port.entry(port).or_default().push((id, cmd));
+        }
+
+        for (port_idx, port_intents) in by_port {
+            if port_idx >= self.markets.len() {
+                continue;
+            }
+            self.clear_port_intents(port_idx, port_intents);
+        }
+    }
+
+    /// Resolve all of one port's queued market intents for this tick.
+    /// See `clear_markets` for the per-tick ordering invariants.
+    fn clear_port_intents(
+        &mut self,
+        port_idx: usize,
+        intents: Vec<(ShipId, crate::command::ShipCommand)>,
+    ) {
+        use crate::command::ShipCommand;
+        use crate::ship::{CHANDLER_PORT_FRACTION_CAP, MAX_SHIP_DEBT};
+
+        // Stable deterministic order across all intents at this port.
+        // ShipId's underlying KeyData implements Ord (generational
+        // tie-break), so sorting by `.data()` gives a total order that
+        // doesn't depend on push order.
+        let mut intents = intents;
+        intents.sort_by_key(|(id, _)| id.data());
+
+        // ── Step A: silver-only operations in ship-id order ──
+        //
+        // These don't affect prices; they just shuffle the port
+        // treasury. Played strictly in order so a port that runs out
+        // of silver mid-tick correctly underpays only the later ships
+        // in line (deterministic).
+        for (ship_id, cmd) in &intents {
+            let ship = match self.ships.get_mut(*ship_id) {
+                Some(s) => s,
+                None => continue,
+            };
+            let market = &mut self.markets[port_idx];
+            match cmd {
+                ShipCommand::MarketCollectDebt { .. } => {
+                    market.collect_debt(ship, super::ai::HOME_PORT_FLOAT_SILVER);
+                }
+                ShipCommand::MarketDeposit { amount, .. } => {
+                    // Cap at what the ship still has — debt collection
+                    // above may have eaten the surplus.
+                    let pay = (*amount).min(ship.silver).max_zero();
+                    if pay.is_positive() {
+                        ship.silver -= pay;
+                        market.silver += pay;
+                        ship.lifetime_dividends += pay;
+                    }
+                }
+                ShipCommand::MarketDrawOutfit { target_silver, .. } => {
+                    market.draw_for_outfit(
+                        ship,
+                        *target_silver,
+                        super::ai::OUTFIT_PORT_FRACTION_CAP,
+                    );
+                }
+                ShipCommand::MarketCreditBid { max_amount, .. } => {
+                    market.extend_credit(
+                        ship,
+                        *max_amount,
+                        super::ai::TRAMP_PORT_FRACTION_CAP,
+                        MAX_SHIP_DEBT,
+                    );
+                }
+                _ => {}
+            }
+        }
+
+        // ── Step B: per-good single-price call auction ──
+        //
+        // Group bids and asks by good, then for each (port, good) find
+        // a single clearing price that all crossing orders transact at.
+        // The clearing price is the formula price evaluated at the
+        // *post-tick* effective stockpile (current ± net trade flow),
+        // which gives every order the marginal price the trade itself
+        // would induce — no more "first ship at the dock gets the
+        // pre-tick price".
+        use std::collections::HashMap;
+        let mut bids: HashMap<crate::goods::GoodId, Vec<AuctionBid>> = HashMap::new();
+        let mut asks: HashMap<crate::goods::GoodId, Vec<AuctionAsk>> = HashMap::new();
+
+        for (ship_id, cmd) in &intents {
+            match cmd {
+                ShipCommand::MarketBid {
+                    good,
+                    tons,
+                    limit_price,
+                    ..
+                } => {
+                    if *tons > 0.0 {
+                        bids.entry(*good).or_default().push(AuctionBid {
+                            ship_id: *ship_id,
+                            tons: *tons,
+                            limit_price: *limit_price,
+                            is_resupply: false,
+                        });
+                    }
+                }
+                ShipCommand::MarketResupplyBid {
+                    tons, limit_price, ..
+                } => {
+                    if *tons > 0.0 {
+                        bids.entry(crate::goods::ids::PROVISIONS)
+                            .or_default()
+                            .push(AuctionBid {
+                                ship_id: *ship_id,
+                                tons: *tons,
+                                limit_price: *limit_price,
+                                is_resupply: true,
+                            });
+                    }
+                }
+                ShipCommand::MarketAsk {
+                    good,
+                    tons,
+                    limit_price,
+                    ..
+                } => {
+                    if *tons > 0.0 {
+                        asks.entry(*good).or_default().push(AuctionAsk {
+                            ship_id: *ship_id,
+                            tons: *tons,
+                            limit_price: *limit_price,
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Union of goods to clear. Sort for determinism.
+        let mut goods: Vec<crate::goods::GoodId> = bids
+            .keys()
+            .chain(asks.keys())
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        goods.sort();
+
+        for good in goods {
+            let bids_for_good = bids.remove(&good).unwrap_or_default();
+            let asks_for_good = asks.remove(&good).unwrap_or_default();
+            self.clear_one_good(port_idx, good, bids_for_good, asks_for_good);
+            let _ = (CHANDLER_PORT_FRACTION_CAP,); // silence unused import warning if both
+        }
+
+        // Settle any net stockpile growth against outstanding
+        // hinterland debt for this port.
+        self.markets[port_idx].settle_hinterland_debt();
+    }
+
+    /// Inner helper: clear bids and asks for one (port, good) at a
+    /// single auction price. Mutates port stockpile/treasury and the
+    /// participating ships' cargo/silver.
+    #[allow(clippy::too_many_lines)]
+    fn clear_one_good(
+        &mut self,
+        port_idx: usize,
+        good: crate::goods::GoodId,
+        bids: Vec<AuctionBid>,
+        asks: Vec<AuctionAsk>,
+    ) {
+        // Provisional total flow at face-value (before limit-price
+        // filtering). Used to derive the clearing price.
+        let total_bid_tons: f32 = bids.iter().map(|b| b.tons).sum();
+        let total_ask_tons: f32 = asks.iter().map(|a| a.tons).sum();
+        if total_bid_tons <= 0.0 && total_ask_tons <= 0.0 {
+            return;
+        }
+        let market = &self.markets[port_idx];
+        let pre_stockpile = market.stockpile.get(good);
+        let pre_debt = market.debt.get(good);
+        // Post-tick effective stock if every bid and ask filled:
+        // selling adds to stockpile, buying subtracts. Hinterland
+        // absorbs negative overshoot.
+        let post_effective = pre_stockpile + total_ask_tons - total_bid_tons - pre_debt;
+        let p_buy = market.buy_price_at(good, post_effective, &self.goods);
+        let p_sell = market.sell_price_at(good, post_effective, &self.goods);
+
+        // Filter bids/asks by limit price. A bid clears if it's willing
+        // to pay at least p_buy; an ask clears if it accepts at most p_sell.
+        let crossing_bids: Vec<AuctionBid> = bids
+            .into_iter()
+            .filter(|b| b.limit_price >= p_buy)
+            .collect();
+        let crossing_asks: Vec<AuctionAsk> = asks
+            .into_iter()
+            .filter(|a| a.limit_price <= p_sell)
+            .collect();
+        if crossing_bids.is_empty() && crossing_asks.is_empty() {
+            return;
+        }
+
+        // ── Sell side ──
+        //
+        // Sellers want their `tons` worth of stockpile-add + treasury
+        // pay. If the port can't cover the full payout (even after
+        // accounting for buyer inflow this tick), pro-rata the fill so
+        // every seller gets the same fraction. Matches the spirit of
+        // the old "drop the sale if port broke" rule but distributes
+        // the loss across all sellers instead of order-dependently
+        // failing the latest ones.
+        let total_sell_tons: f32 = crossing_asks.iter().map(|a| a.tons).sum();
+        let total_sell_revenue = crate::money::Pesos::from_pesos_f32(total_sell_tons * p_sell);
+
+        // ── Buy side ──
+        //
+        // Cap each buyer's draw by what they brought (limit_price implies
+        // they're solvent at that price). Total buys cap stockpile out
+        // first, hinterland debt absorbs the rest (only allowed for
+        // locally-produced goods — for pure imports the auction caps
+        // total fills at current stockpile).
+        let mut buy_fills: Vec<(ShipId, f32, bool)> = Vec::with_capacity(crossing_bids.len());
+        let mut total_buy_tons: f32 = 0.0;
+        let producing = self.markets[port_idx].produces_good(good);
+        // Available stockpile after sells land: pre_stockpile + actual
+        // sells. We don't yet know actual sells (depends on payout
+        // ratio), but the stockpile cap on buys only matters for non-
+        // producing ports; for those, allow buyers up to pre_stockpile.
+        let buy_stock_cap = if producing {
+            f32::INFINITY
+        } else {
+            pre_stockpile
+        };
+        for b in &crossing_bids {
+            let want = b.tons;
+            let room = (buy_stock_cap - total_buy_tons).max(0.0);
+            let take = want.min(room);
+            if take > 0.0 {
+                buy_fills.push((b.ship_id, take, b.is_resupply));
+                total_buy_tons += take;
+            }
+        }
+
+        let buyer_payments = crate::money::Pesos::from_pesos_f32(total_buy_tons * p_buy);
+        let available_for_sellers = self.markets[port_idx].silver + buyer_payments;
+        let payout_ratio = if total_sell_revenue.is_positive() {
+            (available_for_sellers.as_pesos_f32() / total_sell_revenue.as_pesos_f32())
+                .clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+
+        // Apply buys to ships.
+        for (ship_id, tons, is_resupply) in &buy_fills {
+            let ship = match self.ships.get_mut(*ship_id) {
+                Some(s) => s,
+                None => continue,
+            };
+            let cost = crate::money::Pesos::from_pesos_f32(*tons * p_buy);
+            // Defensive clamp: limit_price ensured solvency in
+            // theory, but ship.silver may have been drained by an
+            // earlier silver-only op (CreditBid/DrawOutfit don't
+            // touch this; CollectDebt does). Skip if broke.
+            if cost > ship.silver {
+                continue;
+            }
+            ship.silver -= cost;
+            if *is_resupply {
+                ship.provisions += tons;
+            } else {
+                ship.cargo.add(good, *tons);
+            }
+        }
+
+        // Apply asks to ships (pro-rata payouts).
+        let mut total_sold_tons = 0.0_f32;
+        for a in &crossing_asks {
+            let ship = match self.ships.get_mut(a.ship_id) {
+                Some(s) => s,
+                None => continue,
+            };
+            let pay_per_ton = crate::money::Pesos::from_pesos_f32(p_sell * payout_ratio);
+            let tons = a.tons;
+            // Cargo guard: don't sell more than the ship still holds
+            // (later-resolved sells of the same good would otherwise
+            // overdraw).
+            let have = ship.cargo.get(good);
+            let sell_tons = tons.min(have);
+            if sell_tons <= 0.0 {
+                continue;
+            }
+            ship.cargo.remove(good, sell_tons);
+            let pay = crate::money::Pesos::from_pesos_f32(p_sell * payout_ratio * sell_tons);
+            ship.silver += pay;
+            total_sold_tons += sell_tons;
+            let _ = pay_per_ton;
+        }
+
+        // Apply to port treasury and stockpile.
+        let market = &mut self.markets[port_idx];
+        market.silver += buyer_payments;
+        let actual_payout =
+            crate::money::Pesos::from_pesos_f32(total_sold_tons * p_sell * payout_ratio);
+        market.silver = (market.silver - actual_payout).max_zero();
+        // Stockpile: add sells first, then deduct buys (wharf first,
+        // hinterland for the deficit — only on producing ports).
+        if total_sold_tons > 0.0 {
+            market.stockpile.add(good, total_sold_tons);
+        }
+        if total_buy_tons > 0.0 {
+            let in_stock = market.stockpile.get(good);
+            let from_wharf = total_buy_tons.min(in_stock);
+            if from_wharf > 0.0 {
+                market.stockpile.remove(good, from_wharf);
+            }
+            let from_hinterland = (total_buy_tons - from_wharf).max(0.0);
+            if from_hinterland > 0.0 {
+                market.debt.add(good, from_hinterland);
+            }
+        }
+    }
+
     fn run_sub_tick_combat(&mut self, engagements: &[(ShipId, ShipId)]) {
         if engagements.is_empty() {
             return;

@@ -182,6 +182,50 @@ impl PortMarket {
         self.recipe.monthly_outputs.iter().any(|(g, _)| *g == id)
     }
 
+    /// Pesos-per-ton local price for `id` at a hypothetical effective
+    /// stock level (visible stockpile − hinterland debt). Used by the
+    /// Phase 6 call-auction to derive a single clearing price for all
+    /// crossing bids/asks at the *post-tick* effective stockpile,
+    /// instead of letting every bidder transact at the start-of-tick
+    /// price (which under-prices large in-tick draws).
+    pub fn price_at_effective_stock(
+        &self,
+        id: GoodId,
+        effective_stock: f32,
+        registry: &GoodsRegistry,
+    ) -> f32 {
+        let good = registry.get(id);
+        let target = self.target_stock(id);
+        if target <= 0.0 {
+            return good.base_price_pesos;
+        }
+        let factor = 1.0 + PRICE_K * (target - effective_stock) / target;
+        let clamped = factor.clamp(PRICE_FLOOR_FRAC, PRICE_CEIL_FRAC);
+        good.base_price_pesos * clamped
+    }
+
+    /// Auction-side buy clearing price at a hypothetical effective stock.
+    pub fn buy_price_at(&self, id: GoodId, effective_stock: f32, registry: &GoodsRegistry) -> f32 {
+        self.price_at_effective_stock(id, effective_stock, registry) * (1.0 + PRICE_SPREAD)
+    }
+
+    /// Auction-side sell clearing price at a hypothetical effective stock.
+    pub fn sell_price_at(&self, id: GoodId, effective_stock: f32, registry: &GoodsRegistry) -> f32 {
+        self.price_at_effective_stock(id, effective_stock, registry) * (1.0 - PRICE_SPREAD)
+    }
+
+    /// Whether the port produces `id` locally (auction-side public
+    /// view of the private `produces` helper).
+    pub fn produces_good(&self, id: GoodId) -> bool {
+        self.produces(id)
+    }
+
+    /// Run the per-tick `settle_debt` pass from outside the module
+    /// (the Phase 6 auction calls it after applying matched fills).
+    pub fn settle_hinterland_debt(&mut self) {
+        self.settle_debt();
+    }
+
     /// Pesos-per-ton local price for `id`, factoring effective stock
     /// (visible stockpile minus any outstanding hinterland debt).
     /// Stockpile-driven modulation kicks in only once a `target` is

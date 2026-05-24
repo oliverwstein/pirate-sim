@@ -11,7 +11,7 @@
 
 use serde::Deserialize;
 
-#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+#[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug)]
 pub struct GoodId(pub u8);
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Deserialize)]
