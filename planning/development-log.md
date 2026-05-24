@@ -1083,3 +1083,50 @@ New private helper `best_single_leg_excluding(origin, exclude, ...)` factored ou
 **Performance.** Multi-hop is O(N²M²) per `find_best_trade` call (60 ports × 11 goods → ~436k inner ops). Called only at port re-plan, not every tick — well within budget.
 
 **Limitations recorded for Phase 4+.** The lookahead doesn't account for cargo-capacity differences between the first and second leg, doesn't model congestion (multiple ships converging on the same circuit), and treats all onward goods as fungible from the planner's perspective even though the ship will need to actually unload at B before reloading. None of these matter at the current scale; revisit if convoy behavior becomes a goal.
+
+## Phase 4 — Combat Realism (in progress)
+
+### §1 — Ordnance supply (`market.rs`, `ai.rs`)
+
+**Premise from postmortem.** "Ordnance consumption is wired; nobody produces gunpowder or shot. Ships start with seeded cargo and can never refill once empty."
+
+**What we found mid-implementation.** Step 7 had already done more than the plan credited: production was wired at three of four planned European hubs (London / Amsterdam / Cadiz), and the AI top-up at port was wired in `ai::act_sell_all → replenish_ordnance`. The actual gaps in §1 were small: Nantes had no powder recipe, and the magazine targets were flat (`(4,4)` pirate, `(1,1)` merchant) regardless of cannon count.
+
+**Changes shipped.**
+
+- `market.rs`: `PortArchetype::EuropeanNantes` recipe now produces 4 t/mo gunpowder (French royal foundries at Essonnes, est. 1664 by Colbert). Powder-only — French shot output largely went into army artillery, not naval export. Two regression-guard tests: every European hub produces powder; the three major arsenals also produce shot.
+
+- `ai.rs`: replaced the flat magazine constants with `ordnance_target(ship, stats)` keyed on cannon count via `combat::broadside_supply_cost`. Targets expressed directly in "broadsides of reserve":
+  - `MERCHANT_BROADSIDES_TARGET = 20`
+  - `PIRATE_BROADSIDES_TARGET = 40`
+
+  With `POWDER_TONS_PER_GUN = 0.01`, a 24-gun pirate ship now carries ~9.6 t powder + shot (was 4 t each), an 8-gun sloop merchant ~1.6 t each (was 1 t). Historically defensible: indiamen carried 5–10 broadsides of reserve, privateers 30+.
+
+**Calibration.** `bench_trade 730 d`: bankrupt 86 → 80 (slight improvement), gunpowder annualized flow +252 t/yr, cannon shot +324 t/yr at producer hubs. Top-up loop reaches Caribbean ports without strangling cargo capacity (magazine is bounded by cannons, not by hold size).
+
+**Decision recorded.** Considered the plan's `cap × scale × 0.5` formula (cargo-size-scaled) but chose cannons-scaled instead because consumption itself is cannon-keyed — the target should track the demand source directly. A fluyt with 12 guns now matches a frigate-converted-merchant of 12 guns regardless of cargo capacity, which is the right invariant.
+
+### §2 — Repair at port (`ship.rs`, `ai.rs`)
+
+**Course correction during planning.** The original plan framed both hull and rigging as "monotonically decaying state". Reviewing the code: hull degrades from storms + fires + combat (all in place); rigging degrades from combat *only*. That changed the model.
+
+- **Rigging is a combat reserve, not a wear part.** Sails, cordage, spars come from bo's'n stores carried aboard. Historical port turnaround included re-rigging as a normal item — a yard could put a new spar up in a day. So rigging gets a one-shot full top-off on undock (like provisions), billed at 1.5 pesos/HP.
+- **Hull is a wear part.** Storm damage + combat damage accumulate; only the carpenters can fix it. Ticks while docked at 0.3 HP/hr, billed at 6 pesos/HP, sized so a 100-HP rebuild ≈ 14 days at port for ~600 pesos (about 30% of a sloop's build cost, matching RN "great repair" line-items).
+
+**New API on `Ship`.**
+
+- `tick_repair_hull(stats) -> bool` — one hour of carpentry. Always applies the full HP delta (carpenters work regardless of payment); silver covers the bill if available, otherwise the shortfall accrues to `Ship::debt` (composes with existing wage / chandler debt: bankruptcy threshold, shipyard scrap, mutiny pressure already cover it).
+- `top_off_rigging(stats) -> f32` — full one-shot restore, returns HP delta. Same silver/debt path. Returns 0.0 (no-op) when rigging already at max.
+
+**Wiring.**
+
+- `ai.rs::act_careen` now ticks both `tick_careen` (fouling + teredo) *and* `tick_repair_hull` in parallel; only returns Success when both complete. A battle-damaged ship stays at port until it's actually seaworthy — historically correct.
+- `ai.rs::act_undock` calls `top_off_rigging` immediately before clearing the dock state.
+
+**Calibration.** `bench_trade 730 d`: bankrupt 80 → 83 (+3). Marginal — current pre-§3 combat cadence is rare enough that most ships pay only a few pesos for the storm hits they took. The real test is after §3 when combat damage scales up. Avg fleet hull integrity target ≥ 60% can't yet be meaningfully checked.
+
+**Future work captured (FW-8).** Repair currently silver-only. Eventually we want hull repair to consume `NAVAL_STORES` + `MANUFACTURES` from the port market and rigging top-off to consume `NAVAL_STORES`. Decoupled from §2 deliberately — kept the v1 path independent of market stock so we can validate the rate / cost / debt machinery first.
+
+### §3 — Sub-tick combat (next up)
+
+Pending; planning notes in `planning/phase-4-plan.md §3`.
