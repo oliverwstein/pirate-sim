@@ -1093,3 +1093,105 @@ fn pirate_ignores_other_pirate() {
         "pirate should not pursue another pirate"
     );
 }
+
+/// Phase 4 §3c-3 regression: a pirate engaged with a rigging-crippled
+/// merchant should commit to boarding (emit `AttemptBoard`) even when
+/// his magazine is empty. The pre-§3c-3 BT would route a magazine-
+/// empty pirate through `should_fight` (false: no ordnance) →
+/// `should_flee` (true: fall-through) and emit a flee Steer instead.
+#[test]
+fn engaged_pirate_with_no_powder_boards_crippled_prey() {
+    use sim_core::combat::BOARDING_RIGGING_THRESHOLD;
+    use sim_core::ship::ShipPolicy;
+    use slotmap::SlotMap;
+
+    let stats = ShipStats::sloop();
+    let wind = calm_wind();
+    let ports = test_ports();
+
+    let mut sm: SlotMap<ShipId, ()> = SlotMap::with_key();
+    let pirate_id = sm.insert(());
+    let merchant_id = sm.insert(());
+
+    // Pirate at origin; merchant 0.1 NM north — point-blank, well
+    // inside BOARDING_RANGE_NM so `maybe_board` fires its AttemptBoard.
+    let mut pirate = Ship::new(Position { x: 0.0, y: 0.0 }, ShipState::Sailing);
+    pirate.policy = ShipPolicy::Pirate;
+    pirate.crew_alive = 12;
+    pirate.engaged_with = Some(merchant_id);
+    // Crucial: empty magazine. Pre-§3c-3 this routed the pirate into flee.
+    pirate.cargo = sim_core::cargo::Cargo::new();
+    let merchant_pos = Position { x: 0.0, y: 0.1 };
+
+    let mut snapshots: SecondaryMap<ShipId, ShipSnapshot> = SecondaryMap::new();
+    snapshots.insert(
+        merchant_id,
+        ShipSnapshot {
+            position: merchant_pos,
+            policy: ShipPolicy::Merchant,
+            faction: sim_core::port::Faction::England,
+            max_speed: stats.speed_max,
+            cargo_capacity_tons: stats.cargo_capacity_tons + 50.0,
+            velocity: (0.0, 0.0),
+            // Crippled rigging — below the boarding threshold so the
+            // merchant cannot slip the grapples.
+            rigging_frac: BOARDING_RIGGING_THRESHOLD * 0.5,
+            hull_frac: 0.6,
+            cannons: 4,
+        },
+    );
+    snapshots.insert(
+        pirate_id,
+        ShipSnapshot {
+            position: pirate.position,
+            policy: ShipPolicy::Pirate,
+            faction: sim_core::port::Faction::Free,
+            max_speed: stats.speed_max,
+            cargo_capacity_tons: stats.cargo_capacity_tons,
+            velocity: (0.0, 0.0),
+            rigging_frac: 1.0,
+            hull_frac: 1.0,
+            cannons: stats.cannons,
+        },
+    );
+    let mut spatial = SpatialHash::new();
+    spatial.insert(pirate_id, pirate.position);
+    spatial.insert(merchant_id, merchant_pos);
+
+    let mut ai = ShipAI::with_seed(7);
+    let cmds = tick_ai_with_snapshots(
+        &mut ai,
+        &mut pirate,
+        &stats,
+        &wind,
+        &ports,
+        &snapshots,
+        &spatial,
+        pirate_id,
+    );
+
+    let attempted_board = cmds.iter().any(
+        |(_id, c)| matches!(c, ShipCommand::AttemptBoard { target } if *target == merchant_id),
+    );
+    let fled = cmds.iter().any(|(_id, c)| {
+        matches!(c, ShipCommand::Steer { heading, .. } if (*heading - 180.0).abs() < 30.0)
+    });
+    assert!(
+        attempted_board,
+        "engaged pirate with crippled prey should emit AttemptBoard \
+         even with empty magazine, got {cmds:?}"
+    );
+    assert!(
+        !fled,
+        "engaged pirate with crippled prey must not flee south, got {cmds:?}"
+    );
+    assert_eq!(
+        ai.goal.pursue_target,
+        Some(merchant_id),
+        "should_board should set pursue_target = engaged_with"
+    );
+    assert_eq!(
+        ai.goal.flee_from, None,
+        "engaged pirate should not have a flee_from set on a board branch"
+    );
+}

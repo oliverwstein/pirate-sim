@@ -53,6 +53,14 @@ const ACT_HOLD: usize = 11;
 // surrendered hull through the shared prize-action machinery (take /
 // sell / sink / release).
 const ACT_STRIKE: usize = 12;
+// Phase 4 §3c-3: ACT_BOARD commits a pirate to closing on a
+// rigging-crippled engaged counterpart and emitting `AttemptBoard`.
+// Distinct from `act_pursue` only by where it sits in the engaged
+// subtree priority — placing the *decision to board* above the
+// fight/flee branches lets a pirate take a crippled prize even when
+// his magazine is empty (the old `should_fight` gate required
+// ordnance and silently routed magazine-empty pirates into flee).
+const ACT_BOARD: usize = 13;
 
 // --- Condition IDs ---
 const COND_IS_DOCKED: usize = 0;
@@ -81,6 +89,14 @@ const COND_SHOULD_FLEE: usize = 10;
 // disengage so a hopelessly-beaten ship surrenders rather than tries
 // to break off into a hail of fire.
 const COND_SHOULD_STRIKE: usize = 11;
+// Phase 4 §3c-3: COND_SHOULD_BOARD fires when this ship is a Pirate
+// (only pirates board in v1), is engaged with a counterpart whose
+// rigging is below the boarding threshold, and has at least two crew
+// alive (the minimum boarding party). Side effect on success: sets
+// `goal.pursue_target = engaged_with` so `act_board` (which reads
+// from pursue_target like `act_pursue`) steers at the engaged
+// counterpart.
+const COND_SHOULD_BOARD: usize = 12;
 
 /// Step 6: visual range (NM) at which a captain can identify another
 /// ship — her flag, her trim, her freeboard (loaded vs light). Sized
@@ -223,6 +239,10 @@ fn build_ship_bt() -> Behavior {
                 Behavior::Sequence(vec![
                     Behavior::Condition(COND_SHOULD_STRIKE),
                     Behavior::Action(ACT_STRIKE),
+                ]),
+                Behavior::Sequence(vec![
+                    Behavior::Condition(COND_SHOULD_BOARD),
+                    Behavior::Action(ACT_BOARD),
                 ]),
                 Behavior::Sequence(vec![
                     Behavior::Condition(COND_SHOULD_DISENGAGE),
@@ -1442,6 +1462,82 @@ impl<'a> ShipBtContext<'a> {
         my_eff_speed <= their_eff_speed
     }
 
+    /// Action (Phase 4 §3c-3): commit to boarding the engaged
+    /// counterpart. Steers at the target at full wind-adjusted speed,
+    /// emits a softening broadside if magazine + range permit
+    /// (`maybe_fire_at`), and emits `AttemptBoard` if the ship will
+    /// close inside `BOARDING_RANGE_NM` this tick
+    /// (`maybe_board`). The world's `resolve_boarding` re-gates range
+    /// and rigging and, on attacker-win, dispatches the prize through
+    /// the shared `resolve_prize_action` resolver (§3c-2). Returns
+    /// `Success` to release Selector memory each tick so the engaged
+    /// subtree re-evaluates priorities every hour.
+    fn act_board(&mut self) -> Status {
+        // `should_board` set `goal.pursue_target = engaged_with`. Bail
+        // cleanly if state has shifted under us between condition and
+        // action (e.g., target struck/sank in another command's wake).
+        let Some(target_id) = self.goal.pursue_target else {
+            return Status::Failure;
+        };
+        let Some(target) = self.snapshots.get(target_id) else {
+            self.goal.pursue_target = None;
+            return Status::Failure;
+        };
+        let from = self.ship.position;
+        let dx = target.position.x - from.x;
+        let dy = target.position.y - from.y;
+        let heading = normalize_angle(dx.atan2(dy).to_degrees());
+        let speed = speed_at_heading(heading, self.stats, self.wind);
+        self.commands
+            .push((self.me, ShipCommand::Steer { heading, speed }));
+        let attacker_vel = velocity_from(heading, speed);
+        // Soften the deck if we can; never *required* for boarding to
+        // resolve, but a free contribution if we have magazine.
+        self.maybe_fire_at(target_id, target.position, attacker_vel, target.velocity);
+        // The real ask — emit the boarding intent if range allows.
+        self.maybe_board(target_id, target.position, attacker_vel, target);
+        Status::Success
+    }
+
+    /// Tactical condition (Phase 4 §3c-3): should this ship commit to
+    /// boarding the engaged counterpart this hour?
+    ///
+    /// True when *all* of:
+    ///   * I am a Pirate (only pirates board in v1; the naval/
+    ///     privateer board path lands with Phase 5 relations).
+    ///   * I am engaged with someone visible in the snapshot map.
+    ///   * Engaged counterpart's rigging fraction is below
+    ///     `BOARDING_RIGGING_THRESHOLD` (she cannot slip the grapples).
+    ///   * I have at least two crew alive (minimum boarding party).
+    ///
+    /// Side effect on success: sets `goal.pursue_target = engaged_with`
+    /// so `act_board` (which reads `pursue_target` like `act_pursue`)
+    /// steers at and grapples the engaged counterpart.
+    ///
+    /// Priority is *above* `should_fight` so a magazine-empty pirate
+    /// commits to the grapple instead of falling through to flee, and
+    /// *above* `should_disengage` so the disengage rule's "no fire +
+    /// no board option" line cannot itself preempt a viable board.
+    fn should_board(&mut self) -> bool {
+        if self.ship.policy != ShipPolicy::Pirate {
+            return false;
+        }
+        let Some(other) = self.ship.engaged_with else {
+            return false;
+        };
+        let Some(other_snap) = self.snapshots.get(other) else {
+            return false;
+        };
+        if self.ship.crew_alive < 2 {
+            return false;
+        }
+        if other_snap.rigging_frac >= crate::combat::BOARDING_RIGGING_THRESHOLD {
+            return false;
+        }
+        self.goal.pursue_target = Some(other);
+        true
+    }
+
     /// Tactical condition: should this ship break off the engagement
     /// this hour?
     ///
@@ -1600,6 +1696,7 @@ impl<'a> BtContext for ShipBtContext<'a> {
             ACT_DISENGAGE => self.act_disengage(),
             ACT_HOLD => self.act_hold(),
             ACT_STRIKE => self.act_strike(),
+            ACT_BOARD => self.act_board(),
             _ => Status::Failure,
         }
     }
@@ -1649,6 +1746,7 @@ impl<'a> BtContext for ShipBtContext<'a> {
             COND_SHOULD_FIGHT => self.should_fight(),
             COND_SHOULD_FLEE => self.should_flee(),
             COND_SHOULD_STRIKE => self.should_strike(),
+            COND_SHOULD_BOARD => self.should_board(),
             _ => false,
         };
         if result {

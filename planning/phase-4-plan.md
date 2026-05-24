@@ -295,7 +295,7 @@ Implement in three sub-commits (each green on fmt/clippy/test):
 - **§3c-1**: Symmetric engagement state (`engaged_with`, `engagement_started_at_minute`, `disengaged_until_minute` — no role enum), `IS_ENGAGED` + nested-Selector engaged subtree with `should_disengage`/`should_fight`/`should_flee`/`hold` heuristics, `Disengage` command + 60-min cooldown, sink terminal condition. Colosseum drops anchor; scenarios resolve as Sunk or as mutual-Disengage (emergent escape).
 - **§3c-2** *(minimal)*: `Strike` command + `should_strike` heuristic in the engaged subtree (priority above disengage), shared `resolve_prize_action` resolver extracted from the boarding path. Surrender outcomes reuse the existing instant-resolve take/sell/sink/release roll — *no* `follow_target` voyage yet (deferred to §3c-2b). Colosseum gains a `PRIZE SURRENDERED` verdict via prize-ledger sniff.
 - **§3c-2b** *(deferred)*: `follow_target` field + Follow BT branch + prize physically sails on victor's quarter + sells when victor reaches a friendly port (replaces the instant `take`/`sell` despawn).
-- **§3c-3**: Boarding integrates with PrizeAction (boarding victor runs same decision tree). `AttemptBoard` becomes a legitimate engaged-subtree choice when rigging conditions permit.
+- **§3c-3**: explicit `should_board` / `act_board` branch in the engaged subtree (priority above `should_fight` and `should_disengage`). Closes the no-ammo-vs-crippled-prey hole where a magazine-empty pirate would otherwise fall through to flee. Boarding-victor → `resolve_prize_action` is already wired (§3c-2). `AttemptBoard` becomes a first-class engaged-subtree choice rather than a side effect inside `act_pursue`.
 
 ### 3.5 Forts
 

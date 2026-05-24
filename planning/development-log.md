@@ -1176,3 +1176,22 @@ Pending; planning notes in `planning/phase-4-plan.md §3`.
 - §3c-2b: Follow BT branch + `follow_target` field + prize physically sails with victor and sells when victor reaches friendly port. Replaces the instant `take`/`sell` despawn with a real voyage.
 - Calibration: 89 bankrupt is in tolerance but worth revisiting once §3d (forts) and §3e (calibration sweep) land — Strike may be too generous, and `STRIKE_THRESHOLD` 0.15 is unvalidated.
 - Open question: should ships of certain factions (Navy, Privateer with Letter of Marque) be forbidden from striking? In Phase 5 (Relations Matrix) the surrender decision will gain a "honor of the flag" gate. For now any policy can strike.
+
+### §3c-3 — Boarding as a first-class engaged-subtree choice
+
+**Problem.** §3c-1's engaged subtree had a silent hole: a pirate engaged with a rigging-crippled merchant but out of powder would route through `should_fight` (false, requires ordnance) → `should_flee` (true, the fall-through) and *flee from helpless prey it could trivially board*. `act_pursue` already called `maybe_board` for pirates, so when `should_fight` did fire (ammo + prey crippled) boarding worked — but with an empty magazine the BT never reached `act_pursue` at all. The `should_disengage` rule had a `can_board` guard that prevented disengage in this case, but nothing then routed the ship into the board.
+
+**Decision.** New `COND_SHOULD_BOARD` + `ACT_BOARD` in the engaged subtree. Priority is *above* `should_fight` (so a pirate facing crippled prey commits to the grapple even with ammo — fire-and-board was the historical combined-arms approach, and `act_board` still calls `maybe_fire_at` to soften the deck if magazine permits) and *above* `should_disengage` (so the disengage rule cannot itself preempt a viable board).
+
+`should_board` gate: Pirate policy + engaged + counterpart visible in snapshots + counterpart rigging < `BOARDING_RIGGING_THRESHOLD` + own crew ≥ 2. Sets `goal.pursue_target = engaged_with` so `act_board` (which reuses the `act_pursue` steering machinery) steers at the right ship.
+
+Final engaged-subtree priority: **strike → board → disengage → fight → flee → hold**.
+
+**Results.**
+- 174 tests pass (1 new regression test added: `engaged_pirate_with_no_powder_boards_crippled_prey`). The test sets a Pirate with empty Cargo + `engaged_with = merchant_id`, places a crippled-rigging merchant 0.1 NM away, and asserts that the BT emits `AttemptBoard` (and does *not* emit a southbound flee Steer).
+- bench_trade 730d: **89 bankrupt** (unchanged from §3c-2). Prize ledger also unchanged at 74 events. The no-ammo-vs-crippled case is rare in this seed, so §3c-3 is correctness-only here — it doesn't shift the calibration metric. Worth re-checking after §3d (forts) and §3e (calibration sweep) bring more combat events into the run.
+- Colosseum: same 5 outcomes (none of the scripted scenarios end with an out-of-ammo pirate facing crippled prey).
+
+**Open question.** `act_board` currently still calls `maybe_fire_at` even when it has ordnance, which means a pirate with a healthy magazine and crippled prey will fire a softening broadside *and* attempt to board on the same tick. That's historically accurate (fire-and-board) but it does mean the boarding gate can fail (rigging may regenerate? no — actually it doesn't, but range may open if the target sails away after the broadside). In v1 we accept this — `maybe_board` re-gates `BOARDING_RANGE_NM` on the same tick using the *commanded* attacker velocity, so if the steer-toward-target keeps us in range, the board still fires.
+
+**Future work.** §3d (forts), §3e (calibration sweep), §3c-2b (Follow voyage), Phase 5 (Relations Matrix + naval boarders).
