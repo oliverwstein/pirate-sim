@@ -675,7 +675,16 @@ impl<'a> ShipBtContext<'a> {
 
     fn act_careen(&mut self) -> Status {
         self.ship.dock_action = DockAction::Careening;
-        if self.ship.tick_careen() {
+        // Phase 4 §2: careening at port now also restores combat /
+        // storm damage to the hull. Both operations tick in parallel
+        // (the carpenters and the boatswain's gang work on different
+        // parts of the ship). Action only completes when both the
+        // fouling-and-teredo scrape *and* the hull-integrity rebuild
+        // are finished. Cost is silver-or-debt; see
+        // `Ship::tick_repair_hull`.
+        let fouling_done = self.ship.tick_careen();
+        let hull_done = self.ship.tick_repair_hull(self.stats);
+        if fouling_done && hull_done {
             self.ship.dock_action = DockAction::Idle;
             Status::Success
         } else {
@@ -685,6 +694,12 @@ impl<'a> ShipBtContext<'a> {
 
     fn act_undock(&mut self) -> Status {
         if self.goal.destination.is_some() {
+            // Phase 4 §2: top off rigging from bo's'n stores on the
+            // way out. One-shot (unlike hull, which ticks gradually);
+            // matches the historical practice where a port turnaround
+            // included re-rigging as a normal item, not a separate
+            // refit. Silver-or-debt.
+            self.ship.top_off_rigging(self.stats);
             self.ship.undock();
             self.ship.nav.docked_at_port = None;
             self.ship.dock_action = DockAction::Idle;

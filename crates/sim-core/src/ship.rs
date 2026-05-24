@@ -744,6 +744,53 @@ impl Ship {
         self.hull_fouling <= 0.0
     }
 
+    /// Phase 4 §2: repair combat / storm damage to the hull for one
+    /// hour at a docked port. Restores up to `HULL_REPAIR_RATE_PER_HOUR`
+    /// HP and bills `HULL_REPAIR_COST_PESOS_PER_HP` per HP from
+    /// `silver`; any shortfall is recorded as drydock debt on
+    /// `Ship::debt` (which composes with the wage / chandler debt
+    /// machinery already in place — bankruptcy threshold, shipyard
+    /// scrap, mutiny pressure). Returns `true` when the hull is at
+    /// (or above) `stats.hull_integrity_max`.
+    ///
+    /// Carpenters work whether or not the captain can pay — bills
+    /// accrue as debt. This matches the historical practice: dockyard
+    /// pursers extended credit to known masters, and pursued unpaid
+    /// accounts through the admiralty courts.
+    pub fn tick_repair_hull(&mut self, stats: &ShipStats) -> bool {
+        let deficit = (stats.hull_integrity_max - self.hull_integrity).max(0.0);
+        if deficit <= 0.0 {
+            return true;
+        }
+        let restored = deficit.min(HULL_REPAIR_RATE_PER_HOUR);
+        self.hull_integrity += restored;
+        let bill = restored * HULL_REPAIR_COST_PESOS_PER_HP;
+        let paid = bill.min(self.silver.max(0.0));
+        self.silver -= paid;
+        self.debt += bill - paid;
+        self.hull_integrity >= stats.hull_integrity_max
+    }
+
+    /// Phase 4 §2: one-shot rigging top-off applied on undock. Rigging
+    /// damage is purely a combat reserve — sails, cordage, spars are
+    /// bo's'n stores carried aboard and replaced wholesale during a
+    /// port turnaround. Charges `RIGGING_REPAIR_COST_PESOS_PER_HP`
+    /// per HP restored from silver; any shortfall accrues to debt
+    /// (same rules as `tick_repair_hull`). Returns the HP delta
+    /// restored.
+    pub fn top_off_rigging(&mut self, stats: &ShipStats) -> f32 {
+        let deficit = (stats.rigging_integrity_max - self.rigging_integrity).max(0.0);
+        if deficit <= 0.0 {
+            return 0.0;
+        }
+        self.rigging_integrity = stats.rigging_integrity_max;
+        let bill = deficit * RIGGING_REPAIR_COST_PESOS_PER_HP;
+        let paid = bill.min(self.silver.max(0.0));
+        self.silver -= paid;
+        self.debt += bill - paid;
+        deficit
+    }
+
     /// Days of provisions remaining at current consumption rate
     /// (scaled by `crew_alive`).
     pub fn provisions_days_remaining(&self, _stats: &ShipStats) -> f32 {
@@ -761,6 +808,23 @@ const RESUPPLY_RATE_PER_HOUR: f32 = 0.5;
 
 /// Fouling points removed per hour while careening at a port.
 const CAREEN_RATE_PER_HOUR: f32 = 3.0;
+
+/// Phase 4 §2: hull HP restored per hour at a docked port. Sized so a
+/// 100-HP hull rebuild takes ~14 days (≈ 333 h), aligned with the
+/// historical 3–6 week refit cycle for a battle-damaged 4th-rate.
+pub const HULL_REPAIR_RATE_PER_HOUR: f32 = 0.3;
+
+/// Phase 4 §2: silver cost per HP of hull repair. A full 100-HP rebuild
+/// for a sloop is ~600 pesos — about 30% of the build cost, matching
+/// the Royal Navy's "great repair" line-item ratios for the era.
+pub const HULL_REPAIR_COST_PESOS_PER_HP: f32 = 6.0;
+
+/// Phase 4 §2: silver cost per HP of rigging restored at undock. Cheap
+/// — cordage + sailcloth come from bo's'n stores which the ship
+/// already carries; the charge models the port chandler's mark-up on
+/// resupply. A fully-dismasted sloop's rigging (80 HP) costs ~120
+/// pesos to replace, well within a single voyage's profit.
+pub const RIGGING_REPAIR_COST_PESOS_PER_HP: f32 = 1.5;
 
 /// Monthly wage per crewman, pesos. Historical reference: an ordinary
 /// English seaman c. 1670–1680 earned ~15–25 shillings/month, with a
@@ -1335,5 +1399,126 @@ mod tests {
             ship.provisions, provisions_before,
             "no provisions should load when market is dry"
         );
+    }
+
+    // ── Phase 4 §2 — repair at port ─────────────────────────────────
+
+    #[test]
+    fn tick_repair_hull_restores_at_documented_rate_and_charges_silver() {
+        let stats = ShipStats::sloop();
+        let mut ship = Ship::new(Position::ZERO, ShipState::Docked);
+        ship.silver = 10_000.0;
+        ship.hull_integrity = stats.hull_integrity_max - 1.0;
+
+        let silver_before = ship.silver;
+        let hull_before = ship.hull_integrity;
+        let done = ship.tick_repair_hull(&stats);
+
+        let restored = ship.hull_integrity - hull_before;
+        assert!(
+            (restored - HULL_REPAIR_RATE_PER_HOUR).abs() < 1e-4
+                || (ship.hull_integrity - stats.hull_integrity_max).abs() < 1e-4,
+            "expected ~{} HP restored, got {}",
+            HULL_REPAIR_RATE_PER_HOUR,
+            restored
+        );
+        let paid = silver_before - ship.silver;
+        assert!(
+            (paid - restored * HULL_REPAIR_COST_PESOS_PER_HP).abs() < 1e-3,
+            "billed {} pesos for {} HP; expected {}",
+            paid,
+            restored,
+            restored * HULL_REPAIR_COST_PESOS_PER_HP
+        );
+        assert!(!done || (ship.hull_integrity - stats.hull_integrity_max).abs() < 1e-4);
+    }
+
+    #[test]
+    fn tick_repair_hull_caps_at_max_and_reports_done() {
+        let stats = ShipStats::sloop();
+        let mut ship = Ship::new(Position::ZERO, ShipState::Docked);
+        ship.silver = 10_000.0;
+        // Damage less than one tick of repair.
+        ship.hull_integrity = stats.hull_integrity_max - 0.01;
+        let done = ship.tick_repair_hull(&stats);
+        assert!(done);
+        assert!((ship.hull_integrity - stats.hull_integrity_max).abs() < 1e-4);
+
+        // Already full → no-op, no charge.
+        let silver = ship.silver;
+        let done2 = ship.tick_repair_hull(&stats);
+        assert!(done2);
+        assert_eq!(ship.silver, silver);
+        assert_eq!(ship.debt, 0.0);
+    }
+
+    #[test]
+    fn tick_repair_hull_insufficient_silver_creates_debt_not_partial_freebie() {
+        let stats = ShipStats::sloop();
+        let mut ship = Ship::new(Position::ZERO, ShipState::Docked);
+        ship.silver = 0.5; // Less than one HP of hull at 6 pesos/HP.
+        ship.debt = 0.0;
+        ship.hull_integrity = stats.hull_integrity_max - 1.0;
+
+        let hull_before = ship.hull_integrity;
+        ship.tick_repair_hull(&stats);
+        let restored = ship.hull_integrity - hull_before;
+        let bill = restored * HULL_REPAIR_COST_PESOS_PER_HP;
+
+        // Full HP delta was applied — the carpenters worked.
+        assert!(restored > 0.0);
+        // Silver drained.
+        assert_eq!(ship.silver, 0.0);
+        // Remainder is debt, not a freebie.
+        assert!(
+            (ship.debt - (bill - 0.5)).abs() < 1e-3,
+            "debt {} should be bill {} minus the 0.5 pesos paid",
+            ship.debt,
+            bill
+        );
+    }
+
+    #[test]
+    fn top_off_rigging_one_shot_full_restore() {
+        let stats = ShipStats::sloop();
+        let mut ship = Ship::new(Position::ZERO, ShipState::Docked);
+        ship.silver = 10_000.0;
+        ship.rigging_integrity = stats.rigging_integrity_max * 0.5;
+
+        let silver_before = ship.silver;
+        let delta = ship.top_off_rigging(&stats);
+
+        let expected_delta = stats.rigging_integrity_max * 0.5;
+        assert!((delta - expected_delta).abs() < 1e-3);
+        assert!((ship.rigging_integrity - stats.rigging_integrity_max).abs() < 1e-4);
+        let expected_bill = expected_delta * RIGGING_REPAIR_COST_PESOS_PER_HP;
+        assert!((silver_before - ship.silver - expected_bill).abs() < 1e-3);
+    }
+
+    #[test]
+    fn top_off_rigging_full_health_is_noop() {
+        let stats = ShipStats::sloop();
+        let mut ship = Ship::new(Position::ZERO, ShipState::Docked);
+        ship.silver = 10_000.0;
+        let silver = ship.silver;
+        let delta = ship.top_off_rigging(&stats);
+        assert_eq!(delta, 0.0);
+        assert_eq!(ship.silver, silver);
+        assert_eq!(ship.debt, 0.0);
+    }
+
+    #[test]
+    fn top_off_rigging_insufficient_silver_goes_to_debt() {
+        let stats = ShipStats::sloop();
+        let mut ship = Ship::new(Position::ZERO, ShipState::Docked);
+        ship.silver = 0.0;
+        ship.debt = 0.0;
+        ship.rigging_integrity = 0.0;
+
+        let delta = ship.top_off_rigging(&stats);
+        assert!((delta - stats.rigging_integrity_max).abs() < 1e-3);
+        assert!((ship.rigging_integrity - stats.rigging_integrity_max).abs() < 1e-4);
+        let expected_debt = stats.rigging_integrity_max * RIGGING_REPAIR_COST_PESOS_PER_HP;
+        assert!((ship.debt - expected_debt).abs() < 1e-3);
     }
 }
