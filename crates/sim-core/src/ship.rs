@@ -232,6 +232,12 @@ pub struct Ship {
     /// foundering hazard rate so older hulls fail more readily, and
     /// will eventually drive economic obsolescence in later steps.
     pub age_days: u32,
+    /// Phase 4 §3a: the absolute `World::sim_minute` at which this
+    /// ship is next ready to fire a broadside. Compared against the
+    /// sub-tick wall clock by §3b's combat resolver. Default 0 means
+    /// "ready immediately"; a fresh ship can fire on its first hour.
+    /// Updated to `current_minute + reload_minutes` on every fire.
+    pub next_fire_at_minute: u64,
 }
 
 /// What the ship is doing while docked. Used by the docking sequence in
@@ -277,6 +283,7 @@ impl Ship {
             rigging_integrity: stats.rigging_integrity_max,
             teredo_damage: 0.0,
             age_days: 0,
+            next_fire_at_minute: 0,
         }
     }
 
@@ -335,6 +342,7 @@ impl Ship {
             rigging_integrity: stats.rigging_integrity_max,
             teredo_damage: 0.0,
             age_days: 0,
+            next_fire_at_minute: 0,
         }
     }
 
@@ -379,6 +387,7 @@ impl Ship {
             rigging_integrity: stats.rigging_integrity_max,
             teredo_damage: 0.0,
             age_days: 0,
+            next_fire_at_minute: 0,
         }
     }
 

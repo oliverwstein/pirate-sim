@@ -363,3 +363,25 @@ fn under_crewed_pirate_cannot_take_prize() {
         );
     }
 }
+
+// ── Phase 4 §3a — sub-tick clock plumbing ─────────────────────────────
+
+/// Phase 4 §3a: `World::sim_minute` must advance by exactly 60 each
+/// hourly `tick()`. The upcoming sub-tick combat loop (§3b) keys
+/// reload timing off this counter, so any drift between calendar
+/// hours and the minute clock would silently miscalibrate reload
+/// rates.
+#[test]
+fn sim_minute_advances_60_per_hour() {
+    let mut world = fresh_world();
+    let start = world.sim_minute;
+    world.tick();
+    assert_eq!(world.sim_minute, start + sim_core::world::MINUTES_PER_HOUR);
+    for _ in 0..23 {
+        world.tick();
+    }
+    assert_eq!(
+        world.sim_minute,
+        start + 24 * sim_core::world::MINUTES_PER_HOUR
+    );
+}

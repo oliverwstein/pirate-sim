@@ -99,7 +99,19 @@ pub struct World {
     /// the Resolution Phase before physics. Lives on `World` so the
     /// allocation is reused across ticks.
     pub commands: Vec<(ShipId, crate::command::ShipCommand)>,
+    /// Phase 4 §3a: monotonic minute counter advanced by `MINUTES_PER_HOUR`
+    /// each hourly tick. Drives the sub-tick combat reload clock so that
+    /// `Ship::next_fire_at_minute` (and the upcoming `Fort` equivalent)
+    /// can be compared against an absolute wall-clock value rather than
+    /// a per-hour reset. Wraps at u64::MAX, which is ~35 trillion sim
+    /// years — i.e., never.
+    pub sim_minute: u64,
 }
+
+/// Phase 4 §3a: minutes per hourly tick. Sub-tick combat (§3b) divides
+/// this into 12 five-minute steps; reload formulas in `combat.rs` are
+/// expressed in real minutes against `sim_minute`.
+pub const MINUTES_PER_HOUR: u64 = 60;
 
 impl World {
     pub fn load(data_dir: &Path) -> Self {
@@ -160,6 +172,7 @@ impl World {
             combat_rng_state: 0x5052_495A_4520_5247_u64 ^ 0x9E37_79B9_7F4A_7C15,
             spatial: SpatialHash::new(),
             commands: Vec::new(),
+            sim_minute: 0,
         }
     }
 
@@ -324,6 +337,10 @@ impl World {
         self.tick_hourly_ai_and_physics(month, &pathfind_stats);
 
         self.date.advance_hours(1);
+        // Phase 4 §3a: keep the absolute minute clock in lock-step with
+        // the calendar tick. Sub-tick combat (§3b) will read this to
+        // schedule reloads at sub-minute precision.
+        self.sim_minute = self.sim_minute.saturating_add(MINUTES_PER_HOUR);
     }
 
     /// Monthly economic tick: market production/consumption, sailor
