@@ -620,7 +620,17 @@ impl PortArchetype {
                 &[(SILVER, 1.0), (SUGAR, 40.0), (TOBACCO, 20.0)],
             ),
             PortArchetype::EuropeanNantes => (
-                &[(MANUFACTURES, 80.0), (RUM, 20.0), (PROVISIONS, 70.0)],
+                &[
+                    (MANUFACTURES, 80.0),
+                    (RUM, 20.0),
+                    (PROVISIONS, 70.0),
+                    // Phase 4 §1.2: French royal powder works (Essonnes,
+                    // est. 1664 by Colbert) routed exports through the
+                    // Atlantic ports. Modest output relative to London
+                    // and Amsterdam, and no foundry shot of note —
+                    // French shot largely went into army artillery.
+                    (GUNPOWDER, 4.0),
+                ],
                 &[(SUGAR, 80.0), (TOBACCO, 30.0), (MOLASSES, 20.0)],
             ),
             // === WEST AFRICA ===
@@ -1109,5 +1119,52 @@ mod tests {
             .unwrap();
         let err = market.buy(&mut ship, &stats, ids::MANUFACTURES, 1.0, &registry);
         assert!(matches!(err, Err(TradeError::InsufficientStockpile)));
+    }
+
+    /// Phase 4 §1.2 — every European arsenal hub produces gunpowder, and
+    /// the three major ones also produce shot. Regression guard against a
+    /// future recipe edit that silently drops ordnance from an archetype.
+    #[test]
+    fn every_european_hub_produces_gunpowder() {
+        for archetype in [
+            PortArchetype::EuropeanLondon,
+            PortArchetype::EuropeanAmsterdam,
+            PortArchetype::EuropeanCadiz,
+            PortArchetype::EuropeanNantes,
+        ] {
+            let recipe = archetype.recipe();
+            let powder_out = recipe
+                .monthly_outputs
+                .iter()
+                .find(|(g, _)| *g == ids::GUNPOWDER)
+                .map(|(_, t)| *t)
+                .unwrap_or(0.0);
+            assert!(
+                powder_out > 0.0,
+                "{:?} should produce gunpowder, got {} t/mo",
+                archetype,
+                powder_out
+            );
+        }
+    }
+
+    /// Phase 4 §1.2 — only the three major arsenals (London / Amsterdam /
+    /// Cadiz) produce cannon shot. Nantes is powder-only by design.
+    #[test]
+    fn major_arsenals_produce_shot() {
+        for archetype in [
+            PortArchetype::EuropeanLondon,
+            PortArchetype::EuropeanAmsterdam,
+            PortArchetype::EuropeanCadiz,
+        ] {
+            let recipe = archetype.recipe();
+            let shot_out = recipe
+                .monthly_outputs
+                .iter()
+                .find(|(g, _)| *g == ids::CANNON_SHOT)
+                .map(|(_, t)| *t)
+                .unwrap_or(0.0);
+            assert!(shot_out > 0.0, "{:?} should produce cannon shot", archetype);
+        }
     }
 }

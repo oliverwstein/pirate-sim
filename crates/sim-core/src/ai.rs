@@ -93,6 +93,43 @@ const REPLAN_DISTANCE_NM: f32 = 25.0;
 /// this is paid out to the owner port on docking.
 const HOME_PORT_FLOAT_SILVER: f32 = 500.0;
 
+/// Phase 4 §1.3: how many full broadsides' worth of powder / shot a
+/// merchant ship aims to keep aboard. 20 ≈ a long convoy's worth of
+/// defensive engagements without restocking, in line with the
+/// "magazine for the voyage" rule of thumb 17C indiamen sailed under.
+const MERCHANT_BROADSIDES_TARGET: f32 = 20.0;
+
+/// Phase 4 §1.3: how many full broadsides a pirate aims to keep aboard.
+/// Double the merchant figure: pirates expect to *initiate* combat,
+/// often several engagements per cruise, and have no second supply
+/// line if they exhaust their magazine far from a friendly port.
+const PIRATE_BROADSIDES_TARGET: f32 = 40.0;
+
+/// Phase 4 §1.3: desired tonnage of powder and shot to keep in a ship's
+/// magazine after selling cargo and before sailing. Scales with the
+/// ship's cannon count via `combat::broadside_supply_cost`, which is
+/// also what `world.rs` debits on every fire — i.e., the target is
+/// expressed directly in "broadsides of reserve".
+///
+/// Pirates aim for `PIRATE_BROADSIDES_TARGET` broadsides; merchants for
+/// `MERCHANT_BROADSIDES_TARGET`. A 0-gun ship returns `(0.0, 0.0)` and
+/// will not buy ordnance at all.
+pub fn ordnance_target(ship: &Ship, stats: &ShipStats) -> (f32, f32) {
+    if stats.cannons == 0 {
+        return (0.0, 0.0);
+    }
+    let broadsides = match ship.policy {
+        ShipPolicy::Pirate => PIRATE_BROADSIDES_TARGET,
+        ShipPolicy::Merchant => MERCHANT_BROADSIDES_TARGET,
+    };
+    let (powder_per_broadside, shot_per_broadside) =
+        crate::combat::broadside_supply_cost(stats.cannons);
+    (
+        powder_per_broadside * broadsides,
+        shot_per_broadside * broadsides,
+    )
+}
+
 /// On outfitting at home, the ship will try to top its strongbox up
 /// to this many times the estimated cost of one full outbound hold.
 /// Gives a cushion for partial-cargo top-ups at intermediate ports
@@ -680,13 +717,20 @@ impl<'a> ShipBtContext<'a> {
         if idx >= self.markets.len() {
             return Status::Success;
         }
-        // Step 7: gunner's stores are bookkept separately from the
-        // supercargo's trade hold. Sell only what's *over* the policy-
-        // appropriate magazine target; refill any shortfall after.
-        let (powder_keep, shot_keep) = match self.ship.policy {
-            crate::ship::ShipPolicy::Pirate => (4.0_f32, 4.0_f32),
-            crate::ship::ShipPolicy::Merchant => (1.0_f32, 1.0_f32),
-        };
+        // Step 7 + Phase 4 §1.3: gunner's stores are bookkept separately
+        // from the supercargo's trade hold. Sell only what's *over* the
+        // policy-and-armament-appropriate magazine target; refill any
+        // shortfall after.
+        //
+        // Targets scale with cannon count: 20 broadsides/gun for
+        // merchants (defensive reserve), 40 for pirates (offensive
+        // budget). With `POWDER_TONS_PER_GUN = 0.01` and `SHOT_TONS_PER_GUN
+        // = 0.01`, this works out to 0.2 t/gun powder & shot for a
+        // merchant, 0.4 t/gun for a pirate — i.e., 1.6 t each on an
+        // 8-gun sloop merchant, 9.6 t each on a 24-gun pirate ship.
+        // Historically defensible: a typical merchant carried 5–10
+        // broadsides' worth aboard, a privateer 30+.
+        let (powder_keep, shot_keep) = ordnance_target(self.ship, self.stats);
         let market = &mut self.markets[idx];
         let entries: Vec<(crate::goods::GoodId, f32)> = self.ship.cargo.iter().collect();
         for (gid, tons) in entries {
@@ -1243,5 +1287,62 @@ impl<'a> BtContext for ShipBtContext<'a> {
         } else {
             Status::Failure
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ship::{Ship, ShipState, ShipStats};
+    use crate::types::Position;
+
+    fn make_ship(policy: ShipPolicy) -> Ship {
+        let mut s = Ship::new(Position { x: 0.0, y: 0.0 }, ShipState::Sailing);
+        s.policy = policy;
+        s
+    }
+
+    /// Phase 4 §1.3 — the magazine target scales linearly with cannon
+    /// count, expressed in "broadsides of reserve". A 0-gun ship buys
+    /// nothing.
+    #[test]
+    fn ordnance_target_scales_with_cannons() {
+        let mut stats_small = ShipStats::sloop();
+        stats_small.cannons = 8;
+        let mut stats_big = ShipStats::sloop();
+        stats_big.cannons = 24;
+        let mut stats_unarmed = ShipStats::sloop();
+        stats_unarmed.cannons = 0;
+        let ship = make_ship(ShipPolicy::Merchant);
+
+        let (p_small, s_small) = ordnance_target(&ship, &stats_small);
+        let (p_big, s_big) = ordnance_target(&ship, &stats_big);
+        let (p_zero, s_zero) = ordnance_target(&ship, &stats_unarmed);
+
+        assert!(p_small > 0.0 && s_small > 0.0);
+        assert!(p_big > p_small * 2.9 && p_big < p_small * 3.1);
+        assert!(s_big > s_small * 2.9 && s_big < s_small * 3.1);
+        assert_eq!(p_zero, 0.0);
+        assert_eq!(s_zero, 0.0);
+    }
+
+    /// Phase 4 §1.3 — pirates aim to keep twice as many broadsides aboard
+    /// as merchants, holding cannon count constant.
+    #[test]
+    fn pirate_target_exceeds_merchant_target() {
+        let mut stats = ShipStats::sloop();
+        stats.cannons = 12;
+        let merchant = make_ship(ShipPolicy::Merchant);
+        let pirate = make_ship(ShipPolicy::Pirate);
+
+        let (p_merchant, _) = ordnance_target(&merchant, &stats);
+        let (p_pirate, _) = ordnance_target(&pirate, &stats);
+
+        assert!(
+            p_pirate > p_merchant * 1.9 && p_pirate < p_merchant * 2.1,
+            "pirate target {} should be ~2× merchant {}",
+            p_pirate,
+            p_merchant
+        );
     }
 }
