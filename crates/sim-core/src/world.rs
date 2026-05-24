@@ -129,6 +129,12 @@ pub struct World {
     /// a per-hour reset. Wraps at u64::MAX, which is ~35 trillion sim
     /// years — i.e., never.
     pub sim_minute: u64,
+    /// Phase 6 instrumentation: wall-clock nanoseconds spent in the
+    /// AI Phase of the most recent hourly tick (read-only world,
+    /// pushes commands). Used by `bench_ai_tick` to measure the
+    /// payoff of parallelizing the AI phase. Zero before the first
+    /// hourly tick of a run.
+    pub last_ai_phase_ns: u64,
 }
 
 /// Phase 4 §3a: minutes per hourly tick. Sub-tick combat (§3b) divides
@@ -198,6 +204,7 @@ impl World {
             spatial: SpatialHash::new(),
             commands: Vec::new(),
             sim_minute: 0,
+            last_ai_phase_ns: 0,
         }
     }
 
@@ -694,41 +701,86 @@ impl World {
 
         // ─── AI Phase (read-only over other ships) ───────────────────
         // Each ship's AI ticks against the pre-tick world snapshot
-        // (`snapshots` + `spatial`) and pushes its intents into
-        // `self.commands`. No ship may mutate another ship here; ship
-        // self-mutation is allowed (cargo bookkeeping at dock, etc.).
-        for id in ids.iter().copied() {
-            let ship_stats: ShipStats = match self.ships.get(id) {
-                Some(s) => self.ship_types.get(s.ship_type).stats.clone(),
-                None => continue,
-            };
-            let wind = self.weather.wind.wind_at(self.ships[id].position, month);
+        // (`snapshots` + `spatial`) and pushes its intents into a
+        // per-task local buffer. No ship may mutate another ship
+        // here; ship self-mutation is allowed (cargo bookkeeping at
+        // dock, etc.).
+        //
+        // Parallelism: ships are independent during the AI phase
+        // (read-only world, write-only to per-ship buffer), so we
+        // Rayon-parallelize the per-ship loop. Determinism is
+        // preserved by sorting per-ship outputs by `ShipId.data()`
+        // before flattening into the global command buffer, so the
+        // downstream resolution phase sees the same drain order as
+        // the serial implementation.
+        let ai_phase_start = std::time::Instant::now();
 
-            let ai = match self.ship_ais.get_mut(id) {
-                Some(a) => a,
-                None => continue,
-            };
-            let ship = match self.ships.get_mut(id) {
-                Some(s) => s,
-                None => continue,
-            };
-            let mut inputs = crate::ai::ShipTickInputs {
-                me: id,
-                ship,
-                stats: &ship_stats,
-                wind: &wind,
-                ports: &self.ports,
-                harbors: &self.harbors,
-                pathfind: Some(&pathfind),
-                markets: &self.markets,
-                goods: &self.goods,
-                commands: &mut self.commands,
-                day_of_year: self.date.day_of_year,
-                snapshots: &snapshots,
-                spatial: &self.spatial,
-            };
-            ai.tick(&mut inputs);
+        // Materialize disjoint (id, &mut Ship, &mut ShipAI) triples
+        // by zipping the two slotmaps. Both iterate in slot-index
+        // order, and every ship has an AI (set at spawn), so the
+        // keys line up; we `debug_assert_eq!` to catch any drift.
+        // 503 ships × 24 bytes ≈ 12 KB; trivial per-tick churn.
+        let pairs: Vec<(ShipId, &mut crate::ship::Ship, &mut crate::ai::ShipAI)> = self
+            .ships
+            .iter_mut()
+            .zip(self.ship_ais.iter_mut())
+            .map(|((sid, ship), (aid, ai))| {
+                debug_assert_eq!(sid, aid, "ship/ai slotmap keys diverged");
+                (sid, ship, ai)
+            })
+            .collect();
+
+        // Reborrow world state as plain `&_` so each Rayon task
+        // captures a Sync reference (PathfindContext, SpatialHash,
+        // WindGrid, etc. are all read-only data).
+        let ports = &self.ports;
+        let harbors = &self.harbors;
+        let markets = &self.markets;
+        let goods = &self.goods;
+        let snapshots_ref = &snapshots;
+        let spatial_ref = &self.spatial;
+        let pathfind_ref = &pathfind;
+        let ship_types = &self.ship_types;
+        let weather_wind = &self.weather.wind;
+        let day_of_year = self.date.day_of_year;
+
+        use rayon::prelude::*;
+        let mut results: Vec<(ShipId, Vec<(ShipId, crate::command::ShipCommand)>)> = pairs
+            .into_par_iter()
+            .map(|(id, ship, ai)| {
+                let ship_stats: ShipStats = ship_types.get(ship.ship_type).stats.clone();
+                let wind = weather_wind.wind_at(ship.position, month);
+                let mut local_commands: Vec<(ShipId, crate::command::ShipCommand)> = Vec::new();
+                {
+                    let mut inputs = crate::ai::ShipTickInputs {
+                        me: id,
+                        ship,
+                        stats: &ship_stats,
+                        wind: &wind,
+                        ports,
+                        harbors,
+                        pathfind: Some(pathfind_ref),
+                        markets,
+                        goods,
+                        commands: &mut local_commands,
+                        day_of_year,
+                        snapshots: snapshots_ref,
+                        spatial: spatial_ref,
+                    };
+                    ai.tick(&mut inputs);
+                }
+                (id, local_commands)
+            })
+            .collect();
+
+        // Determinism: sort by ShipId slot index so the resolution
+        // phase below sees the same drain order as a serial loop
+        // would. (par_bridge / par_iter are unordered.)
+        results.sort_by_key(|(id, _)| id.data());
+        for (_id, cmds) in results {
+            self.commands.extend(cmds);
         }
+        self.last_ai_phase_ns = ai_phase_start.elapsed().as_nanos() as u64;
 
         // ─── Resolution Phase ────────────────────────────────────────
         // Drain the command buffer in push order (== AI-tick id order).

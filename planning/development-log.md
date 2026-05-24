@@ -1557,3 +1557,85 @@ to clear in the current calibration regime.
   ε on the buy/sell spread).
 - A proper auction unit test in `market.rs` that exercises the
   multi-bidder pro-rata path directly.
+
+---
+
+## Phase 6 follow-up — Rayon-parallel AI tick (2025)
+
+**Context.** Phase 6's command-buffer redesign made the AI tick
+read-only against world state and write-only to a per-ship
+command buffer. That was the whole point: unblock Rayon
+parallelism over ships.
+
+**Measurement first.** Added `examples/bench_ai_tick.rs` and a
+`World::last_ai_phase_ns` instrumentation field. Loaded the
+historical fleet (503 ships), warmed up 24 ticks, then measured
+720 hourly ticks. Baseline numbers (single-threaded):
+
+```
+avg : 1.080 ms    p50 : 0.111 ms
+p95 : 7.020 ms    max : 36.580 ms
+Per-ship-per-tick avg: 2.15 µs
+AI-phase share of wall time: 95.8%
+```
+
+The variance is the headline: most ships are sailing or idle
+(microsecond-scale), but on tick boundaries where many ships
+simultaneously plan A* paths, a single hour can spike to 36 ms.
+That spike is what would hurt the visualizer's frame budget once
+we run real-time.
+
+**Implementation.** Replaced the `for id in ids` loop with:
+
+1. Materialize `Vec<(ShipId, &mut Ship, &mut ShipAI)>` by zipping
+   `ships.iter_mut()` and `ship_ais.iter_mut()` (both slot-ordered;
+   a `debug_assert_eq!` catches any divergence).
+2. `into_par_iter().map(...)` where each closure builds a *local*
+   `Vec<(ShipId, ShipCommand)>` and calls `ai.tick(&mut inputs)`.
+3. `sort_by_key(|(id, _)| id.data())` on the collected results
+   before flattening into `self.commands`. This restores the
+   serial drain order so the resolution phase (combat,
+   auction, etc.) sees identical input regardless of thread
+   scheduling.
+
+All shared references (ports/harbors/markets/goods/snapshots/
+spatial/pathfind/weather.wind/ship_types) are `&_` to plain data
+and trivially `Sync`.
+
+**Why a Vec materialization instead of slotmap-direct.** SlotMap
+doesn't expose disjoint-mut random access (only `iter_mut`). The
+intermediate `Vec` is 503 × 24 bytes ≈ 12 KB per tick — well
+below any noise floor, and it lets us use `into_par_iter`
+without unsafe.
+
+**Determinism.** `bench_trade` reported the same 36 bankruptcies
+as the serial baseline; the per-port auction's ship-id-sorted
+ordering is preserved through the sort step.
+
+**Measured results.**
+
+```
+parallel  →  avg : 0.765 ms (-29%)
+             p50 : 0.086 ms (-23%)
+             p95 : 5.343 ms (-24%)
+             max : 11.620 ms (-68%)
+             wall: 587 ms   (-28%)
+```
+
+The avg/p50 win is moderate — most ticks are too small to
+amortize Rayon's task spawn overhead. The dramatic win is the
+max-tick latency (68% reduction): pathfind-heavy hours that
+would have stuttered the simulation now flatten out across
+cores.
+
+**Out of scope (next opportunities).**
+- Larger fleets would amortize task overhead better; if we
+  push past ~2000 ships the avg-tick gain should grow toward
+  the core-count ratio.
+- Parallelizing the resolution phase (combat sub-tick, auction)
+  requires more care: combat has cross-ship writes. Probably
+  worth it once the AI phase is no longer the dominant
+  fraction of wall time.
+- Could chunk ships into batches with `par_chunks` to reduce
+  per-task overhead for short ticks; not obviously worth the
+  added complexity yet.
