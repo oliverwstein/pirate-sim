@@ -9,12 +9,18 @@
 //! equivalent over distances larger than a few NM and avoids the whole
 //! class of bugs where physical zig-zagging pushes a ship into a coastline.
 
-use std::collections::VecDeque;
+use arrayvec::ArrayVec;
 
 use crate::map::land::LandMap;
 use crate::ship::{angle_diff, normalize_angle, speed_at_heading, ShipStats};
 use crate::sim_rng::SimRng;
 use crate::types::{Position, ShipId, WindVector};
+
+/// Maximum number of intermediate waypoints a planned path may hold.
+/// Pathfind benchmark (1406 ordered port pairs) tops out at 37; 64 leaves
+/// generous headroom for future routes (e.g. via the Cape of Good Hope)
+/// without paying the per-ship heap allocation a `VecDeque` would.
+pub const MAX_WAYPOINTS: usize = 64;
 
 /// A steering command: the heading to set on the ship and the speed it
 /// should make good toward its target this tick (pre-fouling).
@@ -201,8 +207,10 @@ pub struct NavTrack {
     pub docked_at_port: Option<usize>,
     /// Ordered intermediate waypoints (front = next target). The final
     /// element should equal the captain's `NavGoal.destination` when a path
-    /// was planned.
-    pub waypoints: VecDeque<Position>,
+    /// was planned. Capped at [`MAX_WAYPOINTS`] so the queue lives inline
+    /// in the `Ship` struct (no per-ship heap allocation, no pointer chase
+    /// when combat/weather iterate over fleets).
+    pub waypoints: ArrayVec<Position, MAX_WAYPOINTS>,
 }
 
 impl NavTrack {
@@ -210,12 +218,22 @@ impl NavTrack {
         Self::default()
     }
 
-    /// Replace the current waypoint queue with a planned path. Caller is
-    /// responsible for keeping the captain's `NavGoal.destination` in sync
-    /// with the path's final waypoint (typically they already match because
-    /// the path was planned *to* the destination).
+    /// Replace the current waypoint queue with a planned path. Truncates
+    /// silently if `waypoints.len() > MAX_WAYPOINTS`; with the current
+    /// 64-slot cap and a measured max of 37, this never fires in practice
+    /// — a debug_assert catches it in dev so we notice if a future route
+    /// (e.g. a longer trans-oceanic leg) starts to need a bigger cap.
     pub fn set_path(&mut self, waypoints: Vec<Position>) {
-        self.waypoints = waypoints.into();
+        debug_assert!(
+            waypoints.len() <= MAX_WAYPOINTS,
+            "planned path of {} waypoints exceeds MAX_WAYPOINTS={}",
+            waypoints.len(),
+            MAX_WAYPOINTS
+        );
+        self.waypoints.clear();
+        for wp in waypoints.into_iter().take(MAX_WAYPOINTS) {
+            self.waypoints.push(wp);
+        }
     }
 
     /// Clear any planned path (keeps `goal.destination` in place).
@@ -225,7 +243,7 @@ impl NavTrack {
 
     /// The current heading target: front waypoint if any, else goal destination.
     fn current_target(&self, goal: &NavGoal) -> Option<Position> {
-        self.waypoints.front().copied().or(goal.destination)
+        self.waypoints.first().copied().or(goal.destination)
     }
 
     /// Compute steering (heading + commanded speed) given current position,
@@ -265,9 +283,11 @@ impl NavTrack {
         // DR plot, not at a GPS truth. The minor "corner cutting"
         // this causes when estimate is biased is bounded by DR
         // noise (a NM or two) — well under WAYPOINT_REACHED_NM.
-        while let Some(&wp) = self.waypoints.front() {
+        // ArrayVec has no pop_front; remove(0) is O(n) but n <= 64 and
+        // typically we pop at most a handful per tick.
+        while let Some(&wp) = self.waypoints.first() {
             if pos_estimate.distance(wp) < WAYPOINT_REACHED_NM {
-                self.waypoints.pop_front();
+                self.waypoints.remove(0);
             } else {
                 break;
             }

@@ -1425,3 +1425,41 @@ roll values.
 **Validation.** 192 tests pass; clippy clean; `bench_trade` 79
 bankruptcies (vs 82 pre-Phase-4 — within noise; the equilibrium gap is
 unchanged); `bench_pathfind` 1406/1406 routes ok, 1.42 ms avg.
+
+---
+
+## DOD Refactor — Phase 5: NavTrack waypoints as ArrayVec (2026-05)
+
+**Context.** `NavTrack.waypoints` was a `VecDeque<Position>`. Every
+`Ship` therefore held a heap allocation that resized and got dropped
+constantly; for 500 ships doing periodic re-planning, the allocator
+traffic alone is meaningful, and the pointer chase pulls cache lines
+into `Ship` iteration loops (combat, weather, AI tick) that have no
+business touching the waypoint buffer.
+
+**Sizing the cap.** `bench_pathfind` exhaustively walks all 1406 ordered
+port pairs in the historical 11-port set. Measured max path length is
+37 waypoints. A 64-slot `ArrayVec<Position, 64>` is 64 × 8 bytes = 512
+bytes (Position is two f32), with no extra indirection. Future routes
+(e.g. trans-Atlantic dogleg around the Cape of Good Hope) get
+generous headroom; a `debug_assert!` in `set_path` will fire if the
+planner ever exceeds the cap in dev so we notice when it's time to raise.
+
+**Alternatives considered.**
+1. *`tinyvec` instead of `arrayvec`.* Spills to heap when capped —
+   defeats the determinism-of-layout argument and re-introduces the
+   allocator traffic we're trying to remove.
+2. *`SmallVec<[Position; 32]>`.* Same spillover issue plus extra
+   discriminant per slot.
+3. *Pull `NavTrack` into a parallel ECS-style component.* The reviewer's
+   alternative suggestion. Defers to the "skip ECS" decision; we can
+   revisit if `Ship` itself ever grows uncomfortably wide.
+
+**Resolution.** `waypoints: ArrayVec<Position, 64>` (constant exported
+as `MAX_WAYPOINTS`). API stays nearly identical — `front()` becomes
+`first()`, `pop_front()` becomes `remove(0)`. The O(n) front-pop is
+trivial at n ≤ 64 and we typically remove at most a handful per tick.
+
+**Validation.** 192 tests pass; clippy clean; `bench_trade` 79
+bankruptcies (unchanged from Phase 4); `bench_pathfind` 1406/1406 ok,
+1.37 ms avg. No path ever exceeded 64 waypoints in either benchmark.

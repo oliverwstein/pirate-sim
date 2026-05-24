@@ -12,6 +12,7 @@ serde = { version = "1", features = ["derive"] }
 ron = "0.8"
 rand_core = "0.6"
 rand_pcg = { version = "0.3", features = ["serde1"] }
+arrayvec = { version = "0.7", features = ["serde"] }
 
 [dev-dependencies]
 rstest = "0.23"
