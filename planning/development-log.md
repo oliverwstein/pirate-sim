@@ -1317,3 +1317,35 @@ predates this work.
 - Remaining DOD/perf items from the review (Cargo flat array, spatial hash
   flat-vec, PRNG → `rand_pcg`, NavTrack → ArrayVec) are queued in the
   session plan and will land as separate commits.
+
+---
+
+## 2026-05-24 — DOD/Perf Refactor #2: Cargo flat array
+
+**Decision.** Replaced `Cargo`'s internal `Vec<(GoodId, f32)>` with a flat
+`[f32; CARGO_SLOTS]` where `CARGO_SLOTS = 16` (room for the 11 starter goods
+plus headroom). `Cargo` is now exactly 64 bytes — one cache line on
+common x86_64 / aarch64 — and held inline on every ship and port.
+
+**Wins.** `get`/`add` become O(1) indexed loads with no branch and no
+heap allocation. Every `Ship` is fully inline (no pointer chase from
+Ship into a heap-allocated cargo Vec). `iter()` is now deterministic by
+`GoodId` ascending (previously by insertion order), which is a strict
+improvement for reproducibility.
+
+**Contract changes.** None visible to callers — the public API
+(`new`, `get`, `add`, `remove`, `iter`, `is_empty`, `len`, `clear`,
+`total_tons`) is unchanged. `iter` now yields slots with positive stock
+only, in `GoodId` order; one test in `cargo.rs` was updated to assert
+the new ordering (and a `size_of::<Cargo>() == 64` guard added so this
+property doesn't regress).
+
+**Out-of-range goods.** `GoodId.0 >= CARGO_SLOTS` panics in debug,
+silently no-ops in release. The current registry is 11 wide so this is
+unreachable in practice; if `goods.ron` ever grows past 16, bumping
+`CARGO_SLOTS` is a single-constant change (and the cache-line guard
+test will fail, which is the prompt to revisit the size choice).
+
+**Validation.** 188 tests pass; clippy clean; `bench_trade` 82 vs 80
+bankruptcies (within centavo-rounding noise from Phase 1 + new iteration
+order influencing per-port settlement order).
