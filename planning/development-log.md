@@ -1269,3 +1269,51 @@ Final engaged-subtree priority: **strike → board → disengage → fight → f
 4. **Byndloss/Tortuga kickback** justifies modeling commissions as a *tradeable* mechanic: when a governor's own faction is at peace, captains can still buy commissions from foreign governors at currently-warring factions, with intermediary fees.
 
 **Next.** Draft `planning/phase-5-plan.md` — likely split into 5a (Static Relations + LoM substrate, unblocks Forts) and 5b (Dynamic diplomacy, Port BT, communication lag).
+
+---
+
+## 2026-05-24 — DOD/Perf Refactor #1: Fixed-point currency (`Pesos`)
+
+**Context.** External code review (May 2026) flagged that the simulation
+stored every silver/debt/wage balance as `f32`, with `cost > silver + 1e-4`
+style guards papering over accumulated drift. Over 730 in-game days × thousands
+of transactions, this can leak phantom pesos or reject valid trades.
+
+**Decision.** Introduced `sim_core::money::Pesos`, an `i64`-backed fixed-point
+type with centavo precision (1/100 peso). All *stored* balances now live in
+`Pesos`; prices remain `f32` (they're computed fresh per call and never
+accumulate). Conversion is one-way per transaction: float bill computed from
+float price, rounded to centavos via `Pesos::from_pesos_f32` or
+`Pesos::scale(f32)`, then exact integer arithmetic forever after.
+
+**Alternatives considered:**
+- *Whole pesos (i64)*: rejected — would round wage accrual (per-hour) and per-ton
+  resupply costs.
+- *Millipesos*: rejected — overkill for 17C economy.
+- *Status quo with tighter epsilons*: rejected — the drift is fundamental, not
+  a tolerance issue.
+
+**Scope.** Converted: `Ship.{silver, starting_silver, lifetime_dividends, debt,
+wages_owed_pesos}`, `PortMarket.silver`, `ShipType.build_silver`,
+`BuildCost.silver`, `World.{silver_at_month_start, last_month_avg_profit}`,
+and all currency constants (`STARTING_SILVER_PESOS`, `MAX_SHIP_DEBT`,
+`MUTINY_DEBT_THRESHOLD`, `WAGE_PESOS_PER_MAN_MONTH`, `SIGN_ON_BOUNTY_PESOS`,
+`HULL/RIGGING_REPAIR_COST_PESOS_PER_HP`, `INITIAL_PORT_SILVER_PESOS`,
+`STARTING_SILVER_FLOOR`). `PortMarket.debt: Cargo` (commodity tons owed to
+hinterland) intentionally left as-is. All `+ 1e-4` currency epsilons deleted.
+
+**Validation.** 187 tests pass; clippy clean; `bench_trade` numbers
+near-identical to baseline (79 → 80 bankrupt ships, well within rounding
+noise — confirms economics unchanged). Pre-existing equilibrium calibration
+gap (Tobacco/Manufactures price deltas of 1000s of %) is unrelated and
+predates this work.
+
+**Notes for next phases.**
+- Pesos's `Serialize`/`Deserialize` is transparent on `i64` centavos. Any
+  future save-game format will read/write integer cents.
+- The `BuildCost.total() -> f32` mixes pesos and tons; kept as f32 since
+  it's only used as a relative ROI score, with `silver` line converted via
+  `as_pesos_f32()` at the boundary.
+- Remaining DOD/perf items from the review (Cargo flat array, spatial hash
+  flat-vec, PRNG → `rand_pcg`, NavTrack → ArrayVec) are queued in the
+  session plan and will land as separate commits.

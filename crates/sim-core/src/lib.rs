@@ -9,6 +9,7 @@ pub mod goods;
 pub mod harbor;
 pub mod map;
 pub mod market;
+pub mod money;
 pub mod nav;
 pub mod navmesh;
 pub mod pathfind;

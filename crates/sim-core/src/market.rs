@@ -11,6 +11,7 @@
 
 use crate::cargo::Cargo;
 use crate::goods::{GoodId, GoodsRegistry};
+use crate::money::Pesos;
 
 /// Initial stockpile per good when a market is first constructed. Big
 /// enough that no port runs dry until production/consumption is wired
@@ -20,7 +21,7 @@ const INITIAL_STOCKPILE_TONS: f32 = 1000.0;
 /// Starting silver in a port's treasury. Used to settle ship sales
 /// against the port. Big enough that no port goes broke in the first
 /// month of trading; production tick doesn't (yet) replenish it.
-const INITIAL_PORT_SILVER_PESOS: f32 = 50_000.0;
+const INITIAL_PORT_SILVER_PESOS: Pesos = Pesos::from_pesos(50_000);
 
 /// Buy/sell spread (port "vig"). Buying costs base × (1 + SPREAD);
 /// selling earns base × (1 - SPREAD). Stops infinite arbitrage of a
@@ -75,7 +76,7 @@ pub struct PortMarket {
     /// the hinterland raises the price for the next buyer.
     pub debt: Cargo,
     /// Pesos in the port's treasury. Unused until step 5.
-    pub silver: f32,
+    pub silver: Pesos,
     pub recipe: ProductionRecipe,
 }
 
@@ -257,13 +258,13 @@ impl PortMarket {
         id: GoodId,
         requested_tons: f32,
         registry: &GoodsRegistry,
-    ) -> Result<f32, TradeError> {
+    ) -> Result<Pesos, TradeError> {
         if requested_tons <= 0.0 {
             return Err(TradeError::NonPositiveAmount);
         }
         let unit = self.buy_price(id, registry);
-        let cost = unit * requested_tons;
-        if cost > ship.silver + 1e-4 {
+        let cost = Pesos::from_pesos_f32(unit * requested_tons);
+        if cost > ship.silver {
             return Err(TradeError::InsufficientSilver);
         }
         let cargo_room = ship_stats.cargo_capacity_tons - ship.cargo.total_tons();
@@ -301,7 +302,7 @@ impl PortMarket {
         id: GoodId,
         requested_tons: f32,
         registry: &GoodsRegistry,
-    ) -> Result<f32, TradeError> {
+    ) -> Result<Pesos, TradeError> {
         if requested_tons <= 0.0 {
             return Err(TradeError::NonPositiveAmount);
         }
@@ -309,8 +310,8 @@ impl PortMarket {
             return Err(TradeError::InsufficientShipCargo);
         }
         let unit = self.sell_price(id, registry);
-        let proceeds = unit * requested_tons;
-        if proceeds > self.silver + 1e-4 {
+        let proceeds = Pesos::from_pesos_f32(unit * requested_tons);
+        if proceeds > self.silver {
             return Err(TradeError::InsufficientPortSilver);
         }
         ship.cargo.remove(id, requested_tons);
@@ -336,10 +337,10 @@ impl PortMarket {
     /// merchants of the home port. The ship's "treasury" only fills
     /// up again when capital is drawn for the next outbound cargo
     /// via [`Self::draw_for_outfit`].
-    pub fn deposit_owner_profit(&mut self, ship: &mut crate::ship::Ship, float: f32) -> f32 {
+    pub fn deposit_owner_profit(&mut self, ship: &mut crate::ship::Ship, float: Pesos) -> Pesos {
         let surplus = ship.silver - float;
-        if surplus <= 0.0 {
-            return 0.0;
+        if !surplus.is_positive() {
+            return Pesos::ZERO;
         }
         ship.silver -= surplus;
         self.silver += surplus;
@@ -358,17 +359,17 @@ impl PortMarket {
     pub fn draw_for_outfit(
         &mut self,
         ship: &mut crate::ship::Ship,
-        target: f32,
+        target: Pesos,
         port_fraction_cap: f32,
-    ) -> f32 {
+    ) -> Pesos {
         let needed = target - ship.silver;
-        if needed <= 0.0 {
-            return 0.0;
+        if !needed.is_positive() {
+            return Pesos::ZERO;
         }
-        let cap = (self.silver * port_fraction_cap).max(0.0);
-        let drawn = needed.min(cap).max(0.0);
-        if drawn <= 0.0 {
-            return 0.0;
+        let cap = self.silver.scale(port_fraction_cap).max_zero();
+        let drawn = needed.min(cap).max_zero();
+        if !drawn.is_positive() {
+            return Pesos::ZERO;
         }
         self.silver -= drawn;
         ship.silver += drawn;
@@ -396,16 +397,16 @@ impl PortMarket {
     pub fn extend_credit(
         &mut self,
         ship: &mut crate::ship::Ship,
-        target: f32,
+        target: Pesos,
         port_fraction_cap: f32,
-        max_total_debt: f32,
-    ) -> f32 {
-        let needed = target.max(0.0);
-        let debt_headroom = (max_total_debt - ship.debt).max(0.0);
-        let liquidity_cap = (self.silver * port_fraction_cap).max(0.0);
+        max_total_debt: Pesos,
+    ) -> Pesos {
+        let needed = target.max_zero();
+        let debt_headroom = (max_total_debt - ship.debt).max_zero();
+        let liquidity_cap = self.silver.scale(port_fraction_cap).max_zero();
         let advance = needed.min(debt_headroom).min(liquidity_cap);
-        if advance <= 0.0 {
-            return 0.0;
+        if !advance.is_positive() {
+            return Pesos::ZERO;
         }
         self.silver -= advance;
         ship.silver += advance;
@@ -417,14 +418,14 @@ impl PortMarket {
     /// out of any silver the ship holds above `float`. Returns the
     /// amount repaid. Called at every dock arrival before dividends
     /// or other port settlement, so creditors are paid first.
-    pub fn collect_debt(&mut self, ship: &mut crate::ship::Ship, float: f32) -> f32 {
-        if ship.debt <= 0.0 {
-            return 0.0;
+    pub fn collect_debt(&mut self, ship: &mut crate::ship::Ship, float: Pesos) -> Pesos {
+        if !ship.debt.is_positive() {
+            return Pesos::ZERO;
         }
-        let available = (ship.silver - float).max(0.0);
+        let available = (ship.silver - float).max_zero();
         let payment = available.min(ship.debt);
-        if payment <= 0.0 {
-            return 0.0;
+        if !payment.is_positive() {
+            return Pesos::ZERO;
         }
         ship.silver -= payment;
         ship.debt -= payment;
@@ -949,8 +950,8 @@ mod tests {
             .unwrap();
 
         // Ship paid; port received; stockpile decreased; cargo grew.
-        assert!((ship.silver - (ship_silver_before - cost)).abs() < 1e-3);
-        assert!((market.silver - (port_silver_before + cost)).abs() < 1e-3);
+        assert_eq!(ship.silver, ship_silver_before - cost);
+        assert_eq!(market.silver, port_silver_before + cost);
         assert!((market.stockpile.get(ids::SUGAR) - (stockpile_before - 5.0)).abs() < 1e-3);
         assert!((ship.cargo.get(ids::SUGAR) - 5.0).abs() < 1e-3);
     }
@@ -964,11 +965,11 @@ mod tests {
         let mut market = PortMarket::with_recipe(&registry, PortArchetype::SugarIsland.recipe());
         let stats = ShipStats::sloop();
         let mut ship = Ship::new(Position::ZERO, ShipState::Docked);
-        ship.silver = 1.0;
+        ship.silver = Pesos::from_pesos(1);
         let result = market.buy(&mut ship, &stats, ids::SUGAR, 50.0, &registry);
         assert_eq!(result, Err(TradeError::InsufficientSilver));
         // Ship still has its silver; cargo still empty.
-        assert_eq!(ship.silver, 1.0);
+        assert_eq!(ship.silver, Pesos::from_pesos(1));
         assert!(ship.cargo.is_empty());
     }
 
@@ -1066,7 +1067,7 @@ mod tests {
         let mut market = PortMarket::with_recipe(&registry, recipe);
         let stats = ShipStats::sloop();
         let mut ship = Ship::new(Position::ZERO, ShipState::Docked);
-        ship.silver = 1_000_000.0;
+        ship.silver = Pesos::from_pesos(1_000_000);
 
         // Drain the visible wharf.
         let wharf = market.stockpile.get(ids::SUGAR);
@@ -1080,7 +1081,7 @@ mod tests {
         let cost = market
             .buy(&mut ship, &stats, ids::SUGAR, further, &registry)
             .unwrap();
-        let unit_paid = cost / further;
+        let unit_paid = cost.as_pesos_f32() / further;
         assert!(
             market.debt.get(ids::SUGAR) >= further - 1e-3,
             "deficit should be recorded as hinterland debt"
@@ -1111,7 +1112,7 @@ mod tests {
         let mut market = PortMarket::with_recipe(&registry, recipe);
         let stats = ShipStats::sloop();
         let mut ship = Ship::new(Position::ZERO, ShipState::Docked);
-        ship.silver = 10_000_000.0;
+        ship.silver = Pesos::from_pesos(10_000_000);
 
         let wharf = market.stockpile.get(ids::MANUFACTURES);
         market

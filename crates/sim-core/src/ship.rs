@@ -1,4 +1,5 @@
 use crate::cargo::Cargo;
+use crate::money::Pesos;
 use crate::nav::NavTrack;
 use crate::port::Faction;
 use crate::types::{Position, WindVector};
@@ -97,7 +98,7 @@ pub enum ShipState {
 /// Default starting silver (pesos) for a freshly-spawned merchant ship.
 /// Roughly enough to fill its provision hold and bunkers a few times over,
 /// and to buy a partial speculative cargo of sugar at base price.
-pub const STARTING_SILVER_PESOS: f32 = 5000.0;
+pub const STARTING_SILVER_PESOS: Pesos = Pesos::from_pesos(5000);
 
 /// What a ship is "doing" at the strategic level — drives BT branch
 /// selection in Step 6 (pursue vs flee vs trade). Distinct from
@@ -129,7 +130,7 @@ pub struct Ship {
     pub hull_fouling: f32, // 0 = clean, 100 = fully encrusted
     /// Pesos in the ship's strongbox. Spent at port markets to buy
     /// provisions and trade goods; earned by selling cargo.
-    pub silver: f32,
+    pub silver: Pesos,
     /// The port that originally launched this ship (its "home port"
     /// for owner-of-record purposes). `None` for ships spawned by
     /// tests or seeded into the world outside the shipyard system.
@@ -144,13 +145,13 @@ pub struct Ship {
     /// life of the ship; used by analytics (P/L = silver - starting_silver)
     /// so newly-built ships can be reported accurately without the
     /// caller having to race against the build moment.
-    pub starting_silver: f32,
+    pub starting_silver: Pesos,
     /// Cumulative silver this ship has paid back to its owner port
     /// across all completed voyages. Each time the ship docks at its
     /// `owner_port`, any silver above the operating float is deposited
     /// into the port treasury and added here. True lifetime P/L for a
     /// home-ported ship is `(silver - starting_silver) + lifetime_dividends`.
-    pub lifetime_dividends: f32,
+    pub lifetime_dividends: Pesos,
     /// Total dock events across the ship's life (instrumentation).
     pub lifetime_dock_count: u32,
     /// Outstanding credit drawn from port chandlers/factors —
@@ -160,7 +161,7 @@ pub struct Ship {
     /// Settles fungibly across the port network — historically this
     /// is what bills of exchange between merchant correspondents
     /// enabled.
-    pub debt: f32,
+    pub debt: Pesos,
     /// Live head-count. Distinct from `stats.crew_typical()` (the
     /// design complement). Ships need `>= stats.crew_min()` to put
     /// to sea; provisions burn and effective speed scale with this
@@ -181,7 +182,7 @@ pub struct Ship {
     /// per hour; paid out of `Ship.silver` into the destination
     /// port's market silver on each dock visit. See
     /// `planning/crewing-plan.md §6`.
-    pub wages_owed_pesos: f32,
+    pub wages_owed_pesos: Pesos,
     /// Crew morale in `[0.0, 1.0]`. 1.0 = content, 0.0 = mutinous.
     /// Ticks hourly per `planning/crewing-plan.md §8`: drops with
     /// low provisions, unpaid wages, damage (Step 7), and rises
@@ -300,16 +301,16 @@ impl Ship {
             owner_port: None,
             ship_type: crate::shiptype::ids::SLOOP,
             starting_silver: STARTING_SILVER_PESOS,
-            lifetime_dividends: 0.0,
+            lifetime_dividends: Pesos::ZERO,
             lifetime_dock_count: 0,
-            debt: 0.0,
+            debt: Pesos::ZERO,
             // Test / seed-fleet ships start fully crewed; the Hiring
             // loop is for shipyard-built hulls only. Seeded ships are
             // veteran crews (100% seasoned) — bench fleets represent
             // established merchant captains.
             crew_alive: stats.crew_typical(),
             crew_seasoned: stats.crew_typical(),
-            wages_owed_pesos: 0.0,
+            wages_owed_pesos: Pesos::ZERO,
             morale: 1.0,
             faction: Faction::Free,
             policy: ShipPolicy::Merchant,
@@ -351,7 +352,7 @@ impl Ship {
         faction: Faction,
         ship_type: crate::shiptype::ShipTypeId,
         stats: &ShipStats,
-        starting_silver: f32,
+        starting_silver: Pesos,
     ) -> Self {
         Self {
             position,
@@ -365,14 +366,14 @@ impl Ship {
             owner_port: Some(owner_port),
             ship_type,
             starting_silver,
-            lifetime_dividends: 0.0,
+            lifetime_dividends: Pesos::ZERO,
             lifetime_dock_count: 0,
-            debt: 0.0,
+            debt: Pesos::ZERO,
             // Seed-fleet ships are fully crewed (no Hiring loop) and
             // are assumed to be veteran crews — see `Ship::new` rationale.
             crew_alive: stats.crew_typical(),
             crew_seasoned: stats.crew_typical(),
-            wages_owed_pesos: 0.0,
+            wages_owed_pesos: Pesos::ZERO,
             morale: 1.0,
             faction,
             policy: ShipPolicy::Merchant,
@@ -397,7 +398,7 @@ impl Ship {
     pub fn freshly_built(
         position: Position,
         owner_port: usize,
-        starting_silver: f32,
+        starting_silver: Pesos,
         ship_type: crate::shiptype::ShipTypeId,
         stats: &ShipStats,
         faction: Faction,
@@ -416,12 +417,12 @@ impl Ship {
             owner_port: Some(owner_port),
             ship_type,
             starting_silver,
-            lifetime_dividends: 0.0,
+            lifetime_dividends: Pesos::ZERO,
             lifetime_dock_count: 0,
-            debt: 0.0,
+            debt: Pesos::ZERO,
             crew_alive: 0,
             crew_seasoned: 0,
-            wages_owed_pesos: 0.0,
+            wages_owed_pesos: Pesos::ZERO,
             morale: 1.0,
             faction,
             policy: ShipPolicy::Merchant,
@@ -633,8 +634,8 @@ impl Ship {
         }
 
         // Wages overdue: > 2x current monthly wage bill.
-        let monthly_bill = self.crew_alive as f32 * WAGE_PESOS_PER_MAN_MONTH;
-        if monthly_bill > 0.0 && self.wages_owed_pesos > 2.0 * monthly_bill {
+        let monthly_bill = WAGE_PESOS_PER_MAN_MONTH.scale(self.crew_alive as f32);
+        if monthly_bill.is_positive() && self.wages_owed_pesos > monthly_bill + monthly_bill {
             delta -= MORALE_LOSS_WAGES_OVERDUE;
         }
 
@@ -646,7 +647,7 @@ impl Ship {
         // Rested in port: docked, full belly, no wage debt.
         if self.state == ShipState::Docked
             && days_left >= MORALE_PROVISIONS_LOW_DAYS
-            && self.wages_owed_pesos <= 0.0
+            && self.wages_owed_pesos <= Pesos::ZERO
         {
             delta += MORALE_GAIN_RESTED_IN_PORT;
         }
@@ -681,7 +682,7 @@ impl Ship {
         if self.state != ShipState::Sailing {
             return false;
         }
-        let financial_distress = self.debt + self.wages_owed_pesos.max(0.0);
+        let financial_distress = self.debt + self.wages_owed_pesos.max_zero();
         if financial_distress <= MUTINY_DEBT_THRESHOLD {
             return false;
         }
@@ -694,8 +695,8 @@ impl Ship {
         self.policy = ShipPolicy::Pirate;
         // The new pirate crew torches the ship's books — debt to the
         // chandler ashore and unpaid wages are no longer their problem.
-        self.debt = 0.0;
-        self.wages_owed_pesos = 0.0;
+        self.debt = Pesos::ZERO;
+        self.wages_owed_pesos = Pesos::ZERO;
         self.morale = MUTINY_POST_FLIP_MORALE;
         true
     }
@@ -754,17 +755,12 @@ impl Ship {
         // take provisions on tick. The advance is sized to one hour's
         // resupply rate — small, repeated calls accumulate naturally
         // for a multi-hour top-up.
-        if self.silver < unit_price * RESUPPLY_RATE_PER_HOUR && self.debt < MAX_SHIP_DEBT {
-            let target_advance = unit_price * RESUPPLY_RATE_PER_HOUR;
-            market.extend_credit(
-                self,
-                target_advance,
-                CHANDLER_PORT_FRACTION_CAP,
-                MAX_SHIP_DEBT,
-            );
+        let hour_bill = Pesos::from_pesos_f32(unit_price * RESUPPLY_RATE_PER_HOUR);
+        if self.silver < hour_bill && self.debt < MAX_SHIP_DEBT {
+            market.extend_credit(self, hour_bill, CHANDLER_PORT_FRACTION_CAP, MAX_SHIP_DEBT);
         }
 
-        let affordable = self.silver / unit_price;
+        let affordable = self.silver.as_pesos_f32() / unit_price;
 
         let desired = RESUPPLY_RATE_PER_HOUR
             .min(space)
@@ -774,7 +770,7 @@ impl Ship {
             return true;
         }
 
-        let cost = desired * unit_price;
+        let cost = Pesos::from_pesos_f32(desired * unit_price);
         self.silver -= cost;
         market.silver += cost;
         market.stockpile.remove(provisions_id, desired);
@@ -785,7 +781,7 @@ impl Ship {
         // we keep going as long as there's *some* progress this tick.
         let full = self.provisions >= stats.provision_capacity - 1e-4;
         let market_dry = market.stockpile.get(provisions_id) <= 0.0;
-        let broke = self.silver < unit_price * 0.05; // less than 5% of an hour's rate
+        let broke = self.silver.as_pesos_f32() < unit_price * 0.05; // less than 5% of an hour's rate
         full || market_dry || broke
     }
 
@@ -821,8 +817,8 @@ impl Ship {
         }
         let restored = deficit.min(HULL_REPAIR_RATE_PER_HOUR);
         self.hull_integrity += restored;
-        let bill = restored * HULL_REPAIR_COST_PESOS_PER_HP;
-        let paid = bill.min(self.silver.max(0.0));
+        let bill = HULL_REPAIR_COST_PESOS_PER_HP.scale(restored);
+        let paid = bill.min(self.silver.max_zero());
         self.silver -= paid;
         self.debt += bill - paid;
         self.hull_integrity >= stats.hull_integrity_max
@@ -841,8 +837,8 @@ impl Ship {
             return 0.0;
         }
         self.rigging_integrity = stats.rigging_integrity_max;
-        let bill = deficit * RIGGING_REPAIR_COST_PESOS_PER_HP;
-        let paid = bill.min(self.silver.max(0.0));
+        let bill = RIGGING_REPAIR_COST_PESOS_PER_HP.scale(deficit);
+        let paid = bill.min(self.silver.max_zero());
         self.silver -= paid;
         self.debt += bill - paid;
         deficit
@@ -874,14 +870,14 @@ pub const HULL_REPAIR_RATE_PER_HOUR: f32 = 0.3;
 /// Phase 4 §2: silver cost per HP of hull repair. A full 100-HP rebuild
 /// for a sloop is ~600 pesos — about 30% of the build cost, matching
 /// the Royal Navy's "great repair" line-item ratios for the era.
-pub const HULL_REPAIR_COST_PESOS_PER_HP: f32 = 6.0;
+pub const HULL_REPAIR_COST_PESOS_PER_HP: Pesos = Pesos::from_pesos(6);
 
 /// Phase 4 §2: silver cost per HP of rigging restored at undock. Cheap
 /// — cordage + sailcloth come from bo's'n stores which the ship
 /// already carries; the charge models the port chandler's mark-up on
 /// resupply. A fully-dismasted sloop's rigging (80 HP) costs ~120
 /// pesos to replace, well within a single voyage's profit.
-pub const RIGGING_REPAIR_COST_PESOS_PER_HP: f32 = 1.5;
+pub const RIGGING_REPAIR_COST_PESOS_PER_HP: Pesos = Pesos::from_centavos(150);
 
 /// Monthly wage per crewman, pesos. Historical reference: an ordinary
 /// English seaman c. 1670–1680 earned ~15–25 shillings/month, with a
@@ -893,12 +889,12 @@ pub const RIGGING_REPAIR_COST_PESOS_PER_HP: f32 = 1.5;
 /// `planning/crewing-plan.md §6.1`; calibration in 3.d may revisit.
 /// Faction-conditional rates (privateer/pirate share systems, Navy
 /// back-pay) land in 3.c.3 or 3.d.
-pub const WAGE_PESOS_PER_MAN_MONTH: f32 = 4.0;
+pub const WAGE_PESOS_PER_MAN_MONTH: Pesos = Pesos::from_pesos(4);
 
 /// Sign-on bounty paid per recruit at hire, in pesos. One month's
 /// wage per crewing-plan §6.2 — historical contracts paid a month
 /// up front to seal the enlistment.
-pub const SIGN_ON_BOUNTY_PESOS: f32 = WAGE_PESOS_PER_MAN_MONTH;
+pub const SIGN_ON_BOUNTY_PESOS: Pesos = WAGE_PESOS_PER_MAN_MONTH;
 
 // --- Morale (crewing-plan §8) -------------------------------------------------
 
@@ -931,7 +927,7 @@ pub const MORALE_GAIN_PRIZE_TAKEN: f32 = 0.30;
 /// Maximum outstanding chandler/factor debt a single ship can
 /// accumulate before further credit is refused. Sized to cover a
 /// few hold-fillings of cheap cargo plus a season's provisions.
-pub const MAX_SHIP_DEBT: f32 = 5000.0;
+pub const MAX_SHIP_DEBT: Pesos = Pesos::from_pesos(5000);
 
 /// Debt threshold above which an at-sea Merchant crew may mutiny
 /// (§9). Step 11.b: raised from 1.5× to 3× `MAX_SHIP_DEBT` to match
@@ -941,7 +937,7 @@ pub const MAX_SHIP_DEBT: f32 = 5000.0;
 /// debt cap at MAX_SHIP_DEBT, the only way to reach this threshold
 /// is to also be carrying ~10000 pesos in unpaid wages — roughly a
 /// year's wages for a small merchant crew.
-pub const MUTINY_DEBT_THRESHOLD: f32 = MAX_SHIP_DEBT * 3.0;
+pub const MUTINY_DEBT_THRESHOLD: Pesos = Pesos::from_pesos(15000);
 /// Morale ceiling below which an at-sea Merchant with crushing debt
 /// flips to Pirate.
 pub const MUTINY_MORALE_THRESHOLD: f32 = 0.25;
@@ -1082,7 +1078,7 @@ mod tests {
         let built = Ship::freshly_built(
             Position::ZERO,
             0,
-            1000.0,
+            Pesos::from_pesos(1000),
             crate::shiptype::ids::SLOOP,
             &stats,
             Faction::Free,
@@ -1107,8 +1103,8 @@ mod tests {
         let mut ship = Ship::new(Position::ZERO, ShipState::Sailing);
         // Plenty of provisions so only the wages branch fires.
         ship.provisions = stats.provision_capacity;
-        let monthly = ship.crew_alive as f32 * WAGE_PESOS_PER_MAN_MONTH;
-        ship.wages_owed_pesos = 3.0 * monthly;
+        let monthly = WAGE_PESOS_PER_MAN_MONTH.scale(ship.crew_alive as f32);
+        ship.wages_owed_pesos = monthly + monthly + monthly;
         let before = ship.morale;
         ship.tick_morale(&stats);
         assert!((before - ship.morale - MORALE_LOSS_WAGES_OVERDUE).abs() < 1e-5);
@@ -1119,7 +1115,7 @@ mod tests {
         let stats = ShipStats::sloop();
         let mut ship = Ship::new(Position::ZERO, ShipState::Docked);
         ship.provisions = stats.provision_capacity;
-        ship.wages_owed_pesos = 0.0;
+        ship.wages_owed_pesos = Pesos::ZERO;
         ship.morale = 0.5;
         ship.tick_morale(&stats);
         assert!((ship.morale - (0.5 + MORALE_GAIN_RESTED_IN_PORT)).abs() < 1e-5);
@@ -1130,7 +1126,7 @@ mod tests {
         let stats = ShipStats::sloop();
         let mut ship = Ship::new(Position::ZERO, ShipState::Sailing);
         ship.provisions = stats.provision_capacity;
-        ship.wages_owed_pesos = 0.0;
+        ship.wages_owed_pesos = Pesos::ZERO;
         ship.debt = MAX_SHIP_DEBT;
         let before = ship.morale;
         ship.tick_morale(&stats);
@@ -1141,21 +1137,21 @@ mod tests {
     fn mutiny_flips_indebted_low_morale_merchant_at_sea() {
         let mut ship = Ship::new(Position::ZERO, ShipState::Sailing);
         ship.policy = ShipPolicy::Merchant;
-        ship.debt = MUTINY_DEBT_THRESHOLD + 1.0;
+        ship.debt = MUTINY_DEBT_THRESHOLD + Pesos::from_pesos(1);
         ship.morale = MUTINY_MORALE_THRESHOLD - 0.01;
-        ship.wages_owed_pesos = 999.0;
+        ship.wages_owed_pesos = Pesos::from_pesos(999);
         // Pass a roll guaranteed to fall under the probability gate.
         assert!(ship.try_mutiny(0.0));
         assert_eq!(ship.policy, ShipPolicy::Pirate);
-        assert_eq!(ship.debt, 0.0);
-        assert_eq!(ship.wages_owed_pesos, 0.0);
+        assert_eq!(ship.debt, Pesos::ZERO);
+        assert_eq!(ship.wages_owed_pesos, Pesos::ZERO);
         assert!((ship.morale - MUTINY_POST_FLIP_MORALE).abs() < 1e-5);
     }
 
     #[test]
     fn mutiny_does_not_trigger_when_docked() {
         let mut ship = Ship::new(Position::ZERO, ShipState::Docked);
-        ship.debt = MUTINY_DEBT_THRESHOLD + 1000.0;
+        ship.debt = MUTINY_DEBT_THRESHOLD + Pesos::from_pesos(1000);
         ship.morale = 0.0;
         assert!(!ship.try_mutiny(0.0));
         assert_eq!(ship.policy, ShipPolicy::Merchant);
@@ -1164,11 +1160,11 @@ mod tests {
     #[test]
     fn mutiny_does_not_trigger_below_thresholds() {
         let mut ship = Ship::new(Position::ZERO, ShipState::Sailing);
-        ship.debt = MUTINY_DEBT_THRESHOLD - 1.0;
-        ship.wages_owed_pesos = 0.0;
+        ship.debt = MUTINY_DEBT_THRESHOLD - Pesos::from_pesos(1);
+        ship.wages_owed_pesos = Pesos::ZERO;
         ship.morale = 0.05;
         assert!(!ship.try_mutiny(0.0), "below distress threshold");
-        ship.debt = MUTINY_DEBT_THRESHOLD + 1.0;
+        ship.debt = MUTINY_DEBT_THRESHOLD + Pesos::from_pesos(1);
         ship.morale = MUTINY_MORALE_THRESHOLD + 0.01;
         assert!(!ship.try_mutiny(0.0), "above morale threshold");
     }
@@ -1179,7 +1175,7 @@ mod tests {
         // Maxed out chandler credit + heavy unpaid wages combine to
         // push the crew over the edge.
         ship.debt = MAX_SHIP_DEBT;
-        ship.wages_owed_pesos = MUTINY_DEBT_THRESHOLD - MAX_SHIP_DEBT + 1.0;
+        ship.wages_owed_pesos = MUTINY_DEBT_THRESHOLD - MAX_SHIP_DEBT + Pesos::from_pesos(1);
         ship.morale = 0.1;
         assert!(ship.try_mutiny(0.0));
         assert_eq!(ship.policy, ShipPolicy::Pirate);
@@ -1189,7 +1185,7 @@ mod tests {
     fn mutiny_ignores_already_pirate_ships() {
         let mut ship = Ship::new(Position::ZERO, ShipState::Sailing);
         ship.policy = ShipPolicy::Pirate;
-        ship.debt = MUTINY_DEBT_THRESHOLD * 10.0;
+        ship.debt = MUTINY_DEBT_THRESHOLD + MUTINY_DEBT_THRESHOLD;
         ship.morale = 0.0;
         assert!(!ship.try_mutiny(0.0));
     }
@@ -1247,7 +1243,7 @@ mod tests {
     fn mutiny_skips_when_roll_above_probability() {
         let mut ship = Ship::new(Position::ZERO, ShipState::Sailing);
         ship.policy = ShipPolicy::Merchant;
-        ship.debt = MUTINY_DEBT_THRESHOLD + 1.0;
+        ship.debt = MUTINY_DEBT_THRESHOLD + Pesos::from_pesos(1);
         ship.morale = 0.0;
         // Just above the probability gate -> no flip.
         assert!(!ship.try_mutiny(MUTINY_PROBABILITY_PER_HOUR + 1e-6));
@@ -1274,17 +1270,17 @@ mod tests {
     #[test]
     fn fresh_ship_has_zero_wages_owed() {
         let ship = Ship::new(Position::ZERO, ShipState::Sailing);
-        assert_eq!(ship.wages_owed_pesos, 0.0);
+        assert_eq!(ship.wages_owed_pesos, Pesos::ZERO);
         let stats = ShipStats::sloop();
         let built = Ship::freshly_built(
             Position::ZERO,
             0,
-            1000.0,
+            Pesos::from_pesos(1000),
             crate::shiptype::ids::SLOOP,
             &stats,
             Faction::Free,
         );
-        assert_eq!(built.wages_owed_pesos, 0.0);
+        assert_eq!(built.wages_owed_pesos, Pesos::ZERO);
     }
 
     #[test]
@@ -1380,7 +1376,7 @@ mod tests {
     #[test]
     fn test_ship_starts_with_silver() {
         let ship = Ship::new(Position::ZERO, ShipState::Docked);
-        assert!(ship.silver > 0.0);
+        assert!(ship.silver > Pesos::ZERO);
     }
 
     #[test]
@@ -1420,15 +1416,10 @@ mod tests {
             market.silver > port_silver_before,
             "port should have earned silver"
         );
-        // Spent ≈ earned (no leakage; small float drift over many ticks).
+        // Spent ≈ earned (no leakage; exact integer ledger).
         let spent = ship_silver_before - ship.silver;
         let earned = market.silver - port_silver_before;
-        assert!(
-            (spent - earned).abs() < 0.5,
-            "spent {} vs earned {}",
-            spent,
-            earned
-        );
+        assert_eq!(spent, earned, "spent {} vs earned {}", spent, earned);
         // Stockpile dropped by ≈ amount loaded.
         assert!(market.stockpile.get(ids::PROVISIONS) < stockpile_before);
     }
@@ -1464,7 +1455,7 @@ mod tests {
     fn tick_repair_hull_restores_at_documented_rate_and_charges_silver() {
         let stats = ShipStats::sloop();
         let mut ship = Ship::new(Position::ZERO, ShipState::Docked);
-        ship.silver = 10_000.0;
+        ship.silver = Pesos::from_pesos(10_000);
         ship.hull_integrity = stats.hull_integrity_max - 1.0;
 
         let silver_before = ship.silver;
@@ -1480,12 +1471,11 @@ mod tests {
             restored
         );
         let paid = silver_before - ship.silver;
-        assert!(
-            (paid - restored * HULL_REPAIR_COST_PESOS_PER_HP).abs() < 1e-3,
-            "billed {} pesos for {} HP; expected {}",
-            paid,
-            restored,
-            restored * HULL_REPAIR_COST_PESOS_PER_HP
+        let expected = HULL_REPAIR_COST_PESOS_PER_HP.scale(restored);
+        assert_eq!(
+            paid, expected,
+            "billed {} for {} HP; expected {}",
+            paid, restored, expected
         );
         assert!(!done || (ship.hull_integrity - stats.hull_integrity_max).abs() < 1e-4);
     }
@@ -1494,7 +1484,7 @@ mod tests {
     fn tick_repair_hull_caps_at_max_and_reports_done() {
         let stats = ShipStats::sloop();
         let mut ship = Ship::new(Position::ZERO, ShipState::Docked);
-        ship.silver = 10_000.0;
+        ship.silver = Pesos::from_pesos(10_000);
         // Damage less than one tick of repair.
         ship.hull_integrity = stats.hull_integrity_max - 0.01;
         let done = ship.tick_repair_hull(&stats);
@@ -1506,32 +1496,35 @@ mod tests {
         let done2 = ship.tick_repair_hull(&stats);
         assert!(done2);
         assert_eq!(ship.silver, silver);
-        assert_eq!(ship.debt, 0.0);
+        assert_eq!(ship.debt, Pesos::ZERO);
     }
 
     #[test]
     fn tick_repair_hull_insufficient_silver_creates_debt_not_partial_freebie() {
         let stats = ShipStats::sloop();
         let mut ship = Ship::new(Position::ZERO, ShipState::Docked);
-        ship.silver = 0.5; // Less than one HP of hull at 6 pesos/HP.
-        ship.debt = 0.0;
+        let starting = Pesos::from_centavos(50);
+        ship.silver = starting; // Less than one HP of hull at 6 pesos/HP.
+        ship.debt = Pesos::ZERO;
         ship.hull_integrity = stats.hull_integrity_max - 1.0;
 
         let hull_before = ship.hull_integrity;
         ship.tick_repair_hull(&stats);
         let restored = ship.hull_integrity - hull_before;
-        let bill = restored * HULL_REPAIR_COST_PESOS_PER_HP;
+        let bill = HULL_REPAIR_COST_PESOS_PER_HP.scale(restored);
 
         // Full HP delta was applied — the carpenters worked.
         assert!(restored > 0.0);
         // Silver drained.
-        assert_eq!(ship.silver, 0.0);
+        assert_eq!(ship.silver, Pesos::ZERO);
         // Remainder is debt, not a freebie.
-        assert!(
-            (ship.debt - (bill - 0.5)).abs() < 1e-3,
-            "debt {} should be bill {} minus the 0.5 pesos paid",
+        assert_eq!(
             ship.debt,
-            bill
+            bill - starting,
+            "debt {} should be bill {} minus the starting silver {}",
+            ship.debt,
+            bill,
+            starting
         );
     }
 
@@ -1539,7 +1532,7 @@ mod tests {
     fn top_off_rigging_one_shot_full_restore() {
         let stats = ShipStats::sloop();
         let mut ship = Ship::new(Position::ZERO, ShipState::Docked);
-        ship.silver = 10_000.0;
+        ship.silver = Pesos::from_pesos(10_000);
         ship.rigging_integrity = stats.rigging_integrity_max * 0.5;
 
         let silver_before = ship.silver;
@@ -1548,35 +1541,35 @@ mod tests {
         let expected_delta = stats.rigging_integrity_max * 0.5;
         assert!((delta - expected_delta).abs() < 1e-3);
         assert!((ship.rigging_integrity - stats.rigging_integrity_max).abs() < 1e-4);
-        let expected_bill = expected_delta * RIGGING_REPAIR_COST_PESOS_PER_HP;
-        assert!((silver_before - ship.silver - expected_bill).abs() < 1e-3);
+        let expected_bill = RIGGING_REPAIR_COST_PESOS_PER_HP.scale(expected_delta);
+        assert_eq!(silver_before - ship.silver, expected_bill);
     }
 
     #[test]
     fn top_off_rigging_full_health_is_noop() {
         let stats = ShipStats::sloop();
         let mut ship = Ship::new(Position::ZERO, ShipState::Docked);
-        ship.silver = 10_000.0;
+        ship.silver = Pesos::from_pesos(10_000);
         let silver = ship.silver;
         let delta = ship.top_off_rigging(&stats);
         assert_eq!(delta, 0.0);
         assert_eq!(ship.silver, silver);
-        assert_eq!(ship.debt, 0.0);
+        assert_eq!(ship.debt, Pesos::ZERO);
     }
 
     #[test]
     fn top_off_rigging_insufficient_silver_goes_to_debt() {
         let stats = ShipStats::sloop();
         let mut ship = Ship::new(Position::ZERO, ShipState::Docked);
-        ship.silver = 0.0;
-        ship.debt = 0.0;
+        ship.silver = Pesos::ZERO;
+        ship.debt = Pesos::ZERO;
         ship.rigging_integrity = 0.0;
 
         let delta = ship.top_off_rigging(&stats);
         assert!((delta - stats.rigging_integrity_max).abs() < 1e-3);
         assert!((ship.rigging_integrity - stats.rigging_integrity_max).abs() < 1e-4);
-        let expected_debt = stats.rigging_integrity_max * RIGGING_REPAIR_COST_PESOS_PER_HP;
-        assert!((ship.debt - expected_debt).abs() < 1e-3);
+        let expected_debt = RIGGING_REPAIR_COST_PESOS_PER_HP.scale(stats.rigging_integrity_max);
+        assert_eq!(ship.debt, expected_debt);
     }
 
     #[test]

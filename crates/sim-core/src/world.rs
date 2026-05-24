@@ -8,6 +8,7 @@ use crate::goods::GoodsRegistry;
 use crate::harbor::HarborMap;
 use crate::map::MapSystem;
 use crate::market::{archetype_for, PortMarket};
+use crate::money::Pesos;
 use crate::navmesh::Navmesh;
 use crate::pathfind::PathfindContext;
 use crate::pop::{self, PortDemographics};
@@ -56,12 +57,12 @@ pub struct World {
     /// profit (silver delta), which feeds the shipyard "math pencils"
     /// decision. A freshly-spawned ship's entry is initialized to its
     /// starting silver so its first-month delta is meaningful.
-    silver_at_month_start: SecondaryMap<ShipId, f32>,
+    silver_at_month_start: SecondaryMap<ShipId, Pesos>,
     /// Last completed month's average per-ship silver delta (pesos).
     /// Used by `shipyard::try_build` as the expected per-ship monthly
     /// profit for new vessels. Starts at 0 (no fleet history); first
     /// month's tick updates it.
-    pub last_month_avg_profit: f32,
+    pub last_month_avg_profit: Pesos,
     /// Diagnostic counter: total number of ships built by the
     /// shipyard system since `World::load`.
     pub ships_built: u32,
@@ -166,7 +167,7 @@ impl World {
             last_market_month,
             last_hire_day,
             silver_at_month_start: SecondaryMap::new(),
-            last_month_avg_profit: 0.0,
+            last_month_avg_profit: Pesos::ZERO,
             ships_built: 0,
             mutinies_total: 0,
             attrition_storms: 0,
@@ -296,7 +297,8 @@ impl World {
                 // of cheap cargo. The shipyard sizing uses ~30 pesos/ton
                 // of capacity; we use a slightly leaner factor here so
                 // seeded fleets don't drown the simulation in cash.
-                let starting_silver = (stats.cargo_capacity_tons * 25.0).max(1500.0);
+                let starting_silver =
+                    Pesos::from_pesos_f32((stats.cargo_capacity_tons * 25.0).max(1500.0));
                 let mut ship = Ship::seeded_at_port_typed(
                     port_pos,
                     port_idx,
@@ -375,18 +377,19 @@ impl World {
         // their first-month delta represents however much (or little)
         // they actually traded.
         if !self.ships.is_empty() {
-            let total_delta: f32 = self
+            let total_delta: Pesos = self
                 .ships
                 .iter()
                 .filter_map(|(id, s)| {
                     self.silver_at_month_start
                         .get(id)
-                        .map(|prev| s.silver - prev)
+                        .map(|prev| s.silver - *prev)
                 })
                 .sum();
-            self.last_month_avg_profit = total_delta / self.ships.len() as f32;
+            self.last_month_avg_profit =
+                Pesos::from_centavos(total_delta.as_centavos() / self.ships.len() as i64);
         } else {
-            self.last_month_avg_profit = 0.0;
+            self.last_month_avg_profit = Pesos::ZERO;
         }
 
         // Shipyards decide whether to build. Collect new ships first
@@ -405,7 +408,7 @@ impl World {
                 market,
                 &self.goods,
                 &self.ship_types,
-                self.last_month_avg_profit,
+                self.last_month_avg_profit.as_pesos_f32(),
             );
             if let (BuildOutcome::Built { .. }, Some(mut ship)) = (outcome, ship) {
                 // New ship docks at home port immediately; the AI's
@@ -465,33 +468,34 @@ impl World {
             // Resolve the port we're hiring at: owner_port while Hiring,
             // docked_at_port (from AI nav) while Docked. Anything else
             // (Sailing/Anchored) skips this tick.
-            let (port_idx, want, ship_type, ship_silver, is_hiring) = match self.ships.get(id) {
-                Some(s) if s.state == ShipState::Hiring => {
-                    let port = match s.owner_port {
-                        Some(p) => p,
-                        None => continue,
-                    };
-                    let stats = self.ship_types.get(s.ship_type).stats.clone();
-                    let typical = stats.crew_typical();
-                    if s.crew_alive >= typical {
-                        continue;
+            let (port_idx, want, ship_type, ship_silver, is_hiring): (usize, u16, _, Pesos, bool) =
+                match self.ships.get(id) {
+                    Some(s) if s.state == ShipState::Hiring => {
+                        let port = match s.owner_port {
+                            Some(p) => p,
+                            None => continue,
+                        };
+                        let stats = self.ship_types.get(s.ship_type).stats.clone();
+                        let typical = stats.crew_typical();
+                        if s.crew_alive >= typical {
+                            continue;
+                        }
+                        (port, typical - s.crew_alive, s.ship_type, s.silver, true)
                     }
-                    (port, typical - s.crew_alive, s.ship_type, s.silver, true)
-                }
-                Some(s) if s.state == ShipState::Docked => {
-                    let stats = self.ship_types.get(s.ship_type).stats.clone();
-                    let typical = stats.crew_typical();
-                    if s.crew_alive >= typical {
-                        continue;
+                    Some(s) if s.state == ShipState::Docked => {
+                        let stats = self.ship_types.get(s.ship_type).stats.clone();
+                        let typical = stats.crew_typical();
+                        if s.crew_alive >= typical {
+                            continue;
+                        }
+                        let port = match s.nav.docked_at_port {
+                            Some(p) => p,
+                            None => continue,
+                        };
+                        (port, typical - s.crew_alive, s.ship_type, s.silver, false)
                     }
-                    let port = match s.nav.docked_at_port {
-                        Some(p) => p,
-                        None => continue,
-                    };
-                    (port, typical - s.crew_alive, s.ship_type, s.silver, false)
-                }
-                _ => continue,
-            };
+                    _ => continue,
+                };
             let stats = &self.ship_types.get(ship_type).stats;
             let morale = self.ships.get(id).map(|s| s.morale).unwrap_or(1.0);
             let rate_mult = if (0.4..0.7).contains(&morale) {
@@ -501,9 +505,12 @@ impl World {
             };
             let per_day_cap = ((HIRE_PER_DAY as f32) * rate_mult).floor() as u16;
             let cap = want.min(per_day_cap.max(1));
-            let affordable = (ship_silver / crate::ship::SIGN_ON_BOUNTY_PESOS)
-                .floor()
-                .max(0.0) as u16;
+            let affordable = if ship_silver.is_positive() {
+                (ship_silver.as_centavos() / crate::ship::SIGN_ON_BOUNTY_PESOS.as_centavos()).max(0)
+                    as u16
+            } else {
+                0
+            };
             let cap = cap.min(affordable);
             let demo = match self.demographics.get_mut(port_idx) {
                 Some(d) => d,
@@ -515,7 +522,7 @@ impl World {
             let drawn = from_seasoned + from_unseasoned;
             demo.seasoned -= from_seasoned as u32;
             demo.unseasoned -= from_unseasoned as u32;
-            let bounty = drawn as f32 * crate::ship::SIGN_ON_BOUNTY_PESOS;
+            let bounty = crate::ship::SIGN_ON_BOUNTY_PESOS.scale(drawn as f32);
             if let Some(s) = self.ships.get_mut(id) {
                 s.crew_alive += drawn;
                 // Track the seasoned slice of this hire so the ship's
@@ -900,15 +907,15 @@ impl World {
             // and supplies — closed-economy property preserved).
             match ship.state {
                 ShipState::Sailing => {
-                    let hourly = (ship.crew_alive as f32) * crate::ship::WAGE_PESOS_PER_MAN_MONTH
-                        / (30.0 * 24.0);
+                    let hourly = crate::ship::WAGE_PESOS_PER_MAN_MONTH
+                        .scale(ship.crew_alive as f32 / (30.0 * 24.0));
                     ship.wages_owed_pesos += hourly;
                 }
                 ShipState::Docked => {
-                    if ship.wages_owed_pesos > 0.0 {
+                    if ship.wages_owed_pesos.is_positive() {
                         if let Some(port_idx) = ship.nav.docked_at_port {
-                            let pay = ship.wages_owed_pesos.min(ship.silver.max(0.0));
-                            if pay > 0.0 {
+                            let pay = ship.wages_owed_pesos.min(ship.silver.max_zero());
+                            if pay.is_positive() {
                                 ship.silver -= pay;
                                 ship.wages_owed_pesos -= pay;
                                 if let Some(market) = self.markets.get_mut(port_idx) {
@@ -982,8 +989,8 @@ impl World {
             let (owner, cargo_silver, hull_bounty) = match self.ships.get(id) {
                 Some(p) => {
                     let owner = p.prize_owner.expect("filtered to Some");
-                    let cargo_silver = p.cargo.total_tons() * 20.0;
-                    let hull_bounty = p.hull_integrity * 8.0;
+                    let cargo_silver = Pesos::from_pesos_f32(p.cargo.total_tons() * 20.0);
+                    let hull_bounty = Pesos::from_pesos_f32(p.hull_integrity * 8.0);
                     (owner, cargo_silver, hull_bounty)
                 }
                 None => continue,
@@ -1335,8 +1342,8 @@ impl World {
             }
             None => (0.0, 0.0, 0.0),
         };
-        let cargo_silver = target_cargo_tons * 20.0;
-        let hull_bounty = target_hull * 8.0;
+        let cargo_silver = Pesos::from_pesos_f32(target_cargo_tons * 20.0);
+        let hull_bounty = Pesos::from_pesos_f32(target_hull * 8.0);
 
         // Decide outcome. Real-upgrade check first
         // (a 200-ton fluyt is no upgrade for a 60-ton
@@ -1394,7 +1401,7 @@ impl World {
             }
             if let Some(t) = self.ships.get_mut(tgt) {
                 t.cargo = crate::cargo::Cargo::new();
-                t.silver = (t.silver * 0.1).max(0.0); // boarders took most of it
+                t.silver = t.silver.scale(0.1).max_zero(); // boarders took most of it
             }
         }
 

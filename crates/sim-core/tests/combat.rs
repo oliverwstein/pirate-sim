@@ -11,6 +11,7 @@ use sim_core::combat::{
     broadside_supply_cost, compute_broadside_damage, CANNON_RANGE_NM, LONG_RANGE_FALLOFF,
 };
 use sim_core::goods::ids::{CANNON_SHOT, GUNPOWDER};
+use sim_core::money::Pesos;
 use sim_core::ship::{Ship, ShipStats};
 use sim_core::types::WindVector;
 use std::path::Path;
@@ -193,7 +194,7 @@ fn pirate_boards_dismasted_merchant_and_resolves_prize() {
     let pirate_stats = world.ship_types.get(pirate.ship_type).stats.clone();
     pirate.crew_alive = pirate_stats.crew_typical();
     pirate.morale = 1.0;
-    pirate.silver = 0.0;
+    pirate.silver = Pesos::ZERO;
     pirate.cargo = Cargo::new();
     pirate.cargo.add(GUNPOWDER, 4.0);
     pirate.cargo.add(CANNON_SHOT, 4.0);
@@ -211,7 +212,7 @@ fn pirate_boards_dismasted_merchant_and_resolves_prize() {
     // boarders stripped both.
     merchant.cargo = Cargo::new();
     merchant.cargo.add(SUGAR, 20.0);
-    merchant.silver = 500.0;
+    merchant.silver = Pesos::from_pesos(500);
     let merchant_id = world.add_ship(merchant, ShipAI::with_seed(11));
 
     world.tick();
@@ -268,7 +269,7 @@ fn pirate_boards_dismasted_merchant_and_resolves_prize() {
         );
         // And the attacker should have pocketed the cargo silver.
         assert!(
-            pirate_after.silver > 0.0,
+            pirate_after.silver > Pesos::ZERO,
             "non-take outcomes should bank stripped cargo silver"
         );
     }
@@ -430,7 +431,7 @@ fn hiring_draws_seasoned_first_and_tracks_count() {
     hull.state = ShipState::Hiring;
     hull.crew_alive = 0;
     hull.crew_seasoned = 0;
-    hull.silver = 10_000.0;
+    hull.silver = Pesos::from_pesos(10_000);
     hull.nav.docked_at_port = None;
     let id = world.add_ship(hull, ShipAI::with_seed(1));
 

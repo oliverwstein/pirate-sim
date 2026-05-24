@@ -20,6 +20,7 @@
 //! Warships (frigates, SOL, galleon, slave ship, East Indiaman) are
 //! out of scope for v1 — they'll arrive with combat/piracy systems.
 
+use crate::money::Pesos;
 use crate::ship::ShipStats;
 use serde::Deserialize;
 
@@ -57,7 +58,7 @@ pub struct ShipType {
     pub name: String,
     pub stats: ShipStats,
     /// Silver portion of the build cost (pesos).
-    pub build_silver: f32,
+    pub build_silver: Pesos,
     /// Naval stores (pitch, tar, cordage, sailcloth) in tons.
     pub build_naval_stores: f32,
     /// Manufactured goods (iron, tools, fittings) in tons.
@@ -95,7 +96,7 @@ impl ShipTypeRegistry {
                 id: ShipTypeId(i as u8),
                 name: r.name,
                 stats: r.stats,
-                build_silver: r.build_silver,
+                build_silver: Pesos::from_pesos_f32(r.build_silver),
                 build_naval_stores: r.build_naval_stores,
                 build_manufactures: r.build_manufactures,
                 build_provisions: r.build_provisions,
@@ -145,7 +146,7 @@ mod tests {
     #[test]
     fn all_types_have_positive_costs_and_stats() {
         for t in ShipTypeRegistry::starter().iter() {
-            assert!(t.build_silver > 0.0, "{}: silver", t.name);
+            assert!(t.build_silver > Pesos::ZERO, "{}: silver", t.name);
             assert!(t.build_naval_stores > 0.0, "{}: naval", t.name);
             assert!(t.build_manufactures > 0.0, "{}: manufactures", t.name);
             assert!(t.build_provisions > 0.0, "{}: provisions", t.name);
@@ -163,8 +164,9 @@ mod tests {
         let r = ShipTypeRegistry::starter();
         let fluyt = r.get(ids::FLUYT);
         let ship = r.get(ids::SHIP);
-        let fluyt_ton_per_peso = fluyt.stats.cargo_capacity_tons / fluyt.build_silver;
-        let ship_ton_per_peso = ship.stats.cargo_capacity_tons / ship.build_silver;
+        let fluyt_ton_per_peso =
+            fluyt.stats.cargo_capacity_tons / fluyt.build_silver.as_pesos_f32();
+        let ship_ton_per_peso = ship.stats.cargo_capacity_tons / ship.build_silver.as_pesos_f32();
         assert!(
             fluyt_ton_per_peso > ship_ton_per_peso,
             "fluyt {:.4} vs ship {:.4}",

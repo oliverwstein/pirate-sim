@@ -222,10 +222,12 @@ fn main() {
         let Some(ship) = world.ships.get(id) else {
             continue;
         };
-        let pl = (ship.silver - ship.starting_silver) + ship.lifetime_dividends - ship.debt;
+        let pl = (ship.silver - ship.starting_silver + ship.lifetime_dividends - ship.debt)
+            .as_pesos_f32();
         total_pl += pl;
-        total_debt += ship.debt;
-        let is_bankrupt = ship.silver < 50.0 && ship.lifetime_dividends < 1.0;
+        total_debt += ship.debt.as_pesos_f32();
+        let is_bankrupt = ship.silver < sim_core::money::Pesos::from_pesos(50)
+            && ship.lifetime_dividends < sim_core::money::Pesos::from_pesos(1);
         if is_bankrupt {
             bankrupt += 1;
         }
@@ -252,7 +254,7 @@ fn main() {
         let b = buckets.entry((faction_key, type_key)).or_default();
         b.n += 1;
         b.pl += pl;
-        b.debt += ship.debt;
+        b.debt += ship.debt.as_pesos_f32();
         b.hull_pct += hull_pct;
         b.rig_pct += rig_pct;
         if ship.policy == ShipPolicy::Pirate {
@@ -646,7 +648,7 @@ fn main() {
     let losers = world
         .ships
         .values()
-        .filter(|s| (s.silver - s.starting_silver) + s.lifetime_dividends < 0.0)
+        .filter(|s| (s.silver - s.starting_silver + s.lifetime_dividends).is_negative())
         .count();
     if bankrupt > 0 {
         println!(
@@ -658,7 +660,14 @@ fn main() {
             "  ⚠ {} ship(s) ended in the red — successful voyages should reliably profit",
             losers
         );
-    } else if total_pl < world.ships.values().map(|s| s.starting_silver).sum::<f32>() * 0.5 {
+    } else if total_pl
+        < world
+            .ships
+            .values()
+            .map(|s| s.starting_silver.as_pesos_f32())
+            .sum::<f32>()
+            * 0.5
+    {
         println!("  ⚠ fleet barely profitable — trade margins or world prices may be too thin");
     } else {
         println!("  ✓ every ship in the black with healthy variance");

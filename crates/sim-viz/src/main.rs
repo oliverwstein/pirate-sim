@@ -368,10 +368,11 @@ fn draw_hud(world: &World, camera: &Camera, paused: bool, ticks_per_frame: u32) 
             // refactor lets viz peek mid-tick).
             ShipState::Sunk => {}
         }
-        total_silver += ship.silver;
-        total_dividends += ship.lifetime_dividends;
-        total_debt += ship.debt;
-        total_pnl += (ship.silver - ship.starting_silver) + ship.lifetime_dividends - ship.debt;
+        total_silver += ship.silver.as_pesos_f32();
+        total_dividends += ship.lifetime_dividends.as_pesos_f32();
+        total_debt += ship.debt.as_pesos_f32();
+        total_pnl += (ship.silver - ship.starting_silver + ship.lifetime_dividends - ship.debt)
+            .as_pesos_f32();
     }
 
     let line1 = format!(
@@ -471,7 +472,7 @@ fn draw_ship_panel(world: &World, ship_id: ShipId) {
     };
 
     let prov_pct = (ship.provisions / stats.provision_capacity * 100.0) as i32;
-    let pnl = (ship.silver - ship.starting_silver) + ship.lifetime_dividends - ship.debt;
+    let pnl = ship.silver - ship.starting_silver + ship.lifetime_dividends - ship.debt;
 
     let lines: [(String, Color); 9] = [
         (state_line, LIGHTGRAY),
@@ -491,21 +492,29 @@ fn draw_ship_panel(world: &World, ship_id: ShipId) {
         ),
         (format!("hull fouling {:.0}", ship.hull_fouling), LIGHTGRAY),
         (String::new(), LIGHTGRAY),
-        (format!("silver     ${:>9.0}", ship.silver), WHITE),
         (
-            format!("debt       ${:>9.0}", ship.debt),
-            if ship.debt > 0.0 { ORANGE } else { LIGHTGRAY },
+            format!("silver     ${:>9.0}", ship.silver.as_pesos_f32()),
+            WHITE,
+        ),
+        (
+            format!("debt       ${:>9.0}", ship.debt.as_pesos_f32()),
+            if ship.debt.is_positive() {
+                ORANGE
+            } else {
+                LIGHTGRAY
+            },
         ),
         (
             format!(
                 "dividends  ${:>9.0}   (start ${:.0})",
-                ship.lifetime_dividends, ship.starting_silver
+                ship.lifetime_dividends.as_pesos_f32(),
+                ship.starting_silver.as_pesos_f32()
             ),
             LIGHTGRAY,
         ),
         (
-            format!("P/L        ${:>+9.0}", pnl),
-            if pnl >= 0.0 { GREEN } else { RED },
+            format!("P/L        ${:>+9.0}", pnl.as_pesos_f32()),
+            if !pnl.is_negative() { GREEN } else { RED },
         ),
     ];
     for (i, (text, color)) in lines.iter().enumerate() {
@@ -559,7 +568,7 @@ fn draw_market_panel(world: &World, port_idx: usize) {
 
     draw_text(&port.name, x + 10.0, y + 22.0, 20.0, YELLOW);
     draw_text(
-        &format!("Treasury: ${:.0}", market.silver),
+        &format!("Treasury: ${:.0}", market.silver.as_pesos_f32()),
         x + 10.0,
         y + 42.0,
         16.0,

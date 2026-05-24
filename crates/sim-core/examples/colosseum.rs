@@ -57,7 +57,7 @@ fn spawn(
         },
         ship_type,
         &stats,
-        100.0,
+        sim_core::money::Pesos::from_pesos(100),
     );
     ship.policy = policy;
     ship.state = ShipState::Sailing;

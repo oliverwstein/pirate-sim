@@ -138,7 +138,7 @@ const REPLAN_DISTANCE_NM: f32 = 25.0;
 /// to top up provisions at any foreign port, plus a modest reserve
 /// for incidentals (pilotage fees, minor repairs). All silver above
 /// this is paid out to the owner port on docking.
-const HOME_PORT_FLOAT_SILVER: f32 = 500.0;
+const HOME_PORT_FLOAT_SILVER: crate::money::Pesos = crate::money::Pesos::from_pesos(500);
 
 /// Phase 4 §1.3: how many full broadsides' worth of powder / shot a
 /// merchant ship aims to keep aboard. 20 ≈ a long convoy's worth of
@@ -895,7 +895,7 @@ impl<'a> ShipBtContext<'a> {
             }
             let want = target - have;
             let unit = market.buy_price(good, self.goods).max(0.0001);
-            let affordable = (self.ship.silver / unit).max(0.0);
+            let affordable = (self.ship.silver.as_pesos_f32() / unit).max(0.0);
             let in_stock = market.stockpile.get(good);
             let cargo_room = self.stats.cargo_capacity_tons - self.ship.cargo.total_tons();
             let tons = want.min(affordable).min(in_stock).min(cargo_room).max(0.0);
@@ -926,7 +926,7 @@ impl<'a> ShipBtContext<'a> {
         // proceeds with the owners — a ship sitting on a fat
         // purse won't keep chasing marginal arbitrage forever.
         let home_bias = self.ship.owner_port.map(|home_idx| {
-            let surplus = (self.ship.silver - HOME_PORT_FLOAT_SILVER).max(0.0);
+            let surplus = (self.ship.silver - HOME_PORT_FLOAT_SILVER).max_zero();
             // Roughly: a ship sitting on +5k surplus pulls
             // toward home with a 25 peso/ton bias, fully
             // dominating ordinary arbitrage. The cap of 200
@@ -934,7 +934,7 @@ impl<'a> ShipBtContext<'a> {
             // the fattest opportunistic margin.
             crate::trade::HomeBias {
                 home_port: home_idx,
-                bias_pesos_per_ton: (surplus / 200.0).min(200.0),
+                bias_pesos_per_ton: (surplus.as_pesos_f32() / 200.0).min(200.0),
             }
         });
         let plan = crate::trade::find_best_trade(
@@ -966,7 +966,8 @@ impl<'a> ShipBtContext<'a> {
         if let Some(owner) = self.ship.owner_port {
             if owner == idx {
                 let want_tons = cargo_room.min(market.stockpile.get(plan.good));
-                let target = unit * want_tons * OUTFIT_DRAW_MULTIPLE;
+                let target =
+                    crate::money::Pesos::from_pesos_f32(unit * want_tons * OUTFIT_DRAW_MULTIPLE);
                 market.draw_for_outfit(self.ship, target, OUTFIT_PORT_FRACTION_CAP);
             }
         }
@@ -977,7 +978,7 @@ impl<'a> ShipBtContext<'a> {
         // consignment from the local factor. Booked as debt;
         // repaid out of the sale proceeds at the destination.
         let want_tons = cargo_room.min(market.stockpile.get(plan.good));
-        let need_silver = unit * want_tons;
+        let need_silver = crate::money::Pesos::from_pesos_f32(unit * want_tons);
         if self.ship.silver < need_silver
             && self.ship.debt < crate::ship::MAX_SHIP_DEBT
             && want_tons > 0.0
@@ -991,7 +992,7 @@ impl<'a> ShipBtContext<'a> {
             );
         }
 
-        let affordable = self.ship.silver / unit;
+        let affordable = self.ship.silver.as_pesos_f32() / unit;
         let in_stock = market.stockpile.get(plan.good);
         let tons = cargo_room.min(affordable).min(in_stock).max(0.0);
         if tons > 0.0 {
