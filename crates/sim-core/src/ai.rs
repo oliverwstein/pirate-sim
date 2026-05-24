@@ -26,6 +26,7 @@ use crate::ship::{
     angle_diff, normalize_angle, speed_at_heading, DockAction, Ship, ShipPolicy, ShipState,
     ShipStats,
 };
+use crate::sim_rng::SimRng;
 use crate::spatial::SpatialHash;
 use crate::types::{Position, ShipId, WindVector};
 use slotmap::SecondaryMap;
@@ -310,13 +311,13 @@ pub struct ShipAI {
     pub goal: NavGoal,
     tree: Behavior,
     state: BtState,
-    /// Simple RNG state (xorshift) for destination selection.
-    rng_state: u64,
-    /// Independent RNG state for the navigator (DR noise, fix noise).
+    /// PCG RNG for destination selection.
+    rng: SimRng,
+    /// Independent PCG RNG for the navigator (DR noise, fix noise).
     /// Kept separate so per-ship navigation jitter doesn't perturb the
     /// destination-choice RNG sequence — important for reproducible
     /// bench economics across noise tuning passes.
-    nav_rng_state: u64,
+    nav_rng: SimRng,
     /// Previous tick's true ship position. Used by the navigator pass
     /// to advance the captain's dead-reckoning estimate by the ship's
     /// actual displacement (plus accumulating DR noise). `None` on the
@@ -336,8 +337,8 @@ impl ShipAI {
             goal: NavGoal::new(),
             tree: build_ship_bt(),
             state: BtState::new(),
-            rng_state: 12345,
-            nav_rng_state: 0x9E3779B97F4A7C15,
+            rng: SimRng::new(12345),
+            nav_rng: SimRng::new(0x9E3779B97F4A7C15),
             prev_truth: None,
         }
     }
@@ -347,8 +348,8 @@ impl ShipAI {
             goal: NavGoal::with_destination(dest),
             tree: build_ship_bt(),
             state: BtState::new(),
-            rng_state: 12345,
-            nav_rng_state: 0x9E3779B97F4A7C15,
+            rng: SimRng::new(12345),
+            nav_rng: SimRng::new(0x9E3779B97F4A7C15),
             prev_truth: None,
         }
     }
@@ -362,8 +363,8 @@ impl ShipAI {
             goal: NavGoal::new(),
             tree: build_ship_bt(),
             state: BtState::new(),
-            rng_state: seed,
-            nav_rng_state: seed ^ 0x9E3779B97F4A7C15,
+            rng: SimRng::new(seed),
+            nav_rng: SimRng::new(seed ^ 0x9E3779B97F4A7C15),
             prev_truth: None,
         }
     }
@@ -412,20 +413,20 @@ impl ShipAI {
             }
             // DR error scales with the previous tick's speed (no
             // drift at anchor / dock).
-            nav::apply_dr_error(estimate, inputs.ship.speed, 1.0, &mut self.nav_rng_state);
+            nav::apply_dr_error(estimate, inputs.ship.speed, 1.0, &mut self.nav_rng);
             nav::try_noon_sight(
                 estimate,
                 truth,
                 inputs.day_of_year,
                 &mut self.goal.last_noon_sight_day,
-                &mut self.nav_rng_state,
+                &mut self.nav_rng,
             );
             // Landmark fix only while underway. A docked captain knows
             // where the dock is — re-snapping to truth+N(0,1) every
             // hour would just add noise to a known position and
             // perturb departure headings.
             if inputs.ship.speed > 0.1 {
-                nav::try_landmark_fix(estimate, truth, inputs.ports, &mut self.nav_rng_state);
+                nav::try_landmark_fix(estimate, truth, inputs.ports, &mut self.nav_rng);
             }
         }
         self.prev_truth = Some(truth);
@@ -438,7 +439,7 @@ impl ShipAI {
             goal: &mut self.goal,
             ports: inputs.ports,
             harbors: inputs.harbors,
-            rng_state: &mut self.rng_state,
+            rng: &mut self.rng,
             pathfind: inputs.pathfind,
             markets: inputs.markets,
             goods: inputs.goods,
@@ -539,15 +540,7 @@ pub struct ShipSnapshot {
     pub cannons: u16,
 }
 
-/// Simple xorshift64 RNG — deterministic and fast.
-fn xorshift64(state: &mut u64) -> u64 {
-    let mut x = *state;
-    x ^= x << 13;
-    x ^= x >> 7;
-    x ^= x << 17;
-    *state = x;
-    x
-}
+// Simple xorshift64 RNG — legacy. Replaced by `crate::sim_rng::SimRng`.
 
 /// Convert a steering command (heading in degrees CW from N, speed in
 /// knots) to a velocity vector in (East, North) NM/hr. Used by Step 8
@@ -569,7 +562,7 @@ pub struct ShipBtContext<'a> {
     goal: &'a mut NavGoal,
     ports: &'a [Port],
     harbors: &'a HarborMap,
-    rng_state: &'a mut u64,
+    rng: &'a mut SimRng,
     pathfind: Option<&'a PathfindContext<'a>>,
     markets: &'a mut [PortMarket],
     goods: &'a GoodsRegistry,
@@ -817,7 +810,7 @@ impl<'a> ShipBtContext<'a> {
         if self.ports.is_empty() {
             return Status::Failure;
         }
-        let mut idx = (xorshift64(self.rng_state) as usize) % self.ports.len();
+        let mut idx = (self.rng.next_u64() as usize) % self.ports.len();
         if self.estimated_position().distance(self.ports[idx].position) < 20.0 {
             idx = (idx + 1) % self.ports.len();
         }

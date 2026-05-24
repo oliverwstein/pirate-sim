@@ -13,6 +13,7 @@ use std::collections::VecDeque;
 
 use crate::map::land::LandMap;
 use crate::ship::{angle_diff, normalize_angle, speed_at_heading, ShipStats};
+use crate::sim_rng::SimRng;
 use crate::types::{Position, ShipId, WindVector};
 
 /// A steering command: the heading to set on the ship and the speed it
@@ -63,31 +64,8 @@ const NOON_SIGHT_NOISE_NM: f32 = 0.5;
 /// think you are — far better than a noon sight in both axes.
 const LANDMARK_FIX_NOISE_NM: f32 = 1.0;
 
-/// xorshift64 — same generator the AI already uses; mutates `state`.
-fn xorshift64(state: &mut u64) -> u64 {
-    let mut x = *state;
-    x ^= x << 13;
-    x ^= x >> 7;
-    x ^= x << 17;
-    *state = x;
-    x
-}
-
-/// Uniform in (0, 1].
-fn uniform01(state: &mut u64) -> f32 {
-    // Mask to 53 bits, divide by 2^53 — gives [0, 1). Add epsilon so
-    // the Box-Muller log doesn't blow up on 0.
-    let bits = xorshift64(state) >> 11;
-    (bits as f32 / (1u64 << 53) as f32).max(1e-7)
-}
-
-/// One sample of N(0, 1) via Box-Muller. Cheap (two uniforms, one log,
-/// one cos) and deterministic given the RNG state.
-fn gaussian(state: &mut u64) -> f32 {
-    let u1 = uniform01(state);
-    let u2 = uniform01(state);
-    (-2.0 * u1.ln()).sqrt() * (2.0 * std::f32::consts::PI * u2).cos()
-}
+// xorshift64 — legacy. Removed after PCG migration; the project-wide
+// generator now lives in `crate::sim_rng::SimRng`.
 
 /// Walk the dead-reckoning estimate by one hour. Error scales with the
 /// commanded speed — a ship hove-to at zero kt doesn't drift. The
@@ -97,11 +75,11 @@ pub fn apply_dr_error(
     estimate: &mut Position,
     speed_kt: f32,
     error_multiplier: f32,
-    rng_state: &mut u64,
+    rng: &mut SimRng,
 ) {
     let scale = (speed_kt.max(0.0) / 6.0) * error_multiplier; // 6 kt ≈ typical sloop cruise
-    estimate.x += gaussian(rng_state) * DR_ERROR_LON_NM_PER_HOUR * scale;
-    estimate.y += gaussian(rng_state) * DR_ERROR_LAT_NM_PER_HOUR * scale;
+    estimate.x += rng.gaussian() * DR_ERROR_LON_NM_PER_HOUR * scale;
+    estimate.y += rng.gaussian() * DR_ERROR_LAT_NM_PER_HOUR * scale;
 }
 
 /// Attempt a noon sight: at most once per simulated day. Returns `true`
@@ -113,12 +91,12 @@ pub fn try_noon_sight(
     truth: Position,
     day_of_year: u16,
     last_sight_day: &mut u16,
-    rng_state: &mut u64,
+    rng: &mut SimRng,
 ) -> bool {
     if day_of_year == 0 || day_of_year == *last_sight_day {
         return false;
     }
-    estimate.y = truth.y + gaussian(rng_state) * NOON_SIGHT_NOISE_NM;
+    estimate.y = truth.y + rng.gaussian() * NOON_SIGHT_NOISE_NM;
     *last_sight_day = day_of_year;
     true
 }
@@ -136,12 +114,12 @@ pub fn try_landmark_fix(
     estimate: &mut Position,
     truth: Position,
     ports: &[crate::port::Port],
-    rng_state: &mut u64,
+    rng: &mut SimRng,
 ) -> Option<usize> {
     for (idx, port) in ports.iter().enumerate() {
         if truth.distance(port.position) <= LANDMARK_SIGHT_NM {
-            estimate.x = truth.x + gaussian(rng_state) * LANDMARK_FIX_NOISE_NM;
-            estimate.y = truth.y + gaussian(rng_state) * LANDMARK_FIX_NOISE_NM;
+            estimate.x = truth.x + rng.gaussian() * LANDMARK_FIX_NOISE_NM;
+            estimate.y = truth.y + rng.gaussian() * LANDMARK_FIX_NOISE_NM;
             return Some(idx);
         }
     }

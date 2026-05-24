@@ -6,15 +6,16 @@
 //! 3-6%/yr in the Caribbean basin. Cause mix per Davis (1962) and
 //! Jarvis (1954): storms ~50-65%, foundering 10-20%, fire 5-10%.
 //!
-//! All RNG flows through a single `HazardSystem.rng_state` for
-//! determinism; the same world seeded the same way produces the same
-//! attrition trace.
+//! All RNG flows through a single `HazardSystem.rng` (PCG via
+//! `crate::sim_rng::SimRng`) for determinism; the same world seeded the
+//! same way produces the same attrition trace.
 //!
 //! Position convention: y axis is northing in NM from origin
 //! (17.5°N, 72.5°W). 1° latitude ≈ 60 NM, so the 25°N tropical line
 //! sits at y = (25.0 - 17.5) * 60.0 = 450.0 NM.
 
 use crate::ship::{Ship, ShipState};
+use crate::sim_rng::SimRng;
 use crate::types::Position;
 
 /// Latitudes south of this y-value are considered "tropical" for the
@@ -95,16 +96,17 @@ pub struct HazardCounters {
 }
 
 pub struct HazardSystem {
-    rng_state: u64,
+    rng: SimRng,
     pub counters: HazardCounters,
 }
 
 impl HazardSystem {
     pub fn new(seed: u64) -> Self {
         Self {
-            // Seed of 0 would zero the xorshift forever, so XOR in a
-            // golden-ratio constant to keep the stream lively.
-            rng_state: seed ^ 0x9E37_79B9_7F4A_7C15,
+            // XOR with a golden-ratio constant so seed=0 still produces
+            // a non-degenerate PCG stream (defensive; SimRng handles
+            // this internally via splitmix64 too).
+            rng: SimRng::new(seed ^ 0x9E37_79B9_7F4A_7C15),
             counters: HazardCounters::default(),
         }
     }
@@ -244,14 +246,9 @@ impl HazardSystem {
         out
     }
 
-    /// xorshift64 step, returning a uniform sample in [0, 1).
+    /// PCG step, returning a uniform sample in [0, 1).
     fn uniform(&mut self) -> f32 {
-        self.rng_state ^= self.rng_state << 13;
-        self.rng_state ^= self.rng_state >> 7;
-        self.rng_state ^= self.rng_state << 17;
-        // Mix to avoid low-bit correlation, then map to [0, 1).
-        let r = self.rng_state.wrapping_mul(0x2545_F491_4F6C_DD1D);
-        (r >> 11) as f32 / ((1u64 << 53) as f32)
+        self.rng.uniform_f32()
     }
 }
 

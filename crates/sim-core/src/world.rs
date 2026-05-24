@@ -16,6 +16,7 @@ use crate::port::{all_ports, Port};
 use crate::ship::{Ship, ShipPolicy, ShipState, ShipStats};
 use crate::shiptype::{self, ShipTypeRegistry};
 use crate::shipyard::{self, BuildOutcome};
+use crate::sim_rng::SimRng;
 use crate::spatial::SpatialHash;
 use crate::types::{ShipId, SimDate};
 use crate::weather::WeatherSystem;
@@ -95,7 +96,7 @@ pub struct World {
     /// Step 11.a: deterministic RNG for stochastic combat outcomes
     /// (prize handling, future morale rolls, etc.). Seeded once at
     /// `World::load`; same world state → same outcome trace.
-    pub combat_rng_state: u64,
+    pub combat_rng: SimRng,
     /// Dynamic spatial index over Sailing ships, rebuilt at the top
     /// of every hourly tick. Read by viz (Step 4.d) and, in Step 6+,
     /// by AI `SeePrey` / `Pursue` / `Flee` conditions. Docked /
@@ -179,7 +180,7 @@ impl World {
             prizes_released: 0,
             prizes_in_tow: 0,
             prizes_orphaned: 0,
-            combat_rng_state: 0x5052_495A_4520_5247_u64 ^ 0x9E37_79B9_7F4A_7C15,
+            combat_rng: SimRng::new(0x5052_495A_4520_5247_u64 ^ 0x9E37_79B9_7F4A_7C15),
             spatial: SpatialHash::new(),
             commands: Vec::new(),
             sim_minute: 0,
@@ -846,7 +847,7 @@ impl World {
             // Step 11.b: pass a uniform sample from the world combat
             // RNG; ship.try_mutiny now rolls stochastically instead of
             // firing deterministically the moment conditions are met.
-            let mutiny_roll = combat_rng_step(&mut self.combat_rng_state);
+            let mutiny_roll = self.combat_rng.uniform_f32();
             if ship.try_mutiny(mutiny_roll) {
                 self.mutinies_total += 1;
                 if let Some(ai) = self.ship_ais.get_mut(id) {
@@ -1363,7 +1364,7 @@ impl World {
         let attacker_after = a_surviving.saturating_sub(prize_crew);
         let can_spare_crew = attacker_after >= a_min_crew && prize_crew >= 2;
 
-        let roll = combat_rng_step(&mut self.combat_rng_state);
+        let roll = self.combat_rng.uniform_f32();
         // Outcome weights (sum to 1.0):
         //   take    : 0.05 (only if real upgrade + crew spareable)
         //   sell    : 0.30 (silver bonus, prize sunk)
@@ -1522,14 +1523,6 @@ impl World {
     }
 }
 
-/// Free-function form of `World::combat_uniform`, taking the rng state
-/// by `&mut` so it can be called from inside `self.commands.drain(..)`
-/// loops that already hold a mutable borrow on `self`. xorshift64 with
-/// a multiplicative mixer.
-fn combat_rng_step(state: &mut u64) -> f32 {
-    *state ^= *state << 13;
-    *state ^= *state >> 7;
-    *state ^= *state << 17;
-    let r = state.wrapping_mul(0x2545_F491_4F6C_DD1D);
-    (r >> 11) as f32 / ((1u64 << 53) as f32)
-}
+// Free-function `combat_rng_step` removed; the per-tick combat RNG now
+// lives on `World.combat_rng: SimRng` and is called as
+// `self.combat_rng.uniform_f32()` even from inside drain loops.

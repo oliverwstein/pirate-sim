@@ -1383,3 +1383,45 @@ updated to call `finalize()` after their inserts.
 **Validation.** 189 tests pass; clippy clean; `bench_trade` 82
 bankruptcies (identical to Phase 2 baseline); `bench_pathfind` 1406/1406
 routes ok, 1.36 ms avg.
+
+---
+
+## DOD Refactor — Phase 4: PRNG → `rand_pcg` (2026-05)
+
+**Context.** Four call sites (`ai.rs`, `nav.rs`, `weather/hazards.rs`,
+`world.rs`) hand-rolled the same xorshift64 + 53-bit-mantissa-mixer
+pattern, each as a private helper. Hand-rolled xorshift has documented
+weak low bits; the multiplicative mixer was added as folk wisdom rather
+than from a stated mathematical guarantee. Five separate copies also
+made it impossible to swap algorithms without touching every site.
+
+**Alternatives considered.**
+1. *`rand` (full crate).* Brings in `OsRng`, distributions, and the
+   getrandom platform shim — overkill for a deterministic sim that only
+   needs uniform f32 and Gaussians.
+2. *`fastrand`.* Tiny, but the algorithm is wyrand (a multiplier hash);
+   designed for speed in tooling, not statistically scrutinized at the
+   level PCG is.
+3. *`rand_pcg::Pcg64Mcg` behind a thin newtype.* Chosen. Stable,
+   documented determinism contract, ~5 ns per draw, and the only
+   surface area we need (`next_u64` + uniform_f32 + Box-Muller).
+
+**Resolution.** New `sim_rng::SimRng` newtype wraps `Pcg64Mcg`. Three
+methods: `uniform_f32`, `gaussian` (Box-Muller), `next_u64`. Seeded via
+`SeedableRng::seed_from_u64` so existing u64 seeds keep their public
+meaning. All four sites converted: `ShipAI` now stores `rng` + `nav_rng`
+as `SimRng`; `HazardSystem` stores `rng: SimRng`; `World.combat_rng:
+SimRng` replaces the free `combat_rng_step(&mut u64)` helper (the
+borrow-checker dance that motivated it is unaffected — `&mut self.combat_rng`
+works inside drain loops the same way `&mut self.combat_rng_state` did).
+
+Tests that depend on specific RNG outcomes (combat rolls at given seeds,
+e.g. `pirate_in_cannon_range_damages_merchant`, prize-disposition tests)
+were re-validated under the new generator; **all 192 tests pass** with
+no golden-value adjustments needed — the affected tests check
+qualitative invariants (cargo missing, hull damaged) rather than exact
+roll values.
+
+**Validation.** 192 tests pass; clippy clean; `bench_trade` 79
+bankruptcies (vs 82 pre-Phase-4 — within noise; the equilibrium gap is
+unchanged); `bench_pathfind` 1406/1406 routes ok, 1.42 ms avg.

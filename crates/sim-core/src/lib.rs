@@ -18,6 +18,7 @@ pub mod port;
 pub mod ship;
 pub mod shiptype;
 pub mod shipyard;
+pub mod sim_rng;
 pub mod spatial;
 pub mod trade;
 pub mod types;
