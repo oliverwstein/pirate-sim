@@ -9,6 +9,7 @@ pub mod goods;
 pub mod harbor;
 pub mod map;
 pub mod market;
+pub mod market_clearer;
 pub mod market_curve;
 pub mod money;
 pub mod nav;

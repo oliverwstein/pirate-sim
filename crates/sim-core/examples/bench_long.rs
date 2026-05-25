@@ -152,12 +152,7 @@ fn main() {
     // Resolve watch-port indices once.
     let watch_idxs: Vec<(String, Option<usize>)> = WATCH_PORTS
         .iter()
-        .map(|n| {
-            (
-                n.to_string(),
-                world.ports.iter().position(|p| p.name == *n),
-            )
-        })
+        .map(|n| (n.to_string(), world.ports.iter().position(|p| p.name == *n)))
         .collect();
 
     let mut prev_built: u32 = world.faction_telemetry.iter().map(|t| t.ships_built).sum();
