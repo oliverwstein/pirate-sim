@@ -234,12 +234,16 @@ fn main() {
     let mut dest_changes = Vec::with_capacity(world.ships.len());
     let mut replan_exh = Vec::with_capacity(world.ships.len());
     let mut replan_los = Vec::with_capacity(world.ships.len());
+    let mut skip_ahead = Vec::with_capacity(world.ships.len());
+    let mut cooldown_suppressed = Vec::with_capacity(world.ships.len());
     let mut divert_evt = Vec::with_capacity(world.ships.len());
     for (id, _) in &world.ships {
         if let Some(ai) = world.ship_ais.get(id) {
             dest_changes.push(ai.diag.destination_changes);
             replan_exh.push(ai.diag.path_replans_exhausted);
             replan_los.push(ai.diag.path_replans_los);
+            skip_ahead.push(ai.diag.path_skip_ahead);
+            cooldown_suppressed.push(ai.diag.replans_suppressed_cooldown);
             divert_evt.push(ai.diag.divert_events);
         }
     }
@@ -263,6 +267,8 @@ fn main() {
     summary("destination_changes", dest_changes);
     summary("path_replans_exhausted", replan_exh);
     summary("path_replans_los", replan_los);
+    summary("path_skip_ahead", skip_ahead);
+    summary("replans_suppressed_cooldown", cooldown_suppressed);
     summary("divert_events", divert_evt);
 }
 

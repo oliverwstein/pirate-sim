@@ -135,6 +135,23 @@ const REACHABILITY_BUFFER_DAYS: f32 = 3.0;
 /// that a ship drifting past its smoothed route promptly recovers.
 const REPLAN_DISTANCE_NM: f32 = 25.0;
 
+/// Cooldown (in AI ticks) on path re-planning from `act_sail`. At ~1
+/// AI tick per simulated minute, 30 ticks is 30 sim-minutes — long
+/// enough to break thrash storms in tight waters, short enough that a
+/// ship that has genuinely drifted off-route still re-plans promptly
+/// once the cooldown expires. Reactive deflection
+/// (`nav::deflect_for_land`) continues to steer around obstacles
+/// every tick regardless of cooldown.
+const REPLAN_COOLDOWN_TICKS: u16 = 30;
+
+/// How far ahead in the waypoint queue we will skip looking for a
+/// reachable later waypoint when the next one fails the LOS check.
+/// Bounded so even with a 200-waypoint plan the skip-ahead probe
+/// remains O(1). Skipping farther than this is rarely useful: A*
+/// emits waypoints close to coast features, so a long chain of them
+/// will almost always be blocked together.
+const SKIP_AHEAD_PROBE_LIMIT: usize = 8;
+
 /// Operating float kept aboard after a home-port settlement: enough
 /// to top up provisions at any foreign port, plus a modest reserve
 /// for incidentals (pilotage fees, minor repairs). All silver above
@@ -327,6 +344,15 @@ pub struct ShipAI {
     /// specific call site so a bench can attribute path/destination
     /// churn to one of the routing pathways. Read-only outside `ai.rs`.
     pub diag: AiDiag,
+    /// Cooldown (in AI ticks) on path re-planning from `act_sail`.
+    /// Whenever a LOS or exhausted-waypoint replan fires we set this
+    /// to [`REPLAN_COOLDOWN_TICKS`]; it decrements each tick. While
+    /// non-zero, those replan branches are suppressed and we trust
+    /// [`nav::deflect_for_land`] to handle moment-to-moment hazard
+    /// avoidance. This breaks the "stuck near coast" thrash storm
+    /// where A* repeatedly returns paths the LOS check immediately
+    /// rejects on the very next tick.
+    replan_cooldown_ticks: u16,
 }
 
 /// Diagnostic counters surfaced to benches (no behavioral effect).
@@ -341,6 +367,16 @@ pub struct AiDiag {
     /// Path re-plans from the LOS / corridor-blocked branch in
     /// `act_sail` (path-stale safety net for ships drifting near land).
     pub path_replans_los: u32,
+    /// LOS-block events resolved by skipping ahead to a later
+    /// already-queued waypoint that was reachable from truth, instead
+    /// of running A*. High counts here indicate the planned path was
+    /// fundamentally OK but wind drift made an intermediate waypoint
+    /// transiently unreachable.
+    pub path_skip_ahead: u32,
+    /// Replans suppressed by the per-ship cooldown (would have fired
+    /// but a previous replan is still cooling down). High counts here
+    /// confirm the cooldown is breaking thrash storms.
+    pub replans_suppressed_cooldown: u32,
     /// Successful `act_divert_to_port` events.
     pub divert_events: u32,
 }
@@ -361,6 +397,7 @@ impl ShipAI {
             nav_rng: SimRng::new(0x9E3779B97F4A7C15),
             prev_truth: None,
             diag: AiDiag::default(),
+            replan_cooldown_ticks: 0,
         }
     }
 
@@ -373,6 +410,7 @@ impl ShipAI {
             nav_rng: SimRng::new(0x9E3779B97F4A7C15),
             prev_truth: None,
             diag: AiDiag::default(),
+            replan_cooldown_ticks: 0,
         }
     }
 
@@ -389,6 +427,7 @@ impl ShipAI {
             nav_rng: SimRng::new(seed ^ 0x9E3779B97F4A7C15),
             prev_truth: None,
             diag: AiDiag::default(),
+            replan_cooldown_ticks: 0,
         }
     }
 
@@ -472,6 +511,7 @@ impl ShipAI {
             snapshots: inputs.snapshots,
             spatial: inputs.spatial,
             diag: &mut self.diag,
+            replan_cooldown_ticks: &mut self.replan_cooldown_ticks,
         };
 
         let status = bt::tick(&self.tree, &mut self.state, &mut ctx, 0);
@@ -608,6 +648,8 @@ pub struct ShipBtContext<'a> {
     snapshots: &'a SecondaryMap<ShipId, ShipSnapshot>,
     spatial: &'a SpatialHash,
     diag: &'a mut AiDiag,
+    /// Mutable reference into [`ShipAI::replan_cooldown_ticks`].
+    replan_cooldown_ticks: &'a mut u16,
 }
 
 impl<'a> ShipBtContext<'a> {
@@ -778,6 +820,14 @@ impl<'a> ShipBtContext<'a> {
             return Status::Success;
         }
 
+        // Cooldown tick. Both replan branches below are guarded by
+        // this counter; reactive deflection (`nav::deflect_for_land`)
+        // remains active every tick regardless. See [`AiDiag`] for the
+        // rationale.
+        if *self.replan_cooldown_ticks > 0 {
+            *self.replan_cooldown_ticks -= 1;
+        }
+
         // Replan when our planned route has been exhausted but we're
         // still nowhere near the destination. Without this, a ship
         // that drifts/tacks past its last waypoint will dead-reckon
@@ -787,9 +837,15 @@ impl<'a> ShipBtContext<'a> {
             if let Some(dest) = self.goal.destination {
                 if self.estimated_position().distance(dest) > REPLAN_DISTANCE_NM {
                     if let Some(idx) = self.goal.dest_port {
-                        self.diag.path_replans_exhausted =
-                            self.diag.path_replans_exhausted.saturating_add(1);
-                        self.replan_to_port(idx);
+                        if *self.replan_cooldown_ticks > 0 {
+                            self.diag.replans_suppressed_cooldown =
+                                self.diag.replans_suppressed_cooldown.saturating_add(1);
+                        } else {
+                            self.diag.path_replans_exhausted =
+                                self.diag.path_replans_exhausted.saturating_add(1);
+                            self.replan_to_port(idx);
+                            *self.replan_cooldown_ticks = REPLAN_COOLDOWN_TICKS;
+                        }
                     }
                 }
             }
@@ -802,10 +858,17 @@ impl<'a> ShipBtContext<'a> {
         // Path-stale check: if land has come between the ship's actual
         // position and its NEXT INTERMEDIATE waypoint, the remaining
         // path is invalid — `compute_steering` will sail us straight
-        // into the coast. Replan from truth. This covers the common
-        // failure mode where wind/tacking drifts the ship a few NM
-        // off the planned corridor and the next waypoint is no
-        // longer reachable in a straight line.
+        // into the coast. Try three remedies in order of cost:
+        //   1. Skip-ahead: a later already-queued waypoint may be
+        //      reachable from truth (the planned route is still good,
+        //      we've just drifted past or around an intermediate).
+        //      Pop the unreachable intermediates and continue.
+        //   2. Cooldown gate: if we've replanned recently, suppress
+        //      another A* call and let reactive deflection handle this
+        //      tick. Prevents the stuck-near-coast thrash storm.
+        //   3. Full replan from truth, with the cooldown re-armed so
+        //      we don't immediately re-fire if the new path also has
+        //      a marginal first waypoint.
         //
         // CRITICAL: we deliberately do NOT fall through to checking
         // the destination when waypoints are empty. Harbors sit on
@@ -820,15 +883,38 @@ impl<'a> ShipBtContext<'a> {
         if let (Some(pf), Some(target)) = (self.pathfind, self.ship.nav.waypoints.first().copied())
         {
             if !pf.land.corridor_is_clear(pos_truth, target, 0.0) {
-                self.diag.path_replans_los = self.diag.path_replans_los.saturating_add(1);
-                if let Some(idx) = self.goal.dest_port {
-                    self.replan_to_port(idx);
-                } else if let Some(dest) = self.goal.destination {
-                    if let Some(path) = pathfind::find_path(pf, pos_truth, dest) {
-                        if let Some(last) = path.last().copied() {
-                            self.goal.destination = Some(last);
+                // Step 1: skip-ahead probe over queued waypoints.
+                let mut skip_to: Option<usize> = None;
+                let probe_end = self.ship.nav.waypoints.len().min(SKIP_AHEAD_PROBE_LIMIT);
+                for i in 1..probe_end {
+                    let wp = self.ship.nav.waypoints[i];
+                    if pf.land.corridor_is_clear(pos_truth, wp, 0.0) {
+                        skip_to = Some(i);
+                        break;
+                    }
+                }
+                if let Some(i) = skip_to {
+                    for _ in 0..i {
+                        self.ship.nav.waypoints.remove(0);
+                    }
+                    self.diag.path_skip_ahead = self.diag.path_skip_ahead.saturating_add(1);
+                } else if *self.replan_cooldown_ticks > 0 {
+                    // Step 2: cooldown active → suppress.
+                    self.diag.replans_suppressed_cooldown =
+                        self.diag.replans_suppressed_cooldown.saturating_add(1);
+                } else {
+                    // Step 3: genuine block, no recent replan — try a fresh path.
+                    self.diag.path_replans_los = self.diag.path_replans_los.saturating_add(1);
+                    *self.replan_cooldown_ticks = REPLAN_COOLDOWN_TICKS;
+                    if let Some(idx) = self.goal.dest_port {
+                        self.replan_to_port(idx);
+                    } else if let Some(dest) = self.goal.destination {
+                        if let Some(path) = pathfind::find_path(pf, pos_truth, dest) {
+                            if let Some(last) = path.last().copied() {
+                                self.goal.destination = Some(last);
+                            }
+                            self.ship.nav.set_path(path);
                         }
-                        self.ship.nav.set_path(path);
                     }
                 }
             }
