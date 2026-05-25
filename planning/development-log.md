@@ -1914,3 +1914,239 @@ The ad-hoc prototype confirmed the shape of these issues but
 needs a more durable home — likely a dedicated stats / metrics
 crate, or an exporter step on `World` that emits a structured
 report at end-of-run.
+
+---
+
+## Per-entity telemetry: faction + port aggregates (interim observability)
+
+**Context.** The faction-policy bench surfaced two structural questions
+the bench couldn't easily answer: per-faction crown revenue and
+which ports were running zero trade volume. The ad-hoc prototype that
+answered these was reverted (notes above). The full event-journal
+design was written up in `planning/observability-plan.md` but deferred
+— it's a cross-cutting refactor and the data we want for the next
+calibration round is narrower than that.
+
+**Decision.** Add small, monotonic aggregates directly on the entities
+that already exist: a `Vec<PortTelemetry>` parallel to `World::ports`,
+and a `[FactionTelemetry; 5]` array on `World`. New module
+`crates/sim-core/src/telemetry.rs`.
+
+Fields (chosen with user; deliberately minimal):
+
+- **Faction**: `crown_revenue` (cumulative duty wedge), `silver_returned_home`
+  (cumulative `MarketDeposit` dividend payments by ships of this flag
+  to their home port — i.e., trade profits remitted to the metropole),
+  `ships_built`, `ships_lost`.
+- **Port**: `lifetime_duties` (per-port duty wedge), `lifetime_production`
+  (base value of all tons the port has sold), `lifetime_production_by_good`
+  (sparse, sorted map), `dockings_by_flag: [AtomicU32; 5]`.
+
+`dockings_by_flag` is `AtomicU32` because the dock transition happens
+in the parallel AI phase (`ai::act_sail`) where ports are only
+borrowed immutably; everything else is mutated in serial phases
+(clearing, shipyard, cleanup) under `&mut self`. Counts are
+commutative so Relaxed ordering preserves determinism.
+
+**Explicitly not added.** Ship-level fields (`lifetime_profit`,
+`voyages_completed`, `times_refit`) were considered but skipped: the
+existing `silver`, `starting_silver`, `lifetime_dividends`,
+`lifetime_dock_count` give the same P/L story without new state.
+
+**Update sites (5 total).**
+- `world::clear_one_good` (end of fn): credits `lifetime_duties`,
+  `lifetime_production[_by_good]`, and `crown_revenue` (port's faction).
+- `world::clear_port` `MarketDeposit` arm: credits
+  `silver_returned_home[ship.faction]` alongside `lifetime_dividends`
+  — captures dividend remittance at home-port docking.
+- `world::run_shipyard` (post-Built): `faction_telemetry[ship.faction].ships_built`.
+- `world::cleanup` (pre-remove): `faction_telemetry[ship.faction].ships_lost`.
+- `ai::act_sail` dock site: `port_telemetry[idx].record_docking(ship.faction)`.
+- New `port_telemetry` field threaded through `ShipTickInputs` →
+  `ShipBtContext`.
+
+**Bench output.** `bench_trade` ends with a "Per-faction telemetry"
+table and an "Inactive ports" list. First run reproduces the earlier
+findings: England 1954 / Netherlands 805 / France 132 / Spain 2 pesos
+crown revenue; 7 inactive ports including Portobelo, Santiago de Cuba,
+Cadiz, Nantes; silver_returned_home zero across all factions over
+60 days (longer runs will exercise this).
+
+**Migration path to full event system.** When the per-entity numbers
+stop being enough — typically when we want chronological queries
+("when did Petit-Goâve start cannibalizing the other French ports?")
+or per-good per-flag matrices that can't be precomputed — return to
+`planning/observability-plan.md` and implement the SoA event journals
++ SQLite export. The current telemetry fields are forward-compatible:
+they remain useful as cached aggregates even when events are added,
+and the update sites are the same locations where events would be
+emitted.
+
+## Perf series — Phases 1, 6, 7 (entity-telemetry branch, 2026)
+
+**Context.** Profiling on `entity-telemetry` after the per-entity
+telemetry work landed showed `bench_ai_tick` spending most of its
+budget in two places: (a) the parallel AI closure, where each ship
+cloned its `ShipStats`, and (b) the navmesh A* called from
+`assign_destination_port` / `replan_to_port` when many ships'
+waypoint queues emptied in the same tick. The p50→p95 ratio was
+~40× — classic "common cheap + occasional very expensive" shape.
+
+An 8-phase plan was drafted (P0 baseline → P1 build flags → P2 alloc
+hygiene → P3 cohort scheduling → P4 OD matrices → P5 onward-leg
+cache → P6 A* arrays → P7 batched A* → P8 SIMD). Phases 2, 5a were
+tried/dropped; Phases 3/4/8 deferred. The three that landed are
+documented below.
+
+### Phase 1 — Workspace LTO + ShipStats borrow
+
+- `Cargo.toml`: `[profile.release] lto = "fat", codegen-units = 1`.
+  Build time 2.7 s → 12–21 s; runtime −10% AI tick avg.
+- `world.rs`: parallel AI closure now borrows `&ship_types.get(...).stats`
+  instead of cloning. `ShipStats` is small but cloned per ship per
+  tick, so removing the clone gives a measurable win.
+- `panic = "abort"` deliberately *not* set — it would break
+  should_panic-style tests and Rayon panic propagation.
+- Bit-identical telemetry preserved. Commit `7527bd5`.
+
+### Phase 6 — Thread-local Vec scratch for A*
+
+Replace per-call `HashMap<u32,f32>` / `HashMap<u32,u32>` / `HashSet<u32>`
+in `navmesh::route` with thread-local Vec-backed scratch
+(`g_score`, `came_from`, `in_goal`) sized to `nodes.len()` (~37 588).
+Each Rayon worker keeps its own `RouteScratch`; the per-node arrays
+are allocated once and reset O(touched) instead of O(N) between
+calls via two `touched: Vec<u32>` lists.
+
+Algorithm preserved bit-for-bit: same neighbor iteration order,
+same `BinaryHeap` tie-breaks via reversed `Ord` on `f`. Telemetry
+identical. The spike-tick cost was many ships' A* calls in the same
+tick eating ~150 KB of HashMap setup each; eliminating that removed
+about half of the AI tick cost. Commit `e5ad2ca`:
+
+| Metric | Phase 1 | Phase 6 | Δ |
+| --- | --- | --- | --- |
+| AI avg | 0.748 ms | 0.396 ms | −47% |
+| p95 | 4.442 ms | 2.080 ms | −53% |
+| max | 9.997 ms | 3.984 ms | −60% |
+
+### Phase 7 — Per-port SSSP cache (vs bidirectional A*)
+
+New module `portroutes::PortRouteCache`. The navmesh graph is
+static; every port destination has a fixed harbor-entry node set.
+So at world load we run one multi-source Dijkstra per port from
+those entry nodes, producing `(dist, pred)` arrays of size
+`nodes.len()`. Per-tick `find_path_to_harbor` becomes a
+constant-time lookup (pick the start node with min cached distance)
+plus an O(path-length) predecessor walk. Live A* fallback remains
+for arbitrary-goal `find_path` and tests that don't construct a
+cache.
+
+API extension: `PathfindContext` gained an optional
+`port_routes: &PortRouteCache` field, attached via
+`with_port_routes` in the production tick path. Existing
+tests/examples were untouched.
+
+Memory: 38 ports × 37 588 nodes × 8 bytes ≈ 11 MB.
+Build cost: ~1 s added to `World::load` (38 Dijkstras on a ~1.3 M
+edge graph). Commit `99a9bdf`:
+
+| Metric | Baseline (P1) | Phase 6 | Phase 7-SSSP | Δ vs baseline |
+| --- | --- | --- | --- | --- |
+| AI avg | 0.748 ms | 0.396 ms | 0.220 ms | −71% |
+| p95 | 4.442 ms | 2.080 ms | 0.837 ms | −81% |
+| max | 9.997 ms | 3.984 ms | 2.132 ms | −79% |
+| µs/ship | 1.49 | 0.79 | 0.44 | −70% |
+| Wall | 575 ms | 320 ms | 192 ms | −67% |
+
+**Tradeoff.** Dijkstra returns an optimal-cost path that can break
+ties differently than live A*. `bench_trade` telemetry shifted ~1%
+on France (crown_revenue +6%) and ~0.4% on Netherlands (silver
++0.4%); Spain/England/Free numbers, the "24 ships in red" verdict,
+and the inactive-port list were unchanged. Total cost preserved.
+Accepted because the magnitude is below the noise floor of the
+calibration bench and the perf win is large.
+
+**Bidirectional A* (Phase 7-B) — failed alternative.** Implemented
+side-by-side as a comparison: two simultaneous A* frontiers with
+front-to-front termination. Result was a **regression vs Phase 6**
+(avg 0.638 ms / p95 4.04 ms / max 7.16 ms). The navmesh has very
+high local connectivity (avg degree 35) and the Euclidean heuristic
+is already tight, so forward A* prunes aggressively — the 2×
+frontier maintenance + termination check cost dwarfed the
+expansion savings. SSSP beats bidirectional ~3× head-to-head on
+this graph; the lesson is "theoretical 2-4× speedup of
+bidirectional A* doesn't survive when the forward search is
+already cheap".
+
+**Deferred.** Phase 3 (cohort scheduling), Phase 4 (OD matrices),
+Phase 8 (SIMD) all stand to gain from the now-much-cheaper pathing
+baseline. Cohort scheduling in particular is no longer obviously
+worth it — the spike cost is gone — and may be revisited only if
+profiling identifies a new hotspot.
+
+---
+
+## 2025 — Perf Phase 8: Boundary-only path smoothing
+
+**Context.** After Phases 6 (A* scratch) and 7 (SSSP cache), a
+samply profile of `bench_trade` showed `LandMap::corridor_is_clear`
+at **7.7 % self** time and `smooth_path` at **7.3 % inclusive** —
+the largest per-tick line item. The SSSP cache had made route
+*finding* free, but every voyage still ran the full LOS smoother
+over the resulting `[start, mesh_node_0..N, terminal]` list,
+issuing ~N `corridor_is_clear` calls of growing length.
+
+**Insight.** The navmesh is built with `EDGE_MARGIN_NM = 0` line-
+of-sight checks between every connected node pair, so consecutive
+mesh nodes in any route are valid by construction. The only LOS
+work of *practical* value during smoothing is collapsing leading
+mesh nodes that `start` (a non-mesh point — typically a ship's
+current position) can see past, and trailing mesh nodes that
+`terminal` (the harbor anchor) can be reached from. Interior
+mesh-to-mesh collapses save a handful of waypoints per voyage but
+cost O(N) LOS calls to discover.
+
+**Change.** New `smooth_boundaries()` in `pathfind.rs`: only
+smooths the prefix (start → first kept interior node) and suffix
+(last kept interior node → terminal). Interior is preserved
+verbatim. LOS work bounded by `prefix_len + suffix_len`, each call
+itself bounded by `ENTRY_RADIUS_NM = 200 NM`. The single boundary
+LOS check at the top of `find_path_to_harbor` is unchanged.
+
+**Knock-on.** Unsmoothed interiors blow past the old
+`MAX_WAYPOINTS = 64` cap (long Caribbean ↔ Europe routes hit the
+low hundreds). Bumped to **512** — inline `ArrayVec` cost is ~4 KB
+per ship × 500 ships = 2 MB, fine. The old cap was based on the
+full smoother's measured max of 37; the new doc-comment makes the
+relationship explicit.
+
+**Results (vs Phase 7 baseline).**
+| Metric          | Phase 7 | Phase 8 | Δ      |
+| --------------- | ------- | ------- | ------ |
+| AI tick avg     | 0.243 ms | 0.171 ms | **−30 %** |
+| AI tick p95     | 0.769 ms | 0.323 ms | **−58 %** |
+| AI tick max     | 10.28 ms | 1.48 ms  | **−86 %** |
+
+**Telemetry.** `bench_trade` numbers within calibration noise:
+England crown +0.2 %, France −2 %, Netherlands +19 % (this metric
+has known high run-to-run variance), bankruptcy count unchanged
+(23 ↔ 23), inactive-port list unchanged. No new ships in the red.
+
+**Why the max dropped 86 %.** Spike ticks were dominated by many
+ships replanning the same hour, each running the full smoother
+across long routes. With LOS work now constant-ish per voyage
+(bounded by the boundary leg lengths, not the route length), the
+worst-case tick cost collapses.
+
+**Profiling infrastructure.** Added `[profile.profiling]` to
+`Cargo.toml` (inherits release, adds `debug = "line-tables-only"`,
+`strip = "none"`) so future perf investigations can reproduce
+today's samply runs with `cargo build --profile=profiling
+-p sim-core --example bench_trade`.
+
+**Deferred.** SIMD/coarse-reject on `corridor_is_clear` itself
+(still the leaf hotspot but now called far less often), behavior-
+tree internals (~12.6 % inclusive, distributed across many
+actions), and persisting the SSSP cache to disk to amortize the
+~1 s `World::load` cost.

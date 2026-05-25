@@ -444,6 +444,7 @@ impl ShipAI {
             markets: inputs.markets,
             goods: inputs.goods,
             policy: inputs.policy,
+            port_telemetry: inputs.port_telemetry,
             commands: inputs.commands,
             snapshots: inputs.snapshots,
             spatial: inputs.spatial,
@@ -486,6 +487,11 @@ pub struct ShipTickInputs<'a> {
     /// to filter destinations and goods and to compute post-duty
     /// effective prices for arbitrage scoring.
     pub policy: &'a crate::policy::PolicyResolver,
+    /// Read-only per-port telemetry. Used by `act_sail` at the
+    /// docking transition to bump `dockings_by_flag[ship.faction]`
+    /// via the atomic counter. Other fields (production, duties)
+    /// are written only in the serial clearing phase.
+    pub port_telemetry: &'a [crate::telemetry::PortTelemetry],
     /// Output buffer for `ShipCommand`s emitted this tick. Owned by the
     /// world and drained by the Resolution Phase.
     pub commands: &'a mut Vec<(ShipId, ShipCommand)>,
@@ -573,6 +579,7 @@ pub struct ShipBtContext<'a> {
     markets: &'a [PortMarket],
     goods: &'a GoodsRegistry,
     policy: &'a crate::policy::PolicyResolver,
+    port_telemetry: &'a [crate::telemetry::PortTelemetry],
     commands: &'a mut Vec<(ShipId, ShipCommand)>,
     snapshots: &'a SecondaryMap<ShipId, ShipSnapshot>,
     spatial: &'a SpatialHash,
@@ -690,6 +697,11 @@ impl<'a> ShipBtContext<'a> {
             self.ship.dock();
             self.ship.dock_action = DockAction::Idle;
             self.ship.nav.docked_at_port = port_idx;
+            if let Some(idx) = port_idx {
+                if let Some(t) = self.port_telemetry.get(idx) {
+                    t.record_docking(self.ship.faction);
+                }
+            }
             self.goal.destination = None;
             self.goal.dest_port = None;
             self.ship.nav.clear_path();

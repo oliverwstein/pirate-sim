@@ -85,6 +85,9 @@ fn tick_ai(ai: &mut ShipAI, ship: &mut Ship, stats: &ShipStats, wind: &WindVecto
     let me = dummy_id();
     {
         let policy = sim_core::policy::PolicyResolver::from_factions(ports);
+        let port_telemetry: Vec<sim_core::telemetry::PortTelemetry> = (0..ports.len())
+            .map(|_| sim_core::telemetry::PortTelemetry::default())
+            .collect();
         let mut inputs = ShipTickInputs {
             me,
             ship,
@@ -96,6 +99,7 @@ fn tick_ai(ai: &mut ShipAI, ship: &mut Ship, stats: &ShipStats, wind: &WindVecto
             markets: &mut markets,
             goods: &goods,
             policy: &policy,
+            port_telemetry: &port_telemetry,
             commands: &mut commands,
             day_of_year: 0,
             snapshots: &snapshots,
@@ -126,6 +130,9 @@ fn tick_ai_with_markets(
     let me = dummy_id();
     {
         let policy = sim_core::policy::PolicyResolver::from_factions(ports);
+        let port_telemetry: Vec<sim_core::telemetry::PortTelemetry> = (0..ports.len())
+            .map(|_| sim_core::telemetry::PortTelemetry::default())
+            .collect();
         let mut inputs = ShipTickInputs {
             me,
             ship,
@@ -137,6 +144,7 @@ fn tick_ai_with_markets(
             markets,
             goods,
             policy: &policy,
+            port_telemetry: &port_telemetry,
             commands: &mut commands,
             day_of_year: 0,
             snapshots: &snapshots,
@@ -970,6 +978,9 @@ fn tick_ai_with_snapshots(
     let mut commands: Vec<(ShipId, ShipCommand)> = Vec::new();
     {
         let policy = sim_core::policy::PolicyResolver::from_factions(ports);
+        let port_telemetry: Vec<sim_core::telemetry::PortTelemetry> = (0..ports.len())
+            .map(|_| sim_core::telemetry::PortTelemetry::default())
+            .collect();
         let mut inputs = ShipTickInputs {
             me,
             ship,
@@ -981,6 +992,7 @@ fn tick_ai_with_snapshots(
             markets: &mut markets,
             goods: &goods,
             policy: &policy,
+            port_telemetry: &port_telemetry,
             commands: &mut commands,
             day_of_year: 0,
             snapshots,

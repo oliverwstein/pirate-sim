@@ -38,6 +38,7 @@
 //!   - Run A* on the navmesh graph.
 //!   - Return waypoint positions plus the harbor anchor at the end.
 
+use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
 
@@ -324,10 +325,19 @@ impl Navmesh {
 
     /// A* over the graph from `start_set` to `goal_set`, returning the
     /// node index sequence (inclusive). Cost = sum of edge `dist_nm`.
+    ///
+    /// Perf phase 6: uses thread-local `RouteScratch` so the working
+    /// state (`g_score`, `came_from`, `in_goal`, `open`) is allocated
+    /// once per Rayon worker and reset via a `touched` list between
+    /// calls — no per-route HashMap/HashSet allocation. Algorithmic
+    /// behavior (expansion order, tiebreaks via `BinaryHeap`) is
+    /// preserved bit-for-bit relative to the original HashMap-backed
+    /// implementation.
     pub fn route(&self, start_set: &[u32], goal_set: &[u32]) -> Option<Vec<u32>> {
         if start_set.is_empty() || goal_set.is_empty() {
             return None;
         }
+        let n_nodes = self.nodes.len();
         let goal_pos: Vec<Position> = goal_set
             .iter()
             .map(|&g| self.nodes[g as usize].pos)
@@ -339,59 +349,131 @@ impl Navmesh {
                 .map(|gp| p.distance(*gp))
                 .fold(f32::INFINITY, f32::min)
         };
-        let goal_lookup: std::collections::HashSet<u32> = goal_set.iter().copied().collect();
 
-        #[derive(Copy, Clone, PartialEq)]
-        struct N {
-            f: f32,
-            idx: u32,
-        }
-        impl Eq for N {}
-        impl Ord for N {
-            fn cmp(&self, other: &Self) -> Ordering {
-                other.f.partial_cmp(&self.f).unwrap_or(Ordering::Equal)
-            }
-        }
-        impl PartialOrd for N {
-            fn partial_cmp(&self, o: &Self) -> Option<Ordering> {
-                Some(self.cmp(o))
-            }
-        }
+        ROUTE_SCRATCH.with(|cell| {
+            let mut scratch = cell.borrow_mut();
+            scratch.reset_and_size(n_nodes);
 
-        let mut g_score: HashMap<u32, f32> = HashMap::new();
-        let mut came_from: HashMap<u32, u32> = HashMap::new();
-        let mut open: BinaryHeap<N> = BinaryHeap::new();
-        for &s in start_set {
-            g_score.insert(s, 0.0);
-            open.push(N { f: h(s), idx: s });
-        }
-
-        while let Some(N { idx: cur, .. }) = open.pop() {
-            if goal_lookup.contains(&cur) {
-                let mut path = vec![cur];
-                let mut c = cur;
-                while let Some(&p) = came_from.get(&c) {
-                    path.push(p);
-                    c = p;
-                }
-                path.reverse();
-                return Some(path);
-            }
-            let cur_g = *g_score.get(&cur).unwrap_or(&f32::INFINITY);
-            for e in &self.adj[cur as usize] {
-                let tentative = cur_g + e.dist_nm;
-                let prev = g_score.get(&e.to).copied().unwrap_or(f32::INFINITY);
-                if tentative < prev {
-                    g_score.insert(e.to, tentative);
-                    came_from.insert(e.to, cur);
-                    open.push(N {
-                        f: tentative + h(e.to),
-                        idx: e.to,
-                    });
+            for &g in goal_set {
+                let idx = g as usize;
+                if !scratch.in_goal[idx] {
+                    scratch.in_goal[idx] = true;
+                    scratch.touched_goals.push(g);
                 }
             }
+
+            for &s in start_set {
+                let idx = s as usize;
+                if scratch.g_score[idx] == f32::INFINITY {
+                    scratch.touched.push(s);
+                }
+                scratch.g_score[idx] = 0.0;
+                scratch.open.push(N { f: h(s), idx: s });
+            }
+
+            while let Some(N { idx: cur, .. }) = scratch.open.pop() {
+                let cur_us = cur as usize;
+                if scratch.in_goal[cur_us] {
+                    let mut path = vec![cur];
+                    let mut c = cur;
+                    loop {
+                        let p = scratch.came_from[c as usize];
+                        if p == u32::MAX {
+                            break;
+                        }
+                        path.push(p);
+                        c = p;
+                    }
+                    path.reverse();
+                    return Some(path);
+                }
+                let cur_g = scratch.g_score[cur_us];
+                for e in &self.adj[cur_us] {
+                    let tentative = cur_g + e.dist_nm;
+                    let to_us = e.to as usize;
+                    let prev = scratch.g_score[to_us];
+                    if tentative < prev {
+                        if prev == f32::INFINITY {
+                            scratch.touched.push(e.to);
+                        }
+                        scratch.g_score[to_us] = tentative;
+                        scratch.came_from[to_us] = cur;
+                        scratch.open.push(N {
+                            f: tentative + h(e.to),
+                            idx: e.to,
+                        });
+                    }
+                }
+            }
+            None
+        })
+    }
+}
+
+/// Per-thread A* scratch storage. Allocated lazily on first use per
+/// Rayon worker, then grown to `nodes.len()` on first call. Between
+/// calls, only the indices in `touched` / `touched_goals` are reset,
+/// so per-call cost is proportional to the number of expanded nodes
+/// rather than `nodes.len()`.
+struct RouteScratch {
+    g_score: Vec<f32>,
+    came_from: Vec<u32>,
+    in_goal: Vec<bool>,
+    open: BinaryHeap<N>,
+    touched: Vec<u32>,
+    touched_goals: Vec<u32>,
+}
+
+impl RouteScratch {
+    fn new() -> Self {
+        Self {
+            g_score: Vec::new(),
+            came_from: Vec::new(),
+            in_goal: Vec::new(),
+            open: BinaryHeap::new(),
+            touched: Vec::new(),
+            touched_goals: Vec::new(),
         }
-        None
+    }
+
+    fn reset_and_size(&mut self, n_nodes: usize) {
+        if self.g_score.len() < n_nodes {
+            self.g_score.resize(n_nodes, f32::INFINITY);
+            self.came_from.resize(n_nodes, u32::MAX);
+            self.in_goal.resize(n_nodes, false);
+        }
+        for &i in &self.touched {
+            let idx = i as usize;
+            self.g_score[idx] = f32::INFINITY;
+            self.came_from[idx] = u32::MAX;
+        }
+        self.touched.clear();
+        for &i in &self.touched_goals {
+            self.in_goal[i as usize] = false;
+        }
+        self.touched_goals.clear();
+        self.open.clear();
+    }
+}
+
+thread_local! {
+    static ROUTE_SCRATCH: RefCell<RouteScratch> = RefCell::new(RouteScratch::new());
+}
+
+#[derive(Copy, Clone, PartialEq)]
+struct N {
+    f: f32,
+    idx: u32,
+}
+impl Eq for N {}
+impl Ord for N {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other.f.partial_cmp(&self.f).unwrap_or(Ordering::Equal)
+    }
+}
+impl PartialOrd for N {
+    fn partial_cmp(&self, o: &Self) -> Option<Ordering> {
+        Some(self.cmp(o))
     }
 }
 

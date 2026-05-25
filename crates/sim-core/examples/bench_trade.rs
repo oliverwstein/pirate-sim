@@ -672,4 +672,83 @@ fn main() {
     } else {
         println!("  ✓ every ship in the black with healthy variance");
     }
+
+    // ── Per-faction telemetry ──────────────────────────────────────
+    //
+    // Reads `world.faction_telemetry` directly. Crown revenue is the
+    // cumulative duty wedge collected at the faction's ports across
+    // the run (distinct from the live `crown_silver` per port, which
+    // bleeds back into the local treasury monthly). Silver-returned-
+    // home is `pay × tons` for every Silver-good sale a flag-X ship
+    // made at a port of faction X. Ships built / lost are integer
+    // counts updated at the launch / cleanup sites respectively.
+    println!();
+    println!("Per-faction telemetry (cumulative over run):");
+    println!(
+        "  {:<12} {:>14} {:>18} {:>10} {:>10}",
+        "faction", "crown_revenue", "silver_returned", "built", "lost"
+    );
+    for &f in &[
+        Faction::Spain,
+        Faction::England,
+        Faction::France,
+        Faction::Netherlands,
+        Faction::Free,
+    ] {
+        let t = &world.faction_telemetry[f as usize];
+        let name = match f {
+            Faction::Spain => "Spain",
+            Faction::England => "England",
+            Faction::France => "France",
+            Faction::Netherlands => "Netherlands",
+            Faction::Free => "Free",
+        };
+        println!(
+            "  {:<12} {:>14.0} {:>18.0} {:>10} {:>10}",
+            name,
+            t.crown_revenue.as_pesos_f32(),
+            t.silver_returned_home.as_pesos_f32(),
+            t.ships_built,
+            t.ships_lost,
+        );
+    }
+
+    // ── Inactive ports ──────────────────────────────────────────────
+    //
+    // A port with zero `lifetime_production` after a full run has never
+    // successfully cleared a buy-side trade. This is the signal for
+    // policy-stranded production (e.g., Spanish ports closed to foreign
+    // flags whose own merchants never reach them) or for cannibalization
+    // by a more attractive neighbor. Differs from "no docking" — a port
+    // may host docking without any goods clearing (resupply only).
+    let mut inactive: Vec<(&str, [u32; 5])> = Vec::new();
+    for (idx, port) in world.ports.iter().enumerate() {
+        let t = &world.port_telemetry[idx];
+        if !t.lifetime_production.is_positive() {
+            inactive.push((port.name.as_str(), t.dockings_snapshot()));
+        }
+    }
+    if !inactive.is_empty() {
+        println!();
+        println!(
+            "Inactive ports ({} of {} — zero lifetime production):",
+            inactive.len(),
+            world.ports.len()
+        );
+        println!(
+            "  {:<28} {:>5} {:>5} {:>5} {:>5} {:>5}",
+            "port", "ESP", "ENG", "FRA", "NLD", "FREE"
+        );
+        for (name, docks) in &inactive {
+            println!(
+                "  {:<28} {:>5} {:>5} {:>5} {:>5} {:>5}",
+                name,
+                docks[Faction::Spain as usize],
+                docks[Faction::England as usize],
+                docks[Faction::France as usize],
+                docks[Faction::Netherlands as usize],
+                docks[Faction::Free as usize],
+            );
+        }
+    }
 }
