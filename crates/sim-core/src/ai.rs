@@ -323,6 +323,26 @@ pub struct ShipAI {
     /// actual displacement (plus accumulating DR noise). `None` on the
     /// first tick — initialized on next iteration.
     prev_truth: Option<Position>,
+    /// Per-ship diagnostic counters. Each counter is bumped at a
+    /// specific call site so a bench can attribute path/destination
+    /// churn to one of the routing pathways. Read-only outside `ai.rs`.
+    pub diag: AiDiag,
+}
+
+/// Diagnostic counters surfaced to benches (no behavioral effect).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct AiDiag {
+    /// `assign_destination_port` calls. Expected: bumps when the ship
+    /// docks and the trade planner picks a new target, or on
+    /// `act_divert_to_port`. Should NOT bump mid-voyage otherwise.
+    pub destination_changes: u32,
+    /// Path re-plans from the waypoint-exhausted branch in `act_sail`.
+    pub path_replans_exhausted: u32,
+    /// Path re-plans from the LOS / corridor-blocked branch in
+    /// `act_sail` (path-stale safety net for ships drifting near land).
+    pub path_replans_los: u32,
+    /// Successful `act_divert_to_port` events.
+    pub divert_events: u32,
 }
 
 impl Default for ShipAI {
@@ -340,6 +360,7 @@ impl ShipAI {
             rng: SimRng::new(12345),
             nav_rng: SimRng::new(0x9E3779B97F4A7C15),
             prev_truth: None,
+            diag: AiDiag::default(),
         }
     }
 
@@ -351,6 +372,7 @@ impl ShipAI {
             rng: SimRng::new(12345),
             nav_rng: SimRng::new(0x9E3779B97F4A7C15),
             prev_truth: None,
+            diag: AiDiag::default(),
         }
     }
 
@@ -366,6 +388,7 @@ impl ShipAI {
             rng: SimRng::new(seed),
             nav_rng: SimRng::new(seed ^ 0x9E3779B97F4A7C15),
             prev_truth: None,
+            diag: AiDiag::default(),
         }
     }
 
@@ -448,6 +471,7 @@ impl ShipAI {
             commands: inputs.commands,
             snapshots: inputs.snapshots,
             spatial: inputs.spatial,
+            diag: &mut self.diag,
         };
 
         let status = bt::tick(&self.tree, &mut self.state, &mut ctx, 0);
@@ -583,6 +607,7 @@ pub struct ShipBtContext<'a> {
     commands: &'a mut Vec<(ShipId, ShipCommand)>,
     snapshots: &'a SecondaryMap<ShipId, ShipSnapshot>,
     spatial: &'a SpatialHash,
+    diag: &'a mut AiDiag,
 }
 
 impl<'a> ShipBtContext<'a> {
@@ -601,6 +626,7 @@ impl<'a> ShipBtContext<'a> {
     /// zone. The destination is recorded even if planning fails — the ship
     /// then falls back to straight-line nav with reactive deflection.
     fn assign_destination_port(&mut self, port_index: usize) {
+        self.diag.destination_changes = self.diag.destination_changes.saturating_add(1);
         let port = &self.ports[port_index];
         self.goal.destination = Some(port.position);
         self.goal.dest_port = Some(port_index);
@@ -761,6 +787,8 @@ impl<'a> ShipBtContext<'a> {
             if let Some(dest) = self.goal.destination {
                 if self.estimated_position().distance(dest) > REPLAN_DISTANCE_NM {
                     if let Some(idx) = self.goal.dest_port {
+                        self.diag.path_replans_exhausted =
+                            self.diag.path_replans_exhausted.saturating_add(1);
                         self.replan_to_port(idx);
                     }
                 }
@@ -772,31 +800,35 @@ impl<'a> ShipBtContext<'a> {
         let pos_truth = self.ship.position;
 
         // Path-stale check: if land has come between the ship's actual
-        // position and its next target (waypoint or destination), the
-        // remaining path is invalid — `compute_steering` will sail us
-        // straight into the coast. Replan from truth. This covers the
-        // common failure mode where wind/tacking drifts the ship a few
-        // NM off the planned corridor near a small harbor and the next
-        // waypoint is no longer reachable in a straight line.
-        if let (Some(pf), Some(_)) = (self.pathfind, self.goal.destination) {
-            let next_target = self
-                .ship
-                .nav
-                .waypoints
-                .first()
-                .copied()
-                .or(self.goal.destination);
-            if let Some(target) = next_target {
-                if !pf.land.corridor_is_clear(pos_truth, target, 2.0) {
-                    if let Some(idx) = self.goal.dest_port {
-                        self.replan_to_port(idx);
-                    } else if let Some(dest) = self.goal.destination {
-                        if let Some(path) = pathfind::find_path(pf, pos_truth, dest) {
-                            if let Some(last) = path.last().copied() {
-                                self.goal.destination = Some(last);
-                            }
-                            self.ship.nav.set_path(path);
+        // position and its NEXT INTERMEDIATE waypoint, the remaining
+        // path is invalid — `compute_steering` will sail us straight
+        // into the coast. Replan from truth. This covers the common
+        // failure mode where wind/tacking drifts the ship a few NM
+        // off the planned corridor and the next waypoint is no
+        // longer reachable in a straight line.
+        //
+        // CRITICAL: we deliberately do NOT fall through to checking
+        // the destination when waypoints are empty. Harbors sit on
+        // coastlines, so any non-trivial margin would always trip the
+        // check during final approach.
+        //
+        // Margin of 0.0 → pure straight-line land intersection.
+        // Anything > 0 reintroduces false positives: A* may legitimately
+        // return waypoints within 1–2 NM of a shore (its own clearance
+        // margin is smaller than this check's), so a margin of e.g. 2.0
+        // marks valid paths as "blocked" and re-plans every tick.
+        if let (Some(pf), Some(target)) = (self.pathfind, self.ship.nav.waypoints.first().copied())
+        {
+            if !pf.land.corridor_is_clear(pos_truth, target, 0.0) {
+                self.diag.path_replans_los = self.diag.path_replans_los.saturating_add(1);
+                if let Some(idx) = self.goal.dest_port {
+                    self.replan_to_port(idx);
+                } else if let Some(dest) = self.goal.destination {
+                    if let Some(path) = pathfind::find_path(pf, pos_truth, dest) {
+                        if let Some(last) = path.last().copied() {
+                            self.goal.destination = Some(last);
                         }
+                        self.ship.nav.set_path(path);
                     }
                 }
             }
@@ -1271,32 +1303,50 @@ impl<'a> ShipBtContext<'a> {
         // on toward the trade destination and fail gracefully).
         let provisions = crate::goods::ids::PROVISIONS;
         let ship_flag = self.ship.faction;
+
+        // Closure capturing the "is this port a valid resupply target?"
+        // predicate. Used both to confirm the current destination is
+        // still good (idempotency fast-path) and to pick a fresh one.
+        let port_ok = |idx: usize| -> bool {
+            if !matches!(
+                self.policy.dock_legality(idx, ship_flag),
+                crate::policy::DockLegality::Open
+            ) {
+                return false;
+            }
+            if matches!(
+                self.policy.buy_legality(idx, ship_flag, provisions),
+                crate::policy::TradeLegality::Prohibited
+            ) {
+                return false;
+            }
+            self.markets
+                .get(idx)
+                .map(|m| m.available_to_buy(provisions) > 0.5)
+                .unwrap_or(false)
+        };
+
+        // Idempotency: per user design rule "divert = single replan,
+        // beeline to nearest port, no further replanning." If the
+        // captain has already pointed the ship at a valid resupply
+        // port, do nothing — re-running A* every tick (while the
+        // low-provisions condition latches true because we still
+        // can't reach the destination with our remaining biscuit)
+        // produces the observed mid-ocean oscillation as the
+        // nearest-port choice flips between two near-equidistant
+        // harbors. Stick with the original divert and either make
+        // landfall or starve trying.
+        if let Some(cur) = self.goal.dest_port {
+            if port_ok(cur) {
+                return Status::Success;
+            }
+        }
+
         let nearest = self
             .ports
             .iter()
             .enumerate()
-            .filter(|(idx, _)| {
-                // Closed harbors can't save a hungry crew — `act_sail` would
-                // turn us away on arrival. Also require Provisions to be
-                // legally sellable on our flag (a port that prohibits
-                // foreign provisioning is just as useless as a dry one).
-                if !matches!(
-                    self.policy.dock_legality(*idx, ship_flag),
-                    crate::policy::DockLegality::Open
-                ) {
-                    return false;
-                }
-                if matches!(
-                    self.policy.buy_legality(*idx, ship_flag, provisions),
-                    crate::policy::TradeLegality::Prohibited
-                ) {
-                    return false;
-                }
-                self.markets
-                    .get(*idx)
-                    .map(|m| m.available_to_buy(provisions) > 0.5)
-                    .unwrap_or(false)
-            })
+            .filter(|(idx, _)| port_ok(*idx))
             .min_by(|(_, a), (_, b)| {
                 let da = self.estimated_position().distance(a.position);
                 let db = self.estimated_position().distance(b.position);
@@ -1304,6 +1354,7 @@ impl<'a> ShipBtContext<'a> {
             })
             .map(|(idx, _)| idx);
         if let Some(nearest_idx) = nearest {
+            self.diag.divert_events = self.diag.divert_events.saturating_add(1);
             self.assign_destination_port(nearest_idx);
             Status::Success
         } else {

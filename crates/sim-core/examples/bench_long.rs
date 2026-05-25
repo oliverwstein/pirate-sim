@@ -220,6 +220,50 @@ fn main() {
     for (name, docked, treasury) in rows.iter().take(15) {
         println!("{:<28} {:>8} {:>14.0}", name, docked, treasury);
     }
+
+    // ── AI routing diagnostics ──────────────────────────────────────
+    //
+    // Per-ship counters bumped at every destination change / path
+    // replan / divert event. A well-behaved fleet should see few
+    // path replans per ship per simulated year (replans typically
+    // only fire on land collision corrections). Destination changes
+    // bump on every dock-cycle + every divert, so a value of ~1
+    // per ship per dock-cycle is normal.
+    println!();
+    println!("=== AI routing diagnostics (per-ship totals over the run) ===");
+    let mut dest_changes = Vec::with_capacity(world.ships.len());
+    let mut replan_exh = Vec::with_capacity(world.ships.len());
+    let mut replan_los = Vec::with_capacity(world.ships.len());
+    let mut divert_evt = Vec::with_capacity(world.ships.len());
+    for (id, _) in &world.ships {
+        if let Some(ai) = world.ship_ais.get(id) {
+            dest_changes.push(ai.diag.destination_changes);
+            replan_exh.push(ai.diag.path_replans_exhausted);
+            replan_los.push(ai.diag.path_replans_los);
+            divert_evt.push(ai.diag.divert_events);
+        }
+    }
+    fn summary(label: &str, mut v: Vec<u32>) {
+        if v.is_empty() {
+            println!("  {:<28} (no ships)", label);
+            return;
+        }
+        v.sort_unstable();
+        let n = v.len();
+        let sum: u64 = v.iter().map(|x| *x as u64).sum();
+        let mean = sum as f64 / n as f64;
+        let median = v[n / 2];
+        let p90 = v[(n * 9) / 10];
+        let max = *v.last().unwrap();
+        println!(
+            "  {:<28} sum={:>9}  mean={:>8.1}  p50={:>5}  p90={:>5}  max={:>6}",
+            label, sum, mean, median, p90, max
+        );
+    }
+    summary("destination_changes", dest_changes);
+    summary("path_replans_exhausted", replan_exh);
+    summary("path_replans_los", replan_los);
+    summary("divert_events", divert_evt);
 }
 
 fn print_snapshot_header(watch: &[(String, Option<usize>)]) {

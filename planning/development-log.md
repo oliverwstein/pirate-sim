@@ -2289,3 +2289,48 @@ with LOS+Amsterdam fix), with notable Amsterdam port congestion (164
 ships docked there) suggesting the B.1 heuristic balance seeding
 is letting some good's balance pin at a wall. Expected to resolve in
 B.5 (LP-shadow-price seeding).
+
+---
+
+### 2025: AI routing — coast-area replan storm diagnosis + first fixes
+
+**Context:** user observed in-viz that ships "constantly reroute and
+can't decide where to go, sometimes even in open water."
+
+**Instrumentation (kept for future debugging):** new `AiDiag` struct
+on `ShipAI` with 4 u32 counters: `destination_changes`,
+`path_replans_exhausted`, `path_replans_los`, `divert_events`.
+Threaded through `ShipBtContext` as `&mut AiDiag`. `bench_long`
+prints per-counter sum / mean / p50 / p90 / max at end of run.
+
+**Smoking gun:** `path_replans_los` averaged 25k/ship over 10y, max
+87k. Root causes (two compounding bugs):
+
+1. The path-stale LOS check in `act_sail` fell through from
+   `waypoints.first()` to `goal.destination`. Harbors sit on
+   coastlines, so on final approach
+   `corridor_is_clear(pos, harbor, margin=2.0)` always failed
+   → A* thrash every tick.
+2. Margin of 2.0 NM is *stricter* than the navmesh's own clearance,
+   so even legitimately-returned A* waypoints within 1–2 NM of shore
+   tripped the check.
+
+**Fix A:** scope LOS to `waypoints.first()` only (no destination
+fallback), use `margin=0.0` (pure straight-line land intersection).
+
+**Fix B (idempotent divert):** `act_divert_to_port` re-ran every
+tick once `IsLowProvisions` latched true (no destination reachable
+within remaining biscuit). If two ports were near-equidistant the
+choice flip-flopped → mid-ocean oscillation. Fix: at top of
+`act_divert_to_port`, if `goal.dest_port` is already a valid divert
+target (dock-open, provisions buy-legal, market has stock), return
+Success without re-routing. Matches user design rule: "Divert =
+single replan, beeline to nearest port, no further replanning."
+
+**Validation:**
+- 222 tests pass.
+- bench_long: `path_replans_los` median 23373 → 41 (570× reduction).
+  `divert_events` mean 2.1 → 1.1. 8 ports with non-zero docked
+  ships (was 3) at year 10.
+- Tail of stuck ships remains (max LOS replans 87317 for outliers
+  in coves/behind peninsulas). Next plan: "Robust Coast Routing".
