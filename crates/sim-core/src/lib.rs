@@ -21,6 +21,7 @@ pub mod shiptype;
 pub mod shipyard;
 pub mod sim_rng;
 pub mod spatial;
+pub mod telemetry;
 pub mod trade;
 pub mod types;
 pub mod weather;

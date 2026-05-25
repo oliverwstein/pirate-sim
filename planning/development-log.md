@@ -1914,3 +1914,70 @@ The ad-hoc prototype confirmed the shape of these issues but
 needs a more durable home — likely a dedicated stats / metrics
 crate, or an exporter step on `World` that emits a structured
 report at end-of-run.
+
+---
+
+## Per-entity telemetry: faction + port aggregates (interim observability)
+
+**Context.** The faction-policy bench surfaced two structural questions
+the bench couldn't easily answer: per-faction crown revenue and
+which ports were running zero trade volume. The ad-hoc prototype that
+answered these was reverted (notes above). The full event-journal
+design was written up in `planning/observability-plan.md` but deferred
+— it's a cross-cutting refactor and the data we want for the next
+calibration round is narrower than that.
+
+**Decision.** Add small, monotonic aggregates directly on the entities
+that already exist: a `Vec<PortTelemetry>` parallel to `World::ports`,
+and a `[FactionTelemetry; 5]` array on `World`. New module
+`crates/sim-core/src/telemetry.rs`.
+
+Fields (chosen with user; deliberately minimal):
+
+- **Faction**: `crown_revenue` (cumulative duty wedge), `silver_returned_home`
+  (cumulative `MarketDeposit` dividend payments by ships of this flag
+  to their home port — i.e., trade profits remitted to the metropole),
+  `ships_built`, `ships_lost`.
+- **Port**: `lifetime_duties` (per-port duty wedge), `lifetime_production`
+  (base value of all tons the port has sold), `lifetime_production_by_good`
+  (sparse, sorted map), `dockings_by_flag: [AtomicU32; 5]`.
+
+`dockings_by_flag` is `AtomicU32` because the dock transition happens
+in the parallel AI phase (`ai::act_sail`) where ports are only
+borrowed immutably; everything else is mutated in serial phases
+(clearing, shipyard, cleanup) under `&mut self`. Counts are
+commutative so Relaxed ordering preserves determinism.
+
+**Explicitly not added.** Ship-level fields (`lifetime_profit`,
+`voyages_completed`, `times_refit`) were considered but skipped: the
+existing `silver`, `starting_silver`, `lifetime_dividends`,
+`lifetime_dock_count` give the same P/L story without new state.
+
+**Update sites (5 total).**
+- `world::clear_one_good` (end of fn): credits `lifetime_duties`,
+  `lifetime_production[_by_good]`, and `crown_revenue` (port's faction).
+- `world::clear_port` `MarketDeposit` arm: credits
+  `silver_returned_home[ship.faction]` alongside `lifetime_dividends`
+  — captures dividend remittance at home-port docking.
+- `world::run_shipyard` (post-Built): `faction_telemetry[ship.faction].ships_built`.
+- `world::cleanup` (pre-remove): `faction_telemetry[ship.faction].ships_lost`.
+- `ai::act_sail` dock site: `port_telemetry[idx].record_docking(ship.faction)`.
+- New `port_telemetry` field threaded through `ShipTickInputs` →
+  `ShipBtContext`.
+
+**Bench output.** `bench_trade` ends with a "Per-faction telemetry"
+table and an "Inactive ports" list. First run reproduces the earlier
+findings: England 1954 / Netherlands 805 / France 132 / Spain 2 pesos
+crown revenue; 7 inactive ports including Portobelo, Santiago de Cuba,
+Cadiz, Nantes; silver_returned_home zero across all factions over
+60 days (longer runs will exercise this).
+
+**Migration path to full event system.** When the per-entity numbers
+stop being enough — typically when we want chronological queries
+("when did Petit-Goâve start cannibalizing the other French ports?")
+or per-good per-flag matrices that can't be precomputed — return to
+`planning/observability-plan.md` and implement the SoA event journals
++ SQLite export. The current telemetry fields are forward-compatible:
+they remain useful as cached aggregates even when events are added,
+and the update sites are the same locations where events would be
+emitted.

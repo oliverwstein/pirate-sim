@@ -50,6 +50,14 @@ pub struct World {
     pub ship_types: ShipTypeRegistry,
     /// Per-port economic state, parallel to `ports` (index = port index).
     pub markets: Vec<PortMarket>,
+    /// Per-entity observability aggregates: one entry per port,
+    /// indexed by port_idx. Mutated as a byproduct of clearing
+    /// and docking; never read by sim logic. See `telemetry.rs`
+    /// and `planning/observability-plan.md`.
+    pub port_telemetry: Vec<crate::telemetry::PortTelemetry>,
+    /// Per-faction observability aggregates: fixed-size array
+    /// indexed by `Faction as usize`. See `telemetry.rs`.
+    pub faction_telemetry: [crate::telemetry::FactionTelemetry; crate::telemetry::N_FACTIONS],
     /// Faction trade-policy table: per-port docking permission, per-good
     /// legality, and ad-valorem duties as a function of the visiting
     /// ship's flag. Constructed at load time from `faction_defaults()`
@@ -166,6 +174,9 @@ impl World {
                 PortMarket::with_recipe(&goods, archetype.recipe())
             })
             .collect();
+        let port_telemetry: Vec<crate::telemetry::PortTelemetry> = (0..ports.len())
+            .map(|_| crate::telemetry::PortTelemetry::default())
+            .collect();
         // Faction trade policy: load bundled per-port overrides (if
         // the file is missing, every port falls back to its faction
         // default). Unknown port names in the overrides are a fatal
@@ -194,6 +205,8 @@ impl World {
             goods,
             ship_types,
             markets,
+            port_telemetry,
+            faction_telemetry: Default::default(),
             policy,
             demographics,
             ships: SlotMap::with_key(),
@@ -460,6 +473,7 @@ impl World {
         }
         for (ship, ai) in newly_built {
             self.ships_built += 1;
+            self.faction_telemetry[ship.faction as usize].ships_built += 1;
             self.add_ship(ship, ai);
         }
 
@@ -752,6 +766,7 @@ impl World {
         let markets = &self.markets;
         let goods = &self.goods;
         let policy_ref = &self.policy;
+        let port_telemetry_ref = &self.port_telemetry[..];
         let snapshots_ref = &snapshots;
         let spatial_ref = &self.spatial;
         let pathfind_ref = &pathfind;
@@ -778,6 +793,7 @@ impl World {
                         markets,
                         goods,
                         policy: policy_ref,
+                        port_telemetry: port_telemetry_ref,
                         commands: &mut local_commands,
                         day_of_year,
                         snapshots: snapshots_ref,
@@ -1151,6 +1167,9 @@ impl World {
             })
             .collect();
         for id in sunk {
+            if let Some(s) = self.ships.get(id) {
+                self.faction_telemetry[s.faction as usize].ships_lost += 1;
+            }
             self.ships.remove(id);
             self.ship_ais.remove(id);
             self.silver_at_month_start.remove(id);
@@ -1251,6 +1270,12 @@ impl World {
                         ship.silver -= pay;
                         market.silver += pay;
                         ship.lifetime_dividends += pay;
+                        // Telemetry: trade profits remitted to a
+                        // home-port treasury. Disjoint-field borrow
+                        // OK — `self.ships` / `self.markets` borrows
+                        // are unrelated to `self.faction_telemetry`.
+                        let f = ship.faction as usize;
+                        self.faction_telemetry[f].silver_returned_home += pay;
                     }
                 }
                 ShipCommand::MarketDrawOutfit { target_silver, .. } => {
@@ -1505,6 +1530,7 @@ impl World {
         // ── Apply asks to ships (pro-rata payouts, duty-aware) ──
         let mut total_sold_tons = 0.0_f32;
         let mut total_sell_duty_pesos = crate::money::Pesos::ZERO;
+        let port_faction = self.ports[port_idx].faction;
         for (a, sell_duty) in &crossing_asks {
             let ship = match self.ships.get_mut(a.ship_id) {
                 Some(s) => s,
@@ -1547,6 +1573,24 @@ impl World {
                 market.debt.add(good, from_hinterland);
             }
         }
+
+        // ── Telemetry: port + faction aggregates ───────────────────
+        //
+        // Production = base-currency value the port sold this clear
+        // (buyers paid `total_buy_tons × p_buy` into the treasury).
+        // Duties = total wedge routed to crown_silver this clear.
+        // Crown revenue + silver-home credits roll up to the port's
+        // faction. All commutative additions: order across goods /
+        // calls doesn't change the final value.
+        let total_duty = total_buy_duty_pesos + total_sell_duty_pesos;
+        let production = crate::money::Pesos::from_pesos_f32(total_buy_tons.max(0.0) * p_buy);
+        let port_tel = &mut self.port_telemetry[port_idx];
+        port_tel.lifetime_duties += total_duty;
+        if production.is_positive() {
+            port_tel.add_production(good, production);
+        }
+        let faction_tel = &mut self.faction_telemetry[port_faction as usize];
+        faction_tel.crown_revenue += total_duty;
     }
 
     fn run_sub_tick_combat(&mut self, engagements: &[(ShipId, ShipId)]) {
