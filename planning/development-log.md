@@ -2251,3 +2251,41 @@ plus data.
 provisions/manufactures distinct from recipe inputs) — omitted for
 v1 since the bounded-balance model makes ships self-regulating
 without it; revisit as a separate hinterland-demand concept.
+
+---
+
+### 2025: Market redesign — Phase B.3 (auction switchover)
+
+**Change:** `world.rs::clear_one_good` rewritten to use the
+`market_clearer::clear` fixed-point auction. Price discovery now reads
+`market.balance` + `market.effective_bound(good)` via the asymmetric
+curve from `market_curve.rs`; the old `buy_price_at`/`sell_price_at`
+path is dead. `market.stockpile` / `market.debt` continue to be
+shadow-updated by the auction so existing telemetry keeps working
+unchanged until Phase B.4 strips them.
+
+**Algorithm:**
+1. Faction-policy filter (unchanged): drop prohibited intents,
+   compute `(buy_duty, sell_duty)` per ship.
+2. Translate bid/ask limits into base-currency limits the clearer
+   understands: `max_base = limit / (1 + buy_duty)` for bids,
+   `min_base = limit / (1 - sell_duty)` for asks.
+3. Call `market_clearer::clear` → `(clearing_price, new_balance, fills)`.
+4. Pre-pass: cap each fill by ship cargo / silver to compute the
+   *actual* `total_sell_base` and `total_buy_base` → derive
+   `payout_ratio` from real settling tons (not the clearer's gross
+   request). This was a real bug caught by code review.
+5. Apply pass: charge / pay each ship at base ± duty wedge, accrue
+   crown_silver, update market.balance, shadow-update stockpile/debt.
+
+**Determinism:** all per-ship state lives in `BTreeMap<u32, _>`; fills
+are sorted by `ship_id` before apply. ShipId → u32 via
+`data().as_ffi() as u32` (slot index; unique among live ships).
+
+**Validation:** 232 tests pass, clippy clean. bench_trade 60d: Fleet
+P/L +913342 / 0 bankrupt / 232k outstanding debt (identical to
+pre-switchover). bench_long 10y: 446 ships alive (vs 375 baseline
+with LOS+Amsterdam fix), with notable Amsterdam port congestion (164
+ships docked there) suggesting the B.1 heuristic balance seeding
+is letting some good's balance pin at a wall. Expected to resolve in
+B.5 (LP-shadow-price seeding).
