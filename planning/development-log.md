@@ -1873,3 +1873,44 @@ port; Charleston quietly tolerating Dutch shippers at 5%.
 3. Smuggling: the `TradeLegality` enum has the variant shape
    ready; needs a `Smuggling { detection_base, bribe_floor }`
    case plus a captain risk-appetite policy.
+
+### Note — emergent findings to revisit with proper observability
+
+While prototyping ad-hoc per-faction P/L and per-port activity
+reports in `bench_trade` (changes reverted — too informal for the
+codebase), two real pathologies surfaced that are worth tracking
+once a proper observability layer exists:
+
+1. **Petit-Goâve cannibalizes own-flag French trade.** The override
+   port (open to all, 5% flat) appears to attract even French-flag
+   captains who would otherwise serve Fort-Royal / Basse-Terre /
+   Cap-Français. The result: three major French sugar islands had
+   zero settled trade volume in a 60-day bench, while Petit-Goâve
+   hummed. Mechanism is likely that Petit-Goâve sees Dutch/English
+   demand driving its sell-prices up, making it a more attractive
+   destination per the planner than the lower-demand strict-French
+   ports.
+
+2. **Spanish ports near-totally inactive even for own-flag ships.**
+   Havana, Santo Domingo, Santiago de Cuba, San Juan, Cartagena,
+   Portobelo all settled essentially zero trade over 60 days
+   despite being legally open to Spanish-flagged captains.
+   Hypothesis: 22% own-flag duty makes any voyage less profitable
+   than alternatives at Dutch (2%) or Free (0%) ports, so Spanish
+   ships rationally trade elsewhere — leaving the Spanish economy
+   running but its Crown commodity revenue near-zero (matches
+   history: Spanish customs receipts were dominated by the silver
+   convoys, not commodity duties).
+
+Neither is a bug in the policy system, but both suggest follow-up
+work once we have:
+- Per-port trade-volume instrumentation (the prototype tracked
+  `lifetime_volume`, `lifetime_duties`).
+- Per-faction P/L and crown-revenue rollups.
+- A view of ship visit counts per port to distinguish "open but
+  unused" from "no route reached this port".
+
+The ad-hoc prototype confirmed the shape of these issues but
+needs a more durable home — likely a dedicated stats / metrics
+crate, or an exporter step on `World` that emits a structured
+report at end-of-run.
