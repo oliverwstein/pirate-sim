@@ -2200,3 +2200,54 @@ because surviving ships kept producing into a market that
 couldn't absorb. Reverted in favor of a deeper redesign of
 the supply/price model (bounded trade balance with smooth
 distance-from-0 pricing — see next entry).
+
+---
+
+## Market Redesign: Bounded Signed Trade Balance (planned)
+*(ai-expansion branch — design only, no code yet)*
+
+**Problem.** The current `Stockpile<good> = tons (≥0)` model has two
+chronic failure modes: (a) ports go dry and ships strand because no
+seller exists at any price, and (b) ports accumulate unbounded surplus
+because ship demand is fixed by routes, not by price signals. The
+emergency-resupply experiment confirmed that decoupling provisions
+from stockpile keeps ships alive, but goods like Manufactures still
+pile up (28k→80k tons over 10 sim-years) because demand never bites
+back.
+
+**New model.** Each port × good has a signed integer `balance` in
+`[-bound, +bound]`. Production adds, consumption/sales subtract. Bound
+is RON-declared per port × good, scaled by prosperity. Price is an
+asymmetric monotone function of `balance/bound` — shortage spikes
+hard (`α=4, p=2`, up to 5× base at -bound), glut softens (`β=1,
+p=1.5`, floor ~0.3× base at +bound). Ship cargo remains physical;
+only port inventory becomes abstract.
+
+**Auction kept.** Port-tick clearing becomes a 1-D fixed-point
+solve: find clearing price P* such that the post-trade balance
+b₁ = b₀ + ΔQ(P*) satisfies P(b₁) = P*. Monotonicity guarantees
+unique solution; binary search runs in ~20 iters.
+
+**Prosperity feedback (new).** Recipe profitability at current
+balance-driven prices drifts prosperity up/down monthly. Prosperity
+scales bound *and* production/consumption rates, so a port whose
+recipe is profitable grows its market; an unprofitable port shrinks.
+This is the auto-throttle that prevents the Manufactures pile-up.
+
+**Initial seed.** Run Kantorovich LP at world load; invert the price
+curve on each port's per-good shadow price to derive starting balance.
+Sim starts at LP equilibrium → no startup transient.
+
+**Phasing.** (A) additive schema + curve, no behavior change.
+(B) auction rewrite, stockpile removal, LP seed. (C) prosperity
+feedback loop. (D) tuning + sim-viz HUD updates.
+
+**Impact surface.** market.rs, world.rs (clear_port_intents), ai.rs
+profit math, shipyard.rs, equilibrium.rs, all trade.rs tests, full
+ports.ron migration, sim-viz HUD. ~8 substantive files plus tests
+plus data.
+
+**Deferred to later.** Hinterland population consumption (city eats
+provisions/manufactures distinct from recipe inputs) — omitted for
+v1 since the bounded-balance model makes ships self-regulating
+without it; revisit as a separate hinterland-demand concept.
