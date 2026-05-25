@@ -1700,3 +1700,55 @@ dock visits) is the cleanest follow-up.
 
 **Validation.** 192 tests pass; clippy clean; bench_pathfind
 unchanged.
+
+---
+
+## 2026-05-24 — Exploration branch wrap-up: deferred follow-ups
+
+Closing out the `exploration` branch (DOD refactor + Phases 6/7)
+before opening the faction-design branch. The original code-review
+items are all resolved:
+
+- ✅ Cargo as flat `[f32; 16]` (no heap)
+- ✅ NavTrack as `ArrayVec<Position, 64>` (inline)
+- ✅ SpatialHash as flat sorted `Vec` (cache-friendly, deterministic)
+- ✅ Pesos as `i64` centavos (no float drift)
+- ✅ `SimRng` via `rand_pcg` (no hand-rolled xorshift)
+- ⏸️ Mega-context (`ShipBtContext`) — the review said "keep an
+  eye on this," not "fix now." Deferred until faction code
+  actually grows the context further; ECS migration would be the
+  bigger answer.
+
+**Deferred items captured for future branches:**
+
+1. **Patience-based limit walking.** Auction bids/asks currently
+   post at exactly formula price. Walking the limit by
+   `ε = k * ticks_pending` would let stuck ships clear faster
+   without breaking the post-tick clearing-price invariant.
+
+2. **Multi-bidder pro-rata auction unit test.** The auction
+   resolver has a treasury-shortfall pro-rata code path that is
+   only exercised end-to-end via `bench_trade`. Worth a focused
+   `market.rs` test before we add factions that pile more buyers
+   on the same port.
+
+3. **Trade-plan caching.** Phase 7 cost +53% wall time because
+   stochastic destination selection blew up A* cache reuse.
+   Caching the chosen plan for K dock visits (or until target port
+   stock changes meaningfully) should recover most of that.
+
+4. **Per-port auction parallelization.** `clear_markets` is still
+   serial across ports. Per-port auctions are independent — a
+   Rayon `par_iter_mut` over the port list should be safe and is
+   the natural next perf win after the AI tick.
+
+5. **Tobacco / Manufactures price calibration.** Pre-existing
+   ~6000% deviation at Nantes/Ouidah/Elmina/Cadiz for Tobacco and
+   3000% for Cadiz Manufactures. Not a regression — these were
+   already off before the refactor — but they should be fixed in
+   the next calibration pass.
+
+**Final branch state.** `cargo fmt` clean, `cargo clippy
+--workspace --all-targets -D warnings` clean, 192 tests pass,
+bench_trade 14 bankruptcies (baseline 79), bench_pathfind
+1406/1406, bench_ai_tick AI avg 1.23 ms.
