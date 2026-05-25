@@ -17,10 +17,13 @@ use crate::sim_rng::SimRng;
 use crate::types::{Position, ShipId, WindVector};
 
 /// Maximum number of intermediate waypoints a planned path may hold.
-/// Pathfind benchmark (1406 ordered port pairs) tops out at 37; 64 leaves
-/// generous headroom for future routes (e.g. via the Cape of Good Hope)
-/// without paying the per-ship heap allocation a `VecDeque` would.
-pub const MAX_WAYPOINTS: usize = 64;
+/// Pathfind benchmark (1406 ordered port pairs) tops out at 37 with the old
+/// full-interior LOS smoother. The boundary-only smoother used in production
+/// keeps every interior mesh node, which on long routes (e.g. Caribbean to
+/// Europe) routinely reaches the low hundreds. 512 leaves comfortable
+/// headroom for any plausible Caribbean-world route while keeping
+/// `ArrayVec<Position, _>` inline (~4 KB per ship — fine at ~500 ships).
+pub const MAX_WAYPOINTS: usize = 512;
 
 /// A steering command: the heading to set on the ship and the speed it
 /// should make good toward its target this tick (pre-fouling).

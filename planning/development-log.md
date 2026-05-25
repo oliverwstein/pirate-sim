@@ -2084,3 +2084,69 @@ Phase 8 (SIMD) all stand to gain from the now-much-cheaper pathing
 baseline. Cohort scheduling in particular is no longer obviously
 worth it — the spike cost is gone — and may be revisited only if
 profiling identifies a new hotspot.
+
+---
+
+## 2025 — Perf Phase 8: Boundary-only path smoothing
+
+**Context.** After Phases 6 (A* scratch) and 7 (SSSP cache), a
+samply profile of `bench_trade` showed `LandMap::corridor_is_clear`
+at **7.7 % self** time and `smooth_path` at **7.3 % inclusive** —
+the largest per-tick line item. The SSSP cache had made route
+*finding* free, but every voyage still ran the full LOS smoother
+over the resulting `[start, mesh_node_0..N, terminal]` list,
+issuing ~N `corridor_is_clear` calls of growing length.
+
+**Insight.** The navmesh is built with `EDGE_MARGIN_NM = 0` line-
+of-sight checks between every connected node pair, so consecutive
+mesh nodes in any route are valid by construction. The only LOS
+work of *practical* value during smoothing is collapsing leading
+mesh nodes that `start` (a non-mesh point — typically a ship's
+current position) can see past, and trailing mesh nodes that
+`terminal` (the harbor anchor) can be reached from. Interior
+mesh-to-mesh collapses save a handful of waypoints per voyage but
+cost O(N) LOS calls to discover.
+
+**Change.** New `smooth_boundaries()` in `pathfind.rs`: only
+smooths the prefix (start → first kept interior node) and suffix
+(last kept interior node → terminal). Interior is preserved
+verbatim. LOS work bounded by `prefix_len + suffix_len`, each call
+itself bounded by `ENTRY_RADIUS_NM = 200 NM`. The single boundary
+LOS check at the top of `find_path_to_harbor` is unchanged.
+
+**Knock-on.** Unsmoothed interiors blow past the old
+`MAX_WAYPOINTS = 64` cap (long Caribbean ↔ Europe routes hit the
+low hundreds). Bumped to **512** — inline `ArrayVec` cost is ~4 KB
+per ship × 500 ships = 2 MB, fine. The old cap was based on the
+full smoother's measured max of 37; the new doc-comment makes the
+relationship explicit.
+
+**Results (vs Phase 7 baseline).**
+| Metric          | Phase 7 | Phase 8 | Δ      |
+| --------------- | ------- | ------- | ------ |
+| AI tick avg     | 0.243 ms | 0.171 ms | **−30 %** |
+| AI tick p95     | 0.769 ms | 0.323 ms | **−58 %** |
+| AI tick max     | 10.28 ms | 1.48 ms  | **−86 %** |
+
+**Telemetry.** `bench_trade` numbers within calibration noise:
+England crown +0.2 %, France −2 %, Netherlands +19 % (this metric
+has known high run-to-run variance), bankruptcy count unchanged
+(23 ↔ 23), inactive-port list unchanged. No new ships in the red.
+
+**Why the max dropped 86 %.** Spike ticks were dominated by many
+ships replanning the same hour, each running the full smoother
+across long routes. With LOS work now constant-ish per voyage
+(bounded by the boundary leg lengths, not the route length), the
+worst-case tick cost collapses.
+
+**Profiling infrastructure.** Added `[profile.profiling]` to
+`Cargo.toml` (inherits release, adds `debug = "line-tables-only"`,
+`strip = "none"`) so future perf investigations can reproduce
+today's samply runs with `cargo build --profile=profiling
+-p sim-core --example bench_trade`.
+
+**Deferred.** SIMD/coarse-reject on `corridor_is_clear` itself
+(still the leaf hotspot but now called far less often), behavior-
+tree internals (~12.6 % inclusive, distributed across many
+actions), and persisting the SSSP cache to disk to amortize the
+~1 s `World::load` cost.

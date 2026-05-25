@@ -168,7 +168,7 @@ fn navmesh_path_cached(
     }
     points.push(harbor.anchor);
 
-    let smoothed = smooth_path(land, &points);
+    let smoothed = smooth_boundaries(land, &points);
     Some(smoothed.into_iter().skip(1).collect())
 }
 
@@ -216,11 +216,52 @@ fn navmesh_path(
     }
     points.push(terminal);
 
-    let smoothed = smooth_path(land, &points);
+    let smoothed = smooth_boundaries(land, &points);
     Some(smoothed.into_iter().skip(1).collect())
 }
 
-/// Corridor-aware line-of-sight smoothing: keep a waypoint only if removing
+/// Corridor-aware line-of-sight smoothing restricted to the two boundary
+/// legs (`start → first mesh node` and `last mesh node → terminal`).
+///
+/// Interior mesh-to-mesh segments are kept verbatim. Consecutive nodes in
+/// a navmesh route are valid by construction (the mesh is built so its
+/// edges have line-of-sight with the mesh margin), so the only smoothing
+/// of practical value is collapsing leading and trailing nodes that the
+/// non-mesh endpoints can see past. This bounds LOS work to
+/// `prefix_len + suffix_len` calls (each bounded by `ENTRY_RADIUS_NM`)
+/// instead of `~N` calls across the full route.
+fn smooth_boundaries(land: &LandMap, points: &[Position]) -> Vec<Position> {
+    if points.len() <= 3 {
+        return smooth_path(land, points);
+    }
+    let n = points.len();
+
+    // Prefix: advance over leading interior nodes that `start` can see past.
+    // `prefix_end` is the index of the first interior waypoint we keep.
+    let mut prefix_end = 1usize;
+    while prefix_end + 1 < n - 1
+        && land.corridor_is_clear(points[0], points[prefix_end + 1], SMOOTH_MARGIN_NM)
+    {
+        prefix_end += 1;
+    }
+
+    // Suffix: walk `terminal` back over trailing interior nodes.
+    // `suffix_start` is the index of the last interior waypoint we keep.
+    let mut suffix_start = n - 2;
+    while suffix_start > prefix_end
+        && land.corridor_is_clear(points[suffix_start - 1], points[n - 1], SMOOTH_MARGIN_NM)
+    {
+        suffix_start -= 1;
+    }
+
+    let mut out = Vec::with_capacity(suffix_start - prefix_end + 3);
+    out.push(points[0]);
+    out.extend_from_slice(&points[prefix_end..=suffix_start]);
+    out.push(points[n - 1]);
+    out
+}
+
+/// Plan a path through the navmesh from `start` to any of the goal anchors,
 /// it would force a path through (or too close to) land. Walks forward
 /// greedily, jumping as far as the corridor with `SMOOTH_MARGIN_NM` clearance
 /// allows.

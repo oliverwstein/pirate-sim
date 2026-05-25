@@ -10,3 +10,11 @@ resolver = "2"
 [profile.release]
 lto = "fat"
 codegen-units = 1
+
+# Custom profile for samply/perf profiling: full release optimizations
+# plus debug info so symbol resolution and source line info show up in
+# Firefox Profiler / dtrace traces. Use with `cargo build --profile profiling`.
+[profile.profiling]
+inherits = "release"
+debug = "line-tables-only"
+strip = "none"
