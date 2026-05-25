@@ -2150,3 +2150,53 @@ today's samply runs with `cargo build --profile=profiling
 tree internals (~12.6 % inclusive, distributed across many
 actions), and persisting the SSSP cache to disk to amortize the
 ~1 s `World::load` cost.
+
+---
+
+## Navigation: Amsterdam port relocation + path-stale LOS replan
+*(ai-expansion branch)*
+
+**Problem.** In sim-viz, two pathological behaviors visible within
+the first sim-year: (a) a permanent crowd of ~170 non-docked ships
+loitering within 50 NM of Amsterdam — the harbor zone overlapped
+the Dutch coastline, so ships approaching from the SW kept
+losing LOS to the anchor at the last mile and falling into an
+endless replan/drift loop; (b) ships blown off course by wind /
+tacking would dead-reckon straight toward the destination through
+intervening land, pinning against the coast.
+
+**Diagnosis.** New `crates/sim-core/examples/bench_long.rs` ran
+a 10-year headless sim with `JAM_PROBES` counting non-docked ships
+within 50 NM of Amsterdam / Nantes / Elmina. Confirmed Amsterdam
+loiterer count grew monotonically to ~170. For mode (b), traced
+`act_sail` and found only two narrow replan triggers — neither
+fires when the *next* waypoint is blocked by land from the ship's
+*current truth* position.
+
+**Fixes.**
+1. Move Amsterdam (4644, 2092) → (4625, 2105) — Ijmuiden offshore
+   (52.58°N 4.58°E). Harbor radius unchanged (25 NM).
+2. Add path-stale LOS check in `act_sail`: each tick, if
+   `land.corridor_is_clear(ship.position, next_target, 2.0)` is
+   false, re-A* from truth. Handles both port destinations
+   (calls `replan_to_port`) and free-form destinations (calls
+   `pathfind::find_path`). No cooldown; relies on the replan
+   producing a different path because `pos_truth` changes.
+
+**Validation.** `bench_long 10y`: ships alive at year 10:
+272 → 375 (baseline → post-fix). Amsterdam loiterers 170 → ~1.
+Elmina loiterers 330 → ~37 (partial — Elmina has its own
+silver-sink issue). `bench_trade` 60-day calibration unchanged
+within noise. 171+23+10 tests pass.
+
+**Tried and reverted.** Doubling ship `provision_capacity` —
+no material effect (capacity was already 130-360 days, the bug
+was supply not capacity). Emergency-provisions-at-2× resolver
+that lets ships always buy provisions even when port stockpile
+is dry — *worked* (390 ships alive at year 10, no provision-
+strand) but didn't fix the underlying market dynamics and
+caused MANUFACTURES stockpile to balloon 28k → 80k tons
+because surviving ships kept producing into a market that
+couldn't absorb. Reverted in favor of a deeper redesign of
+the supply/price model (bounded trade balance with smooth
+distance-from-0 pricing — see next entry).

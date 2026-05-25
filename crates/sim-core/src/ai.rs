@@ -770,6 +770,38 @@ impl<'a> ShipBtContext<'a> {
         let land = self.pathfind.map(|c| c.land);
         let pos_estimate = self.estimated_position();
         let pos_truth = self.ship.position;
+
+        // Path-stale check: if land has come between the ship's actual
+        // position and its next target (waypoint or destination), the
+        // remaining path is invalid — `compute_steering` will sail us
+        // straight into the coast. Replan from truth. This covers the
+        // common failure mode where wind/tacking drifts the ship a few
+        // NM off the planned corridor near a small harbor and the next
+        // waypoint is no longer reachable in a straight line.
+        if let (Some(pf), Some(_)) = (self.pathfind, self.goal.destination) {
+            let next_target = self
+                .ship
+                .nav
+                .waypoints
+                .first()
+                .copied()
+                .or(self.goal.destination);
+            if let Some(target) = next_target {
+                if !pf.land.corridor_is_clear(pos_truth, target, 2.0) {
+                    if let Some(idx) = self.goal.dest_port {
+                        self.replan_to_port(idx);
+                    } else if let Some(dest) = self.goal.destination {
+                        if let Some(path) = pathfind::find_path(pf, pos_truth, dest) {
+                            if let Some(last) = path.last().copied() {
+                                self.goal.destination = Some(last);
+                            }
+                            self.ship.nav.set_path(path);
+                        }
+                    }
+                }
+            }
+        }
+
         let steering = self.ship.nav.compute_steering(
             self.goal,
             pos_estimate,
