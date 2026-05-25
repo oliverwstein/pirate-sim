@@ -876,8 +876,8 @@ impl<'a> ShipBtContext<'a> {
             return true;
         }
         let market = &self.markets[idx];
-        let stockpile = market.stockpile.get(provisions_id);
-        if stockpile <= 0.0 {
+        let available = market.available_to_buy(provisions_id);
+        if available <= 0.0 {
             return true;
         }
         // Provisions are the lifeblood of the voyage; if a port
@@ -892,7 +892,7 @@ impl<'a> ShipBtContext<'a> {
             crate::policy::TradeLegality::Legal { duty } => duty,
             crate::policy::TradeLegality::Prohibited => return true,
         };
-        let unit_base = market.buy_price(provisions_id, self.goods).max(0.0001);
+        let unit_base = market.price_at(provisions_id, self.goods).max(0.0001);
         let unit_price = unit_base * (1.0 + buy_duty);
         let hour_bill =
             crate::money::Pesos::from_pesos_f32(unit_price * crate::ship::RESUPPLY_RATE_PER_HOUR);
@@ -910,7 +910,7 @@ impl<'a> ShipBtContext<'a> {
         }
         let desired = crate::ship::RESUPPLY_RATE_PER_HOUR
             .min(space)
-            .min(stockpile);
+            .min(available);
         if desired <= 0.0 {
             return true;
         }
@@ -932,7 +932,7 @@ impl<'a> ShipBtContext<'a> {
         // more to sell, or we're so broke we couldn't even bid for a
         // tiny slice next tick.
         let full = self.ship.provisions + desired >= self.stats.provision_capacity - 1e-4;
-        let market_dry = (stockpile - desired) <= 0.0;
+        let market_dry = (available - desired) <= 0.0;
         let broke = self.ship.silver.as_pesos_f32() + hour_bill.as_pesos_f32() < unit_price * 0.05;
         full || market_dry || broke
     }
@@ -1009,7 +1009,7 @@ impl<'a> ShipBtContext<'a> {
         //
         // Phase 6: emits one `MarketAsk` per good above the keep-line.
         // The world's auction pass clears them at a single per-good
-        // price derived from the post-tick effective stockpile, with
+        // price derived from the post-tick signed balance, with
         // pro-rata seller payouts if the port treasury can't cover.
         // Returns Success once nothing remains above the keep-line —
         // multi-tick behavior emerges when the auction doesn't fill
@@ -1046,7 +1046,7 @@ impl<'a> ShipBtContext<'a> {
                     crate::policy::TradeLegality::Prohibited => continue,
                 };
                 anything_remaining = true;
-                let unit = market.sell_price(gid, self.goods);
+                let unit = market.price_at(gid, self.goods);
                 // Auction returns a net-of-duty price to the ship;
                 // scale the 80% reservation floor by the same wedge
                 // so a duty-bearing leg remains reachable.
@@ -1094,12 +1094,12 @@ impl<'a> ShipBtContext<'a> {
                 crate::policy::TradeLegality::Prohibited => continue,
             };
             let want = target - have;
-            let unit_base = market.buy_price(good, self.goods).max(0.0001);
+            let unit_base = market.price_at(good, self.goods).max(0.0001);
             let unit_gross = unit_base * (1.0 + buy_duty);
             let affordable = (self.ship.silver.as_pesos_f32() / unit_gross).max(0.0);
-            let in_stock = market.stockpile.get(good);
+            let available = market.available_to_buy(good);
             let cargo_room = self.stats.cargo_capacity_tons - self.ship.cargo.total_tons();
-            let tons = want.min(affordable).min(in_stock).min(cargo_room).max(0.0);
+            let tons = want.min(affordable).min(available).min(cargo_room).max(0.0);
             if tons > 0.0 {
                 // 20% headroom over gross-of-duty price — captain's
                 // limit is what they're willing to pay all-in.
@@ -1169,10 +1169,10 @@ impl<'a> ShipBtContext<'a> {
             crate::policy::TradeLegality::Legal { duty } => duty,
             crate::policy::TradeLegality::Prohibited => return Status::Success,
         };
-        let unit_base = market.buy_price(plan.good, self.goods).max(0.0001);
+        let unit_base = market.price_at(plan.good, self.goods).max(0.0001);
         let unit = unit_base * (1.0 + buy_duty);
         let cargo_room = self.stats.cargo_capacity_tons - self.ship.cargo.total_tons();
-        let want_tons = cargo_room.min(market.stockpile.get(plan.good));
+        let want_tons = cargo_room.min(market.available_to_buy(plan.good));
 
         // Outfit draw bid (owner port only). Resolver caps by
         // OUTFIT_PORT_FRACTION_CAP × treasury.
@@ -1237,8 +1237,8 @@ impl<'a> ShipBtContext<'a> {
                 crate::money::Pesos::ZERO
             };
         let affordable = assumed_silver.as_pesos_f32() / unit;
-        let in_stock = market.stockpile.get(plan.good);
-        let tons = cargo_room.min(affordable).min(in_stock).max(0.0);
+        let available = market.available_to_buy(plan.good);
+        let tons = cargo_room.min(affordable).min(available).max(0.0);
         if tons > 0.0 {
             // Headroom premium: pay up to 30% above formula price so
             // concurrent same-tick buys don't push the clearing price
@@ -1261,7 +1261,7 @@ impl<'a> ShipBtContext<'a> {
 
     fn act_divert_to_port(&mut self) -> Status {
         // Pick the nearest port that actually has provisions to sell.
-        // Without the stockpile filter, a low-provisions ship would
+        // Without the availability filter, a low-provisions ship would
         // dock-loop at the closest sugar island whose chandler ran
         // dry weeks ago: resupply returns Success without filling,
         // ship undocks still hungry, this branch reselects the same
@@ -1294,7 +1294,7 @@ impl<'a> ShipBtContext<'a> {
                 }
                 self.markets
                     .get(*idx)
-                    .map(|m| m.stockpile.get(provisions) > 0.5)
+                    .map(|m| m.available_to_buy(provisions) > 0.5)
                     .unwrap_or(false)
             })
             .min_by(|(_, a), (_, b)| {

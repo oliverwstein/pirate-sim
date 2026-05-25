@@ -1,6 +1,6 @@
 //! Run a calibration demo over a configurable horizon: spawn a small
 //! trader fleet, tick the simulation hour-by-hour, and report each
-//! ship's profit-and-loss together with a sample of port stockpiles
+//! ship's profit-and-loss together with a sample of port balances
 //! and prices.
 //!
 //! Used during Phase 2/3 calibration to tune prosperity, monthly
@@ -27,18 +27,18 @@ use std::path::Path;
 
 const DEFAULT_SIM_DAYS: u32 = 60;
 
-/// Snapshot total stockpile (summed across all ports) and total
+/// Snapshot total balance (summed across all ports) and total
 /// in-transit cargo (summed across all ships) for every good. Used
 /// by the system-wide accounting table.
 fn snapshot_system(
     world: &World,
-    stockpile_out: &mut Vec<Vec<(GoodId, f32)>>,
+    balance_out: &mut Vec<Vec<(GoodId, f32)>>,
     in_transit_out: &mut Vec<Vec<(GoodId, f32)>>,
 ) {
     let mut stk: BTreeMap<u8, f32> = BTreeMap::new();
     for m in &world.markets {
-        for (gid, tons) in m.stockpile.iter() {
-            *stk.entry(gid.0).or_insert(0.0) += tons;
+        for (gid, tons) in m.balance.iter() {
+            *stk.entry(gid.0).or_insert(0.0) += tons as f32;
         }
     }
     let mut tr: BTreeMap<u8, f32> = BTreeMap::new();
@@ -47,7 +47,7 @@ fn snapshot_system(
             *tr.entry(gid.0).or_insert(0.0) += tons;
         }
     }
-    stockpile_out.push(stk.into_iter().map(|(k, v)| (GoodId(k), v)).collect());
+    balance_out.push(stk.into_iter().map(|(k, v)| (GoodId(k), v)).collect());
     in_transit_out.push(tr.into_iter().map(|(k, v)| (GoodId(k), v)).collect());
 }
 
@@ -116,36 +116,32 @@ fn main() {
         .filter_map(|n| world.ports.iter().position(|p| p.name == *n))
         .collect();
 
-    println!(
-        "{:>5}  {:<28}  {:>10}  {:>10}",
-        "day", "port", "sugar buy", "sugar sell"
-    );
+    println!("{:>5}  {:<28}  {:>10}", "day", "port", "sugar price");
     for idx in &sample_idxs {
         let m = &world.markets[*idx];
         println!(
-            "{:>5}  {:<28}  {:>10.2}  {:>10.2}",
+            "{:>5}  {:<28}  {:>10.2}",
             0,
             world.ports[*idx].name,
-            m.buy_price(ids::SUGAR, &world.goods),
-            m.sell_price(ids::SUGAR, &world.goods),
+            m.price_at(ids::SUGAR, &world.goods),
         );
     }
 
     // Per-month, per-good system-wide accounting. Captured at each
     // month boundary so we can see real production / consumption /
-    // stockpile flow across the simulation.
+    // balance flow across the simulation.
     //
     // production_per_month[m][good] = Σ over ports of recipe.outputs * prosperity
     // consumed_per_month  same shape, from recipe.inputs.
-    // stockpile_per_month[m][good]  = Σ over ports of stockpile.get(good) at month end
+    // balance_per_month[m][good]  = Σ over ports of balance.get(good) at month end
     // in_transit_per_month[m][good] = Σ over ships of ship.cargo.get(good) at month end
     let mut last_observed_month = world.date.month();
     let mut production_per_month: Vec<Vec<(GoodId, f32)>> = Vec::new();
     let mut consumption_per_month: Vec<Vec<(GoodId, f32)>> = Vec::new();
-    let mut stockpile_per_month: Vec<Vec<(GoodId, f32)>> = Vec::new();
+    let mut balance_per_month: Vec<Vec<(GoodId, f32)>> = Vec::new();
     let mut in_transit_per_month: Vec<Vec<(GoodId, f32)>> = Vec::new();
     // Take an initial snapshot at month 0 (before any production).
-    snapshot_system(&world, &mut stockpile_per_month, &mut in_transit_per_month);
+    snapshot_system(&world, &mut balance_per_month, &mut in_transit_per_month);
     record_recipe_flow(
         &world,
         &mut production_per_month,
@@ -174,7 +170,7 @@ fn main() {
         }
         // Detect month transition and snapshot at end of month.
         if world.date.month() != last_observed_month {
-            snapshot_system(&world, &mut stockpile_per_month, &mut in_transit_per_month);
+            snapshot_system(&world, &mut balance_per_month, &mut in_transit_per_month);
             record_recipe_flow(
                 &world,
                 &mut production_per_month,
@@ -187,11 +183,10 @@ fn main() {
             for idx in &sample_idxs {
                 let m = &world.markets[*idx];
                 println!(
-                    "{:>5}  {:<28}  {:>10.2}  {:>10.2}",
+                    "{:>5}  {:<28}  {:>10.2}",
                     day,
                     world.ports[*idx].name,
-                    m.buy_price(ids::SUGAR, &world.goods),
-                    m.sell_price(ids::SUGAR, &world.goods),
+                    m.price_at(ids::SUGAR, &world.goods),
                 );
             }
         }
@@ -433,7 +428,7 @@ fn main() {
     //    on wharves vs. sloshes around in ship holds.
     println!();
     println!("System-wide commodity accounting (totals across all ports + ships):");
-    let n_months = stockpile_per_month.len();
+    let n_months = balance_per_month.len();
     let header_months: Vec<String> = (0..n_months).map(|m| format!("m{}", m)).collect();
     println!(
         "  {:<18} {:<7} {}",
@@ -446,7 +441,7 @@ fn main() {
     );
     // Union of all goods that show up anywhere in any snapshot.
     let mut all_goods: std::collections::BTreeSet<u8> = std::collections::BTreeSet::new();
-    for snap in stockpile_per_month
+    for snap in balance_per_month
         .iter()
         .chain(in_transit_per_month.iter())
         .chain(production_per_month.iter())
@@ -467,7 +462,7 @@ fn main() {
             .map(|m| format!("{:>10.0}", lookup(&snaps[m], gid)))
             .collect()
     };
-    // Δtotal: net change in (stock + in-transit) between m-1 and m. The
+    // Δtotal: net change in (balance + in-transit) between m-1 and m. The
     // gap between this and (prod - cons) is the simulation's commodity
     // "leak" — almost entirely ship provision consumption while sailing.
     let delta_total_line = |gid: GoodId| -> String {
@@ -476,10 +471,10 @@ fn main() {
                 if m == 0 {
                     format!("{:>10}", "-")
                 } else {
-                    let prev = lookup(&stockpile_per_month[m - 1], gid)
+                    let prev = lookup(&balance_per_month[m - 1], gid)
                         + lookup(&in_transit_per_month[m - 1], gid);
-                    let now = lookup(&stockpile_per_month[m], gid)
-                        + lookup(&in_transit_per_month[m], gid);
+                    let now =
+                        lookup(&balance_per_month[m], gid) + lookup(&in_transit_per_month[m], gid);
                     format!("{:>+10.0}", now - prev)
                 }
             })
@@ -515,8 +510,8 @@ fn main() {
         println!(
             "  {:<18} {:<7} {}",
             "",
-            "stock",
-            series_line(&stockpile_per_month, gid)
+            "balance",
+            series_line(&balance_per_month, gid)
         );
         println!(
             "  {:<18} {:<7} {}",
@@ -537,7 +532,7 @@ fn main() {
         "  {:<18} {:>10} {:>10} {:>10}",
         "good", "prod/yr", "cons/yr", "net/yr"
     );
-    for gid_raw in stockpile_per_month[0]
+    for gid_raw in balance_per_month[0]
         .iter()
         .map(|(g, _)| g.0)
         .chain(production_per_month[0].iter().map(|(g, _)| g.0))
@@ -589,7 +584,7 @@ fn main() {
                 continue;
             }
             if let Some(p_eq) = eq.price_at(port_idx, good) {
-                let p_sim = world.markets[port_idx].buy_price(good, &world.goods);
+                let p_sim = world.markets[port_idx].price_at(good, &world.goods);
                 let pct = if p_eq > 1.0 {
                     ((p_sim - p_eq) / p_eq).abs()
                 } else {

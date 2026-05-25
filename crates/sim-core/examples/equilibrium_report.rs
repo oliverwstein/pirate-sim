@@ -102,7 +102,7 @@ fn main() {
             let g = goods.get(good);
             let p_lin = sol_simple.price_at(port_idx, good);
             let p_voy = sol_real.price_at(port_idx, good);
-            let p_sim = markets[port_idx].buy_price(good, &goods);
+            let p_sim = markets[port_idx].price_at(good, &goods);
             let lin_str = p_lin
                 .map(|p| format!("{:.1}", p))
                 .unwrap_or_else(|| "  —  ".to_string());
@@ -136,7 +136,7 @@ fn main() {
                 continue;
             }
             if let Some(p_eq) = sol_real.price_at(port_idx, *good) {
-                let p_sim = markets[port_idx].buy_price(*good, &goods);
+                let p_sim = markets[port_idx].price_at(*good, &goods);
                 if p_eq > 1.0 {
                     diffs.push(((p_sim - p_eq) / p_eq).abs());
                 }

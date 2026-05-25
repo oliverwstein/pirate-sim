@@ -1214,7 +1214,7 @@ impl World {
     /// outfit draw, credit advance) play through in ship-id order
     /// against the live treasury; then each good with bids and/or asks
     /// is cleared at a *single* price derived from the post-tick
-    /// effective stockpile, with pro-rata seller payouts when the
+    /// signed balance, with pro-rata seller payouts when the
     /// port can't fully cover. This eliminates the "first-bidder gets
     /// the start-of-tick price" artifact of sequential resolution.
     fn clear_markets(&mut self, intents: Vec<(ShipId, crate::command::ShipCommand)>) {
@@ -1319,7 +1319,7 @@ impl World {
         // Group bids and asks by good, then for each (port, good) find
         // a single clearing price that all crossing orders transact at.
         // The clearing price is the formula price evaluated at the
-        // *post-tick* effective stockpile (current ± net trade flow),
+        // *post-tick* signed balance (current ± net trade flow),
         // which gives every order the marginal price the trade itself
         // would induce — no more "first ship at the dock gets the
         // pre-tick price".
@@ -1392,14 +1392,10 @@ impl World {
             self.clear_one_good(port_idx, good, bids_for_good, asks_for_good);
             let _ = (CHANDLER_PORT_FRACTION_CAP,); // silence unused import warning if both
         }
-
-        // Settle any net stockpile growth against outstanding
-        // hinterland debt for this port.
-        self.markets[port_idx].settle_hinterland_debt();
     }
 
     /// Inner helper: clear bids and asks for one (port, good) at a
-    /// single auction price. Mutates port stockpile/treasury and the
+    /// single auction price. Mutates port balance/treasury and the
     /// participating ships' cargo/silver.
     #[allow(clippy::too_many_lines)]
     fn clear_one_good(
@@ -1561,7 +1557,6 @@ impl World {
         };
 
         let mut total_buy_tons = 0.0_f32;
-        let mut total_sold_tons = 0.0_f32;
         let mut applied_tons_signed = 0.0_f32;
         let mut buyer_payments_base = crate::money::Pesos::ZERO;
         let mut actual_payout_base = crate::money::Pesos::ZERO;
@@ -1629,12 +1624,11 @@ impl World {
                     crate::money::Pesos::from_pesos_f32(sell_tons * clearing_price * payout_ratio);
                 total_sell_duty_pesos += duty_pesos;
                 actual_payout_base += payout_base;
-                total_sold_tons += sell_tons;
                 applied_tons_signed -= sell_tons;
             }
         }
 
-        // ── Apply to port treasury, bounded balance, crown, and shadow stockpile ──
+        // ── Apply to port treasury, bounded balance, and crown ──
         let market = &mut self.markets[port_idx];
         market.silver += buyer_payments_base;
         market.silver = (market.silver - actual_payout_base).max_zero();
@@ -1645,21 +1639,6 @@ impl World {
             .round()
             .clamp(-bound as f32, bound as f32) as i32;
         market.balance.set(good, actual_balance);
-
-        if total_sold_tons > 0.0 {
-            market.stockpile.add(good, total_sold_tons);
-        }
-        if total_buy_tons > 0.0 {
-            let in_stock = market.stockpile.get(good);
-            let from_wharf = total_buy_tons.min(in_stock);
-            if from_wharf > 0.0 {
-                market.stockpile.remove(good, from_wharf);
-            }
-            let from_hinterland = (total_buy_tons - from_wharf).max(0.0);
-            if from_hinterland > 0.0 {
-                market.debt.add(good, from_hinterland);
-            }
-        }
 
         // ── Telemetry: port + faction aggregates ───────────────────
         let total_duty = total_buy_duty_pesos + total_sell_duty_pesos;

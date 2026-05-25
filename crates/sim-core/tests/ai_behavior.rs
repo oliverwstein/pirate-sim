@@ -5,7 +5,7 @@ use sim_core::ai::{ShipAI, ShipSnapshot, ShipTickInputs};
 use sim_core::command::ShipCommand;
 use sim_core::goods::GoodsRegistry;
 use sim_core::harbor::HarborMap;
-use sim_core::market::PortMarket;
+use sim_core::market::{PortArchetype, PortMarket};
 use sim_core::port::{Port, DEFAULT_HARBOR_RADIUS_NM};
 use sim_core::ship::{DockAction, Ship, ShipState, ShipStats};
 use sim_core::spatial::SpatialHash;
@@ -234,17 +234,20 @@ fn apply_commands_with_markets(
             } => {
                 if let Some(m) = markets.get_mut(*port) {
                     let provisions_id = sim_core::goods::ids::PROVISIONS;
-                    let unit = m.buy_price(provisions_id, goods).max(0.0001);
+                    let unit = m.price_at(provisions_id, goods).max(0.0001);
                     let cost = sim_core::money::Pesos::from_pesos_f32(unit * *tons);
                     let affordable = ship.silver.as_pesos_f32() / unit;
                     let space = (stats.provision_capacity - ship.provisions).max(0.0);
-                    let in_stock = m.stockpile.get(provisions_id);
-                    let take = tons.min(affordable).min(space).min(in_stock).max(0.0);
+                    let available = m.available_to_buy(provisions_id);
+                    let take = tons.min(affordable).min(space).min(available).max(0.0);
                     if take > 0.0 {
                         let actual_cost = sim_core::money::Pesos::from_pesos_f32(unit * take);
                         ship.silver -= actual_cost;
                         m.silver += actual_cost;
-                        m.stockpile.remove(provisions_id, take);
+                        m.balance.set(
+                            provisions_id,
+                            (m.balance.get(provisions_id) as f32 - take).round() as i32,
+                        );
                         ship.provisions += take;
                     }
                     let _ = cost;
@@ -708,16 +711,17 @@ fn low_provisions_diverts_to_nearest_port() {
     ship.provisions = 0.15; // ~3.3 days at 25 crew — below 4-day threshold
     let mut ai = ShipAI::with_destination(Position { x: 500.0, y: 0.0 });
 
-    // Seed NearPort with provisions so the divert-stockpile filter
+    // Seed NearPort with provisions so the divert availability filter
     // accepts it; FarPort stays dry so it can't be the chosen divert.
     let goods = GoodsRegistry::starter();
     let mut markets: Vec<PortMarket> = vec![
-        PortMarket::with_initial_stockpile(&goods),
-        PortMarket::with_initial_stockpile(&goods),
+        PortMarket::with_recipe(&goods, PortArchetype::NorthAmericanFarming.recipe()),
+        PortMarket::with_recipe(&goods, PortArchetype::NorthAmericanFarming.recipe()),
     ];
+    let dry_bound = markets[1].effective_bound(sim_core::goods::ids::PROVISIONS);
     markets[1]
-        .stockpile
-        .remove(sim_core::goods::ids::PROVISIONS, 1_000_000.0);
+        .balance
+        .set(sim_core::goods::ids::PROVISIONS, -dry_bound);
     tick_ai_with_markets(
         &mut ai,
         &mut ship,
@@ -854,10 +858,11 @@ fn dock_cycle_sells_arriving_cargo_and_buys_outgoing() {
         PortMarket::with_recipe(&goods, PortArchetype::SugarIsland.recipe()),
         PortMarket::with_recipe(&goods, PortArchetype::NorthAmericanFarming.recipe()),
     ];
-    // Bias: surplus of sugar at Home, drain Dest's sugar to zero.
-    markets[0].stockpile.add(ids::SUGAR, 5_000.0);
-    let dest_sugar = markets[1].stockpile.get(ids::SUGAR);
-    markets[1].stockpile.remove(ids::SUGAR, dest_sugar);
+    // Bias: surplus of sugar at Home, drain Dest's sugar to shortage.
+    let home_bound = markets[0].effective_bound(ids::SUGAR);
+    markets[0].balance.set(ids::SUGAR, home_bound);
+    let dest_bound = markets[1].effective_bound(ids::SUGAR);
+    markets[1].balance.set(ids::SUGAR, -dest_bound);
 
     // Ship starts docked at Home with fresh provisions (skip resupply
     // dwell time) and a small dirty hull so careen passes quickly.

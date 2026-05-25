@@ -3,7 +3,7 @@
 //! and every port, computes per-ton arbitrage minus a linear distance
 //! cost, and returns the highest-margin option above a small threshold.
 //!
-//! It does not consider available silver, hold size, or stockpile when
+//! It does not consider available silver, hold size, or balance availability when
 //! ranking — those are enforced by the actual buy/sell call. A future
 //! refinement can switch to "expected total profit for this trip" by
 //! multiplying margin by a feasibility-aware tonnage.
@@ -35,7 +35,7 @@ pub const REACHABILITY_BUFFER_DAYS: f32 = 7.0;
 
 /// Weight applied to the lookahead leg's profit when scoring a
 /// circuit. Small because the onward leg is highly speculative:
-/// prices and stockpiles will have shifted by the time the ship
+/// prices and balances will have shifted by the time the ship
 /// actually arrives at B and re-plans, and bench calibration showed
 /// that anything ≥0.5 causes ships to chase phantom long-distance
 /// circuits (drained destination ports forecast huge sell prices
@@ -172,7 +172,7 @@ pub fn find_best_trade(
     for good in goods.iter() {
         // Refuse to even consider goods the origin is dry on — saves
         // a bunch of pointless candidates.
-        if origin_market.stockpile.get(good.id) <= 0.0 {
+        if origin_market.available_to_buy(good.id) <= 0.0 {
             continue;
         }
         // Buy-side legality at origin: enumerated bans (Spanish
@@ -183,7 +183,10 @@ pub fn find_best_trade(
             TradeLegality::Legal { duty } => duty,
             TradeLegality::Prohibited => continue,
         };
-        let buy_p_base = origin_market.buy_price(good.id, goods);
+        let lot_tons = 1.0_f32
+            .min(origin_market.available_to_buy(good.id))
+            .max(0.0);
+        let buy_p_base = origin_market.price_after_trade(good.id, lot_tons, goods);
         let buy_p_eff = buy_p_base * (1.0 + buy_duty);
         for (dest_idx, dest) in ports.iter().enumerate() {
             if dest_idx == origin_idx {
@@ -209,7 +212,7 @@ pub fn find_best_trade(
             if voyage_days + REACHABILITY_BUFFER_DAYS > provision_days_budget {
                 continue;
             }
-            let sell_p_base = markets[dest_idx].sell_price(good.id, goods);
+            let sell_p_base = markets[dest_idx].price_after_trade(good.id, -lot_tons, goods);
             let sell_p_eff = sell_p_base * (1.0 - sell_duty);
             let cost = dist * TRADE_COST_PER_TON_NM;
             let profit = sell_p_eff - buy_p_eff - cost;
@@ -347,14 +350,18 @@ fn best_single_leg_excluding(
     let origin_market = &markets[origin_idx];
     let mut best: Option<(GoodId, usize, f32)> = None;
     for good in goods.iter() {
-        if origin_market.stockpile.get(good.id) <= 0.0 {
+        if origin_market.available_to_buy(good.id) <= 0.0 {
             continue;
         }
         let buy_duty = match policy.buy_legality(origin_idx, ship_flag, good.id) {
             TradeLegality::Legal { duty } => duty,
             TradeLegality::Prohibited => continue,
         };
-        let buy_p_eff = origin_market.buy_price(good.id, goods) * (1.0 + buy_duty);
+        let lot_tons = 1.0_f32
+            .min(origin_market.available_to_buy(good.id))
+            .max(0.0);
+        let buy_p_eff =
+            origin_market.price_after_trade(good.id, lot_tons, goods) * (1.0 + buy_duty);
         for (dest_idx, dest) in ports.iter().enumerate() {
             if dest_idx == origin_idx {
                 continue;
@@ -377,7 +384,8 @@ fn best_single_leg_excluding(
             if voyage_days + REACHABILITY_BUFFER_DAYS > provision_days_budget {
                 continue;
             }
-            let sell_p_eff = markets[dest_idx].sell_price(good.id, goods) * (1.0 - sell_duty);
+            let sell_p_eff =
+                markets[dest_idx].price_after_trade(good.id, -lot_tons, goods) * (1.0 - sell_duty);
             let cost = dist * TRADE_COST_PER_TON_NM;
             let profit = sell_p_eff - buy_p_eff - cost;
             if profit > MIN_PROFIT_THRESHOLD_PESOS_PER_TON
@@ -437,10 +445,12 @@ mod tests {
         let mut market_b =
             PortMarket::with_recipe(&goods, PortArchetype::NorthAmericanFarming.recipe());
         // Bias A's sugar price low (huge surplus) and B's high (drained).
-        market_a.stockpile.add(ids::SUGAR, 10_000.0);
+        market_a
+            .balance
+            .set(ids::SUGAR, market_a.effective_bound(ids::SUGAR));
         market_b
-            .stockpile
-            .remove(ids::SUGAR, market_b.stockpile.get(ids::SUGAR));
+            .balance
+            .set(ids::SUGAR, -market_b.effective_bound(ids::SUGAR));
 
         let markets = vec![market_a, market_b];
         let resolver = synth_resolver(&ports);
@@ -497,9 +507,9 @@ mod tests {
         let ports = vec![synth_port("A", 0.0, 0.0), synth_port("B", 100.0, 0.0)];
         let mut market_a = PortMarket::with_recipe(&goods, PortArchetype::SugarIsland.recipe());
         // Drain everything in A. Then nothing can be bought.
-        let snapshot: Vec<_> = market_a.stockpile.iter().collect();
-        for (id, t) in snapshot {
-            market_a.stockpile.remove(id, t);
+        for good in goods.iter() {
+            let bound = market_a.effective_bound(good.id);
+            market_a.balance.set(good.id, -bound);
         }
         let market_b =
             PortMarket::with_recipe(&goods, PortArchetype::NorthAmericanFarming.recipe());
@@ -531,10 +541,12 @@ mod tests {
         let mut market_a = PortMarket::with_recipe(&goods, PortArchetype::SugarIsland.recipe());
         let mut market_b =
             PortMarket::with_recipe(&goods, PortArchetype::NorthAmericanFarming.recipe());
-        market_a.stockpile.add(ids::SUGAR, 10_000.0);
+        market_a
+            .balance
+            .set(ids::SUGAR, market_a.effective_bound(ids::SUGAR));
         market_b
-            .stockpile
-            .remove(ids::SUGAR, market_b.stockpile.get(ids::SUGAR));
+            .balance
+            .set(ids::SUGAR, -market_b.effective_bound(ids::SUGAR));
         let markets = vec![market_a, market_b];
         let resolver = synth_resolver(&ports);
         assert!(find_best_trade(
@@ -599,8 +611,8 @@ mod tests {
         // Drain sugar buyers so they pay premium for incoming sugar.
         let mut market_b_dead = PortMarket::with_recipe(&goods, sugar_consumer);
         market_b_dead
-            .stockpile
-            .remove(ids::SUGAR, market_b_dead.stockpile.get(ids::SUGAR));
+            .balance
+            .set(ids::SUGAR, -market_b_dead.effective_bound(ids::SUGAR));
         let market_b_work = PortMarket::with_recipe(&goods, sugar_consumer_and_tobacco_exporter);
         // Drain B-working sugar too so both B's pay the same premium
         // for incoming sugar (recipe seeds 3 months of input buffer
@@ -608,12 +620,12 @@ mod tests {
         // demand state).
         let mut market_b_work = market_b_work;
         market_b_work
-            .stockpile
-            .remove(ids::SUGAR, market_b_work.stockpile.get(ids::SUGAR));
+            .balance
+            .set(ids::SUGAR, -market_b_work.effective_bound(ids::SUGAR));
         let mut market_d = PortMarket::with_recipe(&goods, tobacco_consumer);
         market_d
-            .stockpile
-            .remove(ids::TOBACCO, market_d.stockpile.get(ids::TOBACCO));
+            .balance
+            .set(ids::TOBACCO, -market_d.effective_bound(ids::TOBACCO));
 
         let markets = vec![market_a, market_b_dead, market_b_work, market_d];
         let resolver = synth_resolver(&ports);

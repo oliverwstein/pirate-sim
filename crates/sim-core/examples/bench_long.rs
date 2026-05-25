@@ -174,7 +174,7 @@ fn main() {
         }
     }
 
-    // Final summary: which ports are over/under-attended, total stockpile,
+    // Final summary: which ports are over/under-attended, total balance,
     // and a per-faction birth/death table.
     println!();
     println!("=== Final per-faction ledger ===");
@@ -292,10 +292,10 @@ fn print_snapshot(
             print!(" {:>5} {:>6}", "?", "?");
         }
     }
-    // Aggregate stockpile across all ports for watch goods.
+    // Aggregate signed balance across all ports for watch goods.
     for (gid, _) in WATCH_GOODS {
-        let total: f32 = world.markets.iter().map(|m| m.stockpile.get(*gid)).sum();
-        print!(" {:>7.0}", total);
+        let total: i32 = world.markets.iter().map(|m| m.balance.get(*gid)).sum();
+        print!(" {:>7}", total);
     }
     // Traffic-jam probes: number of non-docked ships within
     // NEAR_PORT_RADIUS_NM of each named port. A persistent high

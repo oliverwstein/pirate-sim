@@ -550,7 +550,7 @@ fn draw_ship_panel(world: &World, ship_id: ShipId) {
 }
 
 /// Right-side panel showing a selected port's market state: prices,
-/// stockpile, treasury, gateway flag.
+/// balance, treasury, gateway flag.
 fn draw_market_panel(world: &World, port_idx: usize) {
     if port_idx >= world.ports.len() || port_idx >= world.markets.len() {
         return;
@@ -575,7 +575,7 @@ fn draw_market_panel(world: &World, port_idx: usize) {
         LIGHTGRAY,
     );
     draw_text(
-        "Good          stk(t)   buy   sell",
+        "Good          bal(t)   price",
         x + 10.0,
         y + 62.0,
         14.0,
@@ -583,10 +583,9 @@ fn draw_market_panel(world: &World, port_idx: usize) {
     );
 
     for (i, good) in world.goods.iter().enumerate() {
-        let stk = market.stockpile.get(good.id);
-        let buy = market.buy_price(good.id, &world.goods);
-        let sell = market.sell_price(good.id, &world.goods);
-        let line = format!("{:<14}{:>7.0} {:>5.1} {:>5.1}", good.name, stk, buy, sell);
+        let bal = market.balance.get(good.id);
+        let price = market.price_at(good.id, &world.goods);
+        let line = format!("{:<14}{:>7} {:>7.1}", good.name, bal, price);
         draw_text(&line, x + 10.0, y + 80.0 + i as f32 * 18.0, 14.0, WHITE);
     }
 }
