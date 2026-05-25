@@ -2292,45 +2292,71 @@ B.5 (LP-shadow-price seeding).
 
 ---
 
-### 2025: AI routing — coast-area replan storm diagnosis + first fixes
+### 2025: Market redesign — Phase B.4 (stockpile/debt removal)
 
-**Context:** user observed in-viz that ships "constantly reroute and
-can't decide where to go, sometimes even in open water."
+**Change:** `PortMarket::stockpile` and `PortMarket::debt` deleted, along
+with all their helpers (`buy_price_at`, `sell_price_at`,
+`price_at_effective_stock`, `produces_good`, `settle_debt`,
+`settle_hinterland_debt`) and constants (`INITIAL_STOCKPILE_TONS`,
+`PRICE_K`, `PRICE_FLOOR_FRAC`, `PRICE_CEIL_FRAC`, `PRICE_SPREAD`).
+Every consumer migrated to the bounded `balance` + asymmetric curve.
 
-**Instrumentation (kept for future debugging):** new `AiDiag` struct
-on `ShipAI` with 4 u32 counters: `destination_changes`,
-`path_replans_exhausted`, `path_replans_los`, `divert_events`.
-Threaded through `ShipBtContext` as `&mut AiDiag`. `bench_long`
-prints per-counter sum / mean / p50 / p90 / max at end of run.
+**New `PortMarket` API:**
+- `price_at(good, &goods) -> f32` — current price from balance.
+- `price_after_trade(good, delta_tons, &goods) -> f32` — sign
+  convention: positive `delta_tons` = ship buys (balance decreases).
+- `available_to_buy(good) -> f32` — tons available before hitting
+  `balance == -bound`. Used as the shipyard / resupply availability
+  gate (formerly `stockpile.get`).
 
-**Smoking gun:** `path_replans_los` averaged 25k/ship over 10y, max
-87k. Root causes (two compounding bugs):
+**Migration highlights:**
+- `world.rs::clear_one_good`: dropped the shadow stockpile/debt mutation
+  block. The auction now updates only `balance`, `silver`,
+  `crown_silver`, and telemetry.
+- `clear_port_intents`: dropped the `settle_hinterland_debt()` call.
+- `ai.rs` / `trade.rs`: planner uses a 1-ton reference lot with
+  `price_after_trade` for opportunity ranking (the planner doesn't
+  know cargo size at decision time, so it can't price the full trade
+  impact; this is an explicit calibration choice).
+- `shipyard.rs`: refuses builds when any input good is at
+  `balance == -bound` (`available_to_buy == 0`). Consumption is
+  i32 with `clamp(-bound, bound)` post-decrement.
+- `ship.rs::resupply_one_hour`: same migration to balance API.
+- Benches and viz HUD: stockpile snapshots replaced with balance +
+  price_at displays.
 
-1. The path-stale LOS check in `act_sail` fell through from
-   `waypoints.first()` to `goal.destination`. Harbors sit on
-   coastlines, so on final approach
-   `corridor_is_clear(pos, harbor, margin=2.0)` always failed
-   → A* thrash every tick.
-2. Margin of 2.0 NM is *stricter* than the navmesh's own clearance,
-   so even legitimately-returned A* waypoints within 1–2 NM of shore
-   tripped the check.
+**Validation:** 218 tests pass (down from 232 — 14 tests that
+asserted exact stockpile counts were rewritten in terms of balance/
+price; none ignored). bench_trade P/L 913342 → 773710 (-15%), 0/505
+bankrupt (unchanged). bench_long alive at year 10: 446 → 366 (-18%).
 
-**Fix A:** scope LOS to `waypoints.first()` only (no destination
-fallback), use `margin=0.0` (pure straight-line land intersection).
+The -18% drop is the predicted design consequence of removing the
+old infinite-hinterland-credit backstop: ports that previously
+absorbed unbounded buy demand by going into perpetual debt now
+hard-cap at `-bound` and refuse further sales. Phase B.5 (LP-shadow-
+price balance seeding) is expected to re-center initial balances
+closer to economic equilibrium and recover this gap.
 
-**Fix B (idempotent divert):** `act_divert_to_port` re-ran every
-tick once `IsLowProvisions` latched true (no destination reachable
-within remaining biscuit). If two ports were near-equidistant the
-choice flip-flopped → mid-ocean oscillation. Fix: at top of
-`act_divert_to_port`, if `goal.dest_port` is already a valid divert
-target (dock-open, provisions buy-legal, market has stock), return
-Success without re-routing. Matches user design rule: "Divert =
-single replan, beeline to nearest port, no further replanning."
+---
 
-**Validation:**
-- 222 tests pass.
-- bench_long: `path_replans_los` median 23373 → 41 (570× reduction).
-  `divert_events` mean 2.1 → 1.1. 8 ports with non-zero docked
-  ships (was 3) at year 10.
-- Tail of stuck ships remains (max LOS replans 87317 for outliers
-  in coves/behind peninsulas). Next plan: "Robust Coast Routing".
+### 2025: Market redesign — Phase B.5 (LP shadow-price balance seeding)
+
+**Change:** at world load, solve the Kantorovich LP over the port/good
+graph (linear freight cost, 0.05 pesos/ton·NM, matching
+`equilibrium_report`) and for each (port, good) with a finite, sane
+shadow price, invert the asymmetric price curve to derive the
+initial `balance`. The simulation now starts at LP equilibrium
+instead of at `balance == 0` (the Phase B.1 heuristic seed).
+
+**New:** `market::seed_balance_from_equilibrium(port_idx, good_id,
+shadow_price, base_price, …) -> i32`. 4 unit tests cover: at-base,
+shortage clamping, glut clamping, and skip-on-nonfinite-or-extreme.
+
+**Wiring:** `World::new` builds `port_specs` from prices/goods/recipes,
+calls `equilibrium::solve`, then walks each (port, good) and seeds
+balance when a shadow price is available. Stderr summary prints
+non-zero shadow-price count + total surplus.
+
+**Validation:** 222 tests pass. bench_trade P/L 773710 → 915590
+(recovers and exceeds the B.3 baseline of 913342, consistent with
+the LP seed eliminating the startup transient).

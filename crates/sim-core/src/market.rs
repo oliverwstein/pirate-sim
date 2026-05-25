@@ -4,6 +4,8 @@ use crate::goods::{GoodId, GoodsRegistry};
 use crate::market_curve::{self, BalanceTable};
 use crate::money::Pesos;
 
+const EQUILIBRIUM_PRICE_RATIO_CAP: f32 = 100.0;
+
 /// Starting silver in a port's treasury. Used to settle ship/port
 /// transactions and local credit.
 const INITIAL_PORT_SILVER_PESOS: Pesos = Pesos::from_pesos(50_000);
@@ -65,6 +67,35 @@ fn recipe_target_stock(recipe: &ProductionRecipe, id: GoodId) -> f32 {
         .map(|(_, t)| *t)
         .unwrap_or(0.0);
     from_outputs.max(from_inputs) * 6.0
+}
+
+pub fn seed_balance_from_equilibrium(
+    market: &mut PortMarket,
+    port_idx: usize,
+    solution: &crate::equilibrium::EquilibriumSolution,
+    goods: &GoodsRegistry,
+) {
+    for good in goods.iter() {
+        let Some(p_eq) = solution.price_at(port_idx, good.id) else {
+            continue;
+        };
+        let ratio = p_eq / good.base_price_pesos;
+        if !ratio.is_finite() || ratio <= 0.0 || ratio > EQUILIBRIUM_PRICE_RATIO_CAP {
+            #[cfg(debug_assertions)]
+            eprintln!(
+                "skipping equilibrium seed for port {port_idx} good {:?}: invalid ratio {ratio}",
+                good.id
+            );
+            continue;
+        }
+
+        let x = market_curve::invert_multiplier(ratio).clamp(-1.0, 1.0);
+        let bound = market.effective_bound(good.id);
+        let new_balance = (x * bound as f32).round() as i32;
+        market
+            .balance
+            .set(good.id, new_balance.clamp(-bound, bound));
+    }
 }
 
 impl PortMarket {
@@ -628,6 +659,17 @@ mod tests {
         (a - b).abs() <= eps
     }
 
+    fn synthetic_solution(
+        prices: impl IntoIterator<Item = (GoodId, f32)>,
+    ) -> crate::equilibrium::EquilibriumSolution {
+        crate::equilibrium::EquilibriumSolution {
+            flows: Vec::new(),
+            supply_prices: std::collections::HashMap::new(),
+            demand_prices: prices.into_iter().map(|(g, p)| ((0, g), p)).collect(),
+            objective: 0.0,
+        }
+    }
+
     #[test]
     fn neutral_market_prices_at_base() {
         let registry = GoodsRegistry::starter();
@@ -646,6 +688,61 @@ mod tests {
         let mfg_bound = market.base_bounds.get(ids::MANUFACTURES);
         assert_eq!(mfg_bound, 72);
         assert_eq!(market.balance.get(ids::MANUFACTURES), -36);
+    }
+
+    #[test]
+    fn equilibrium_seed_half_base_sets_sugar_glut() {
+        let registry = GoodsRegistry::starter();
+        let mut market = PortMarket::with_recipe(&registry, PortArchetype::SugarIsland.recipe());
+        market.balance.set(ids::SUGAR, 0);
+        let solution =
+            synthetic_solution([(ids::SUGAR, registry.get(ids::SUGAR).base_price_pesos * 0.5)]);
+
+        seed_balance_from_equilibrium(&mut market, 0, &solution, &registry);
+
+        assert!(market.balance.get(ids::SUGAR) > 0);
+    }
+
+    #[test]
+    fn equilibrium_seed_double_base_sets_manufactures_shortage() {
+        let registry = GoodsRegistry::starter();
+        let mut market = PortMarket::with_recipe(&registry, PortArchetype::SugarIsland.recipe());
+        market.balance.set(ids::MANUFACTURES, 0);
+        let solution = synthetic_solution([(
+            ids::MANUFACTURES,
+            registry.get(ids::MANUFACTURES).base_price_pesos * 2.0,
+        )]);
+
+        seed_balance_from_equilibrium(&mut market, 0, &solution, &registry);
+
+        assert!(market.balance.get(ids::MANUFACTURES) < 0);
+    }
+
+    #[test]
+    fn equilibrium_seed_preserves_goods_without_shadow_price() {
+        let registry = GoodsRegistry::starter();
+        let mut market = PortMarket::with_recipe(&registry, PortArchetype::SugarIsland.recipe());
+        market.balance.set(ids::SUGAR, 123);
+        let solution = synthetic_solution([]);
+
+        seed_balance_from_equilibrium(&mut market, 0, &solution, &registry);
+
+        assert_eq!(market.balance.get(ids::SUGAR), 123);
+    }
+
+    #[test]
+    fn equilibrium_seed_skips_non_finite_shadow_prices() {
+        let registry = GoodsRegistry::starter();
+        for p_eq in [f32::NAN, f32::INFINITY] {
+            let mut market =
+                PortMarket::with_recipe(&registry, PortArchetype::SugarIsland.recipe());
+            market.balance.set(ids::SUGAR, 123);
+            let solution = synthetic_solution([(ids::SUGAR, p_eq)]);
+
+            seed_balance_from_equilibrium(&mut market, 0, &solution, &registry);
+
+            assert_eq!(market.balance.get(ids::SUGAR), 123);
+        }
     }
 
     #[test]

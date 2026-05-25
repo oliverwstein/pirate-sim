@@ -4,10 +4,11 @@ use slotmap::{Key, SecondaryMap, SlotMap};
 
 use crate::ai::{ShipAI, ShipSnapshot};
 use crate::coastline::{CoastlineMap, LandMesh};
+use crate::equilibrium::{self, EquilibriumScenario, FreightCostModel, PortSpec};
 use crate::goods::GoodsRegistry;
 use crate::harbor::HarborMap;
 use crate::map::MapSystem;
-use crate::market::{archetype_for, PortMarket};
+use crate::market::{archetype_for, seed_balance_from_equilibrium, PortMarket};
 use crate::money::Pesos;
 use crate::navmesh::Navmesh;
 use crate::pathfind::PathfindContext;
@@ -172,13 +173,41 @@ impl World {
             CoastlineMap::load(&data_dir.join("grids/coastline.bin")).unwrap_or_default();
         let land_mesh = LandMesh::load(&data_dir.join("grids/land_polys.bin")).unwrap_or_default();
         let goods = GoodsRegistry::starter();
-        let markets: Vec<PortMarket> = ports
+        let port_specs: Vec<PortSpec<'_>> = ports
             .iter()
             .map(|p| {
                 let archetype = archetype_for(&p.name);
-                PortMarket::with_recipe(&goods, archetype.recipe())
+                PortSpec::from_world(p, archetype.recipe())
             })
             .collect();
+        let mut markets: Vec<PortMarket> = port_specs
+            .iter()
+            .map(|spec| PortMarket::with_recipe(&goods, spec.recipe.clone()))
+            .collect();
+        // Use the linear freight model as a mechanism-free equilibrium baseline;
+        // ship operations then discover route profitability from these seeded prices.
+        let freight = FreightCostModel::Linear {
+            pesos_per_ton_nm: 0.05,
+        };
+        let equilibrium_solution = equilibrium::solve(&EquilibriumScenario {
+            ports: port_specs,
+            goods: &goods,
+            freight,
+        });
+        for (port_idx, market) in markets.iter_mut().enumerate() {
+            seed_balance_from_equilibrium(market, port_idx, &equilibrium_solution, &goods);
+        }
+        let goods_seeded = (0..ports.len())
+            .flat_map(|port_idx| goods.iter().map(move |good| (port_idx, good.id)))
+            .filter(|(port_idx, good)| equilibrium_solution.price_at(*port_idx, *good).is_some())
+            .count();
+        eprintln!(
+            "equilibrium market seed: ports={} flows={} surplus={:+.0} seeded_cells={}",
+            ports.len(),
+            equilibrium_solution.flows.len(),
+            equilibrium_solution.objective,
+            goods_seeded
+        );
         let port_telemetry: Vec<crate::telemetry::PortTelemetry> = (0..ports.len())
             .map(|_| crate::telemetry::PortTelemetry::default())
             .collect();
