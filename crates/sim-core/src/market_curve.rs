@@ -28,6 +28,9 @@
 //! on both sides — guaranteeing a unique clearing price in the
 //! Phase-B fixed-point auction.
 
+use crate::cargo::CARGO_SLOTS;
+use crate::goods::GoodId;
+
 /// Shortage steepness coefficient. Larger → steeper shortage price.
 pub const ALPHA_SHORTAGE: f32 = 4.0;
 /// Shortage exponent. Larger → flatter near 0, steeper near -bound.
@@ -191,5 +194,121 @@ mod tests {
         assert_eq!(effective_bound(100, 0.0), 1);
         assert_eq!(effective_bound(100, -1.0), 1);
         assert_eq!(effective_bound(0, 1.0), 1);
+    }
+
+    #[test]
+    fn balance_table_round_trip() {
+        let mut t = BalanceTable::new();
+        let g = GoodId(2);
+        assert_eq!(t.get(g), 0);
+        t.set(g, 42);
+        assert_eq!(t.get(g), 42);
+        t.add(g, -10);
+        assert_eq!(t.get(g), 32);
+    }
+
+    #[test]
+    fn balance_table_clamp() {
+        let mut bal = BalanceTable::new();
+        let bounds = BalanceTable::from_iter([(GoodId(0), 100), (GoodId(1), 50)]);
+        bal.set(GoodId(0), 200);
+        bal.set(GoodId(1), -200);
+        bal.clamp_to(&bounds);
+        assert_eq!(bal.get(GoodId(0)), 100);
+        assert_eq!(bal.get(GoodId(1)), -50);
+    }
+}
+
+// =====================================================================
+// BalanceTable: per-good signed integer table, fixed-size like `Cargo`.
+// =====================================================================
+
+/// Per-good signed integer (tons). Used for both `balance` and
+/// `base_bounds` on `PortMarket`. Same fixed-size layout as `Cargo`
+/// for cache parity and to allow indexing by `GoodId` without bounds
+/// checks in release.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BalanceTable {
+    tons: [i32; CARGO_SLOTS],
+}
+
+impl Default for BalanceTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl BalanceTable {
+    pub const fn new() -> Self {
+        Self {
+            tons: [0; CARGO_SLOTS],
+        }
+    }
+
+    #[inline]
+    fn idx(id: GoodId) -> usize {
+        debug_assert!(
+            (id.0 as usize) < CARGO_SLOTS,
+            "GoodId {} >= CARGO_SLOTS ({}); enlarge cargo::CARGO_SLOTS",
+            id.0,
+            CARGO_SLOTS,
+        );
+        id.0 as usize
+    }
+
+    #[inline]
+    pub fn get(&self, id: GoodId) -> i32 {
+        let i = Self::idx(id);
+        if i < CARGO_SLOTS {
+            self.tons[i]
+        } else {
+            0
+        }
+    }
+
+    #[inline]
+    pub fn set(&mut self, id: GoodId, value: i32) {
+        let i = Self::idx(id);
+        if i < CARGO_SLOTS {
+            self.tons[i] = value;
+        }
+    }
+
+    #[inline]
+    pub fn add(&mut self, id: GoodId, delta: i32) {
+        let i = Self::idx(id);
+        if i < CARGO_SLOTS {
+            self.tons[i] = self.tons[i].saturating_add(delta);
+        }
+    }
+
+    /// Iterate over `(GoodId, value)` pairs for slots whose value is
+    /// non-zero. Slot order is GoodId-ascending; deterministic.
+    pub fn iter(&self) -> impl Iterator<Item = (GoodId, i32)> + '_ {
+        self.tons
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &v)| (v != 0).then_some((GoodId(i as u8), v)))
+    }
+
+    /// Clamp every entry of `self` into `[-bounds.get(id), +bounds.get(id)]`.
+    /// Bounds entries that are zero leave `self` untouched at that slot.
+    pub fn clamp_to(&mut self, bounds: &BalanceTable) {
+        for i in 0..CARGO_SLOTS {
+            let b = bounds.tons[i];
+            if b > 0 {
+                self.tons[i] = self.tons[i].clamp(-b, b);
+            }
+        }
+    }
+}
+
+impl FromIterator<(GoodId, i32)> for BalanceTable {
+    fn from_iter<I: IntoIterator<Item = (GoodId, i32)>>(iter: I) -> Self {
+        let mut t = BalanceTable::new();
+        for (id, v) in iter {
+            t.set(id, v);
+        }
+        t
     }
 }

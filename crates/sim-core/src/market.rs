@@ -11,6 +11,7 @@
 
 use crate::cargo::Cargo;
 use crate::goods::{GoodId, GoodsRegistry};
+use crate::market_curve::{self, BalanceTable};
 use crate::money::Pesos;
 
 /// Initial stockpile per good when a market is first constructed. Big
@@ -102,9 +103,109 @@ pub struct PortMarket {
     /// budgets (fleets, fortifications).
     pub crown_silver: Pesos,
     pub recipe: ProductionRecipe,
+    /// Phase B.1 (additive — not yet consumed): per-good RON-declared
+    /// base bound (max signed balance, prosperity = 1.0). Derived
+    /// heuristically from `recipe` at construction time until
+    /// per-port-per-good RON overrides land in Phase B.5.
+    pub base_bounds: BalanceTable,
+    /// Phase B.1 (additive — not yet consumed): per-good signed trade
+    /// balance, the redesign's replacement for `stockpile - debt`.
+    /// Initialized to mirror the existing seeded stockpile state so
+    /// Phase B.2 can switch reads over without economic discontinuity.
+    /// Stays stale during Phase B.1 (existing buy/sell don't update
+    /// it); Phase B.3 wires mutation in.
+    pub balance: BalanceTable,
+}
+
+/// Free-function form of `PortMarket::target_stock` — same heuristic
+/// (six months of recipe gross throughput), usable from `PortMarket`
+/// constructors before `self` exists. Returns 0 when neither flow is set.
+fn recipe_target_stock(recipe: &ProductionRecipe, id: GoodId) -> f32 {
+    let from_outputs = recipe
+        .monthly_outputs
+        .iter()
+        .find(|(g, _)| *g == id)
+        .map(|(_, t)| *t)
+        .unwrap_or(0.0);
+    let from_inputs = recipe
+        .monthly_inputs
+        .iter()
+        .find(|(g, _)| *g == id)
+        .map(|(_, t)| *t)
+        .unwrap_or(0.0);
+    from_outputs.max(from_inputs) * 6.0
 }
 
 impl PortMarket {
+    /// Per-good base bound (Phase B.1 heuristic): twelve months of the
+    /// recipe's gross throughput (max of output and input rates),
+    /// floored at 1 ton. So a port with `monthly_outputs = 80 t sugar`
+    /// gets `base_bound[SUGAR] = 960`. Replaced by per-port-per-good
+    /// RON declarations in Phase B.5.
+    fn derive_base_bounds(recipe: &ProductionRecipe) -> BalanceTable {
+        let mut bounds = BalanceTable::new();
+        for (id, tons) in &recipe.monthly_outputs {
+            let prior = bounds.get(*id);
+            let candidate = (tons * 12.0).round() as i32;
+            if candidate > prior {
+                bounds.set(*id, candidate.max(1));
+            }
+        }
+        for (id, tons) in &recipe.monthly_inputs {
+            let prior = bounds.get(*id);
+            let candidate = (tons * 12.0).round() as i32;
+            if candidate > prior {
+                bounds.set(*id, candidate.max(1));
+            }
+        }
+        bounds
+    }
+
+    /// Initial signed balance for `good` given the current stockpile
+    /// `stock_tons` and `recipe`. Mirrors the historical seeding intent:
+    /// surplus (output goods seeded at 12× monthly) maps to +bound/2;
+    /// shortage (input goods seeded at 3× monthly) maps to -bound/2;
+    /// goods absent from the recipe stay at 0.
+    ///
+    /// Phase B.1 derives this once from initial stockpile so Phase B.2
+    /// can switch reads over without breaking economic seeding. Phase
+    /// B.3 starts mutating it directly; the dependency on stockpile
+    /// disappears in B.5.
+    fn derive_initial_balance(
+        recipe: &ProductionRecipe,
+        bounds: &BalanceTable,
+        stockpile: &Cargo,
+    ) -> BalanceTable {
+        let mut balance = BalanceTable::new();
+        for (id, _) in &recipe.monthly_outputs {
+            let target = recipe_target_stock(recipe, *id);
+            let bound = bounds.get(*id);
+            if target > 0.0 && bound > 0 {
+                let offset = ((stockpile.get(*id) - target) / target) * bound as f32;
+                balance.set(*id, (offset.round() as i32).clamp(-bound, bound));
+            }
+        }
+        for (id, _) in &recipe.monthly_inputs {
+            // Avoid double-init for goods that appear in both.
+            if balance.get(*id) != 0 {
+                continue;
+            }
+            let target = recipe_target_stock(recipe, *id);
+            let bound = bounds.get(*id);
+            if target > 0.0 && bound > 0 {
+                let offset = ((stockpile.get(*id) - target) / target) * bound as f32;
+                balance.set(*id, (offset.round() as i32).clamp(-bound, bound));
+            }
+        }
+        balance
+    }
+
+    /// Effective per-good bound after applying prosperity. Floored at 1.
+    /// Phase B.2 will use this to call `market_curve::price_multiplier`.
+    pub fn effective_bound(&self, id: GoodId) -> i32 {
+        market_curve::effective_bound(self.base_bounds.get(id), self.recipe.prosperity)
+    }
+
     /// Construct a market with a uniform initial stockpile of every
     /// good in the registry. Useful for tests; `World::load` instead
     /// uses `with_recipe` to seed each port to its target stock so
@@ -114,12 +215,17 @@ impl PortMarket {
         for good in registry.iter() {
             stockpile.add(good.id, INITIAL_STOCKPILE_TONS);
         }
+        let recipe = ProductionRecipe::empty();
+        let base_bounds = Self::derive_base_bounds(&recipe);
+        let balance = Self::derive_initial_balance(&recipe, &base_bounds, &stockpile);
         Self {
             stockpile,
             debt: Cargo::new(),
             silver: INITIAL_PORT_SILVER_PESOS,
             crown_silver: Pesos::ZERO,
-            recipe: ProductionRecipe::empty(),
+            recipe,
+            base_bounds,
+            balance,
         }
     }
 
@@ -156,11 +262,15 @@ impl PortMarket {
                 stockpile.add(*id, *tons * 3.0);
             }
         }
+        let base_bounds = Self::derive_base_bounds(&recipe);
+        let balance = Self::derive_initial_balance(&recipe, &base_bounds, &stockpile);
         Self {
             stockpile,
             debt: Cargo::new(),
             silver: INITIAL_PORT_SILVER_PESOS,
             crown_silver: Pesos::ZERO,
+            base_bounds,
+            balance,
             recipe,
         }
     }
@@ -301,21 +411,7 @@ impl PortMarket {
     /// the local supply. Returns 0.0 when neither flow is set, which
     /// gives flat base pricing.
     fn target_stock(&self, id: GoodId) -> f32 {
-        let from_outputs = self
-            .recipe
-            .monthly_outputs
-            .iter()
-            .find(|(g, _)| *g == id)
-            .map(|(_, t)| *t)
-            .unwrap_or(0.0);
-        let from_inputs = self
-            .recipe
-            .monthly_inputs
-            .iter()
-            .find(|(g, _)| *g == id)
-            .map(|(_, t)| *t)
-            .unwrap_or(0.0);
-        from_outputs.max(from_inputs) * 6.0
+        recipe_target_stock(&self.recipe, id)
     }
 
     /// Buy `requested_tons` of `id` from this market on behalf of `ship`.
@@ -814,6 +910,66 @@ mod tests {
         let market = PortMarket::with_initial_stockpile(&registry);
         for good in registry.iter() {
             assert_eq!(market.stockpile.get(good.id), INITIAL_STOCKPILE_TONS);
+        }
+    }
+
+    #[test]
+    fn phase_b1_seeds_bounds_and_balance_for_recipe_goods() {
+        let registry = GoodsRegistry::starter();
+        let market = PortMarket::with_recipe(&registry, PortArchetype::SugarIsland.recipe());
+
+        // SUGAR is in monthly_outputs at 80 t/mo → base_bound = 960,
+        // stockpile = 12 * 80 = 960, target = 6 * 80 = 480, so
+        // initial balance = ((960-480)/480) * 960 = 960 → clamped to +960.
+        let sugar_bound = market.base_bounds.get(ids::SUGAR);
+        assert_eq!(sugar_bound, 960);
+        let sugar_balance = market.balance.get(ids::SUGAR);
+        assert_eq!(sugar_balance, sugar_bound, "saturated surplus expected");
+
+        // MANUFACTURES is monthly_inputs at 6 t/mo → base_bound = 72,
+        // stockpile = 3 * 6 = 18, target = 6 * 6 = 36, so
+        // initial balance = ((18-36)/36) * 72 = -36 = -bound/2.
+        let mfg_bound = market.base_bounds.get(ids::MANUFACTURES);
+        assert_eq!(mfg_bound, 72);
+        assert_eq!(market.balance.get(ids::MANUFACTURES), -36);
+
+        // Effective bound at prosperity 1.0 == base_bound.
+        assert_eq!(market.effective_bound(ids::SUGAR), 960);
+        assert_eq!(market.effective_bound(ids::MANUFACTURES), 72);
+    }
+
+    #[test]
+    fn phase_b1_balance_within_bounds_for_all_archetypes() {
+        let registry = GoodsRegistry::starter();
+        let archetypes = [
+            PortArchetype::SugarIsland,
+            PortArchetype::TobaccoColony,
+            PortArchetype::NorthAmericanFarming,
+            PortArchetype::SpanishTreasure,
+            PortArchetype::SpanishEntrepot,
+            PortArchetype::PirateHaven,
+            PortArchetype::Minor,
+            PortArchetype::EuropeanLondon,
+            PortArchetype::EuropeanAmsterdam,
+            PortArchetype::EuropeanCadiz,
+            PortArchetype::EuropeanNantes,
+            PortArchetype::AfricanElmina,
+            PortArchetype::AfricanOuidah,
+        ];
+        for arch in archetypes {
+            let m = PortMarket::with_recipe(&registry, arch.recipe());
+            for (id, bound) in m.base_bounds.iter() {
+                let bal = m.balance.get(id);
+                assert!(
+                    bal.abs() <= bound,
+                    "{:?}: balance {} exceeds bound {} for good {:?}",
+                    arch,
+                    bal,
+                    bound,
+                    id,
+                );
+                assert!(bound >= 1, "bound must be at least 1");
+            }
         }
     }
 
