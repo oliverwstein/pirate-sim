@@ -778,14 +778,18 @@ impl World {
         let mut results: Vec<(ShipId, Vec<(ShipId, crate::command::ShipCommand)>)> = pairs
             .into_par_iter()
             .map(|(id, ship, ai)| {
-                let ship_stats: ShipStats = ship_types.get(ship.ship_type).stats.clone();
+                // Perf Phase 1: borrow the registry's ShipStats instead
+                // of cloning per ship per tick. `ship_types` is captured
+                // as `&self.ship_types` and outlives this closure; the
+                // returned reference is bound to that lifetime.
+                let ship_stats: &ShipStats = &ship_types.get(ship.ship_type).stats;
                 let wind = weather_wind.wind_at(ship.position, month);
                 let mut local_commands: Vec<(ShipId, crate::command::ShipCommand)> = Vec::new();
                 {
                     let mut inputs = crate::ai::ShipTickInputs {
                         me: id,
                         ship,
-                        stats: &ship_stats,
+                        stats: ship_stats,
                         wind: &wind,
                         ports,
                         harbors,
