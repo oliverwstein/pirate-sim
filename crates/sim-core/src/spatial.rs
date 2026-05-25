@@ -22,10 +22,14 @@
 //! similarly bounded). A range query of `r` NM touches at most a
 //! `ceil(2r / cell) + 1` × `ceil(2r / cell) + 1` block of cells.
 //!
-//! Storage uses `BTreeMap` rather than `HashMap` so iteration order
-//! is deterministic across runs — important for reproducible benches.
-
-use std::collections::BTreeMap;
+//! ### Storage
+//!
+//! Internally a single `Vec<Entry>` sorted by cell key. Sorting once
+//! per rebuild and binary-searching for each cell touched by a query
+//! is significantly cache-friendlier than a `BTreeMap` of per-cell
+//! `Vec`s — the entire dataset is contiguous, prefetchable, and free
+//! of node-pointer chases. Sort uses `sort_by` keyed on cell + ShipId
+//! so the order is total and fully deterministic across runs.
 
 use crate::types::{Position, ShipId};
 
@@ -33,16 +37,31 @@ use crate::types::{Position, ShipId};
 /// docstring for the rationale.
 pub const SPATIAL_CELL_NM: f32 = 10.0;
 
-/// Uniform-grid spatial index keyed by `(cell_x, cell_y)` integer
-/// coordinates. Values are `(ShipId, exact_position)` tuples so range
-/// queries can do precise distance checks without external lookups.
+/// Packed (cell_x, cell_y) — sortable and cheap to compare.
+type CellKey = (i32, i32);
+
+#[derive(Debug, Clone, Copy)]
+struct Entry {
+    cell: CellKey,
+    id: ShipId,
+    pos: Position,
+}
+
+/// Uniform-grid spatial index. Build by clearing, inserting all
+/// entries, and querying with `neighbors`; the first query after
+/// inserts triggers a sort that puts entries from the same cell into
+/// a contiguous slice.
 #[derive(Debug, Default, Clone)]
 pub struct SpatialHash {
-    cells: BTreeMap<(i32, i32), Vec<(ShipId, Position)>>,
+    entries: Vec<Entry>,
+    /// True iff `entries` is currently sorted by `cell`. Cleared by
+    /// `insert`, set by the lazy sort inside `neighbors`. Avoids
+    /// re-sorting on every query when no inserts have happened.
+    sorted: bool,
 }
 
 #[inline]
-fn cell_of(pos: Position) -> (i32, i32) {
+fn cell_of(pos: Position) -> CellKey {
     (
         (pos.x / SPATIAL_CELL_NM).floor() as i32,
         (pos.y / SPATIAL_CELL_NM).floor() as i32,
@@ -54,47 +73,90 @@ impl SpatialHash {
         Self::default()
     }
 
-    /// Drop all entries. Cheap; the BTreeMap retains its allocated
-    /// node arena for reuse on the next rebuild.
+    /// Drop all entries. Cheap; the backing Vec retains its capacity
+    /// for reuse on the next rebuild.
     pub fn clear(&mut self) {
-        self.cells.clear();
+        self.entries.clear();
+        self.sorted = true; // empty is trivially sorted
     }
 
-    /// Insert one ship at `pos` into the cell it occupies.
+    /// Insert one ship at `pos`.
     pub fn insert(&mut self, id: ShipId, pos: Position) {
-        self.cells.entry(cell_of(pos)).or_default().push((id, pos));
+        self.entries.push(Entry {
+            cell: cell_of(pos),
+            id,
+            pos,
+        });
+        self.sorted = false;
     }
 
     /// Total number of inserted ships (for diagnostics / tests).
     pub fn len(&self) -> usize {
-        self.cells.values().map(|v| v.len()).sum()
+        self.entries.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.cells.is_empty()
+        self.entries.is_empty()
+    }
+
+    /// Sort entries by cell key, breaking ties on ShipId so the
+    /// ordering is total and deterministic. Idempotent. Call once
+    /// after all inserts and before any queries; `neighbors` panics
+    /// (in debug) if called on a dirty index, since silently sorting
+    /// inside a read-only query would force `&mut self` to propagate
+    /// through every caller.
+    pub fn finalize(&mut self) {
+        if self.sorted {
+            return;
+        }
+        // sort_unstable is acceptable because the key (cell, id) is a
+        // total order — no two entries can compare equal (a given
+        // ShipId appears at most once per rebuild).
+        self.entries
+            .sort_unstable_by(|a, b| a.cell.cmp(&b.cell).then_with(|| a.id.cmp(&b.id)));
+        self.sorted = true;
+    }
+
+    /// Return the contiguous slice of entries whose cell key equals
+    /// `cell`, or an empty slice if no such cell exists. Caller must
+    /// have already ensured the entries are sorted.
+    #[inline]
+    fn cell_slice(&self, cell: CellKey) -> &[Entry] {
+        // partition_point gives the first index >= cell; we then scan
+        // forward while the cell key matches. With sort by cell, all
+        // matching entries are contiguous.
+        let start = self.entries.partition_point(|e| e.cell < cell);
+        // Find end by another partition_point on the strict-greater
+        // predicate, but it's usually faster to scan since cells are
+        // small (typically <10 ships per 10-NM cell).
+        let mut end = start;
+        while end < self.entries.len() && self.entries[end].cell == cell {
+            end += 1;
+        }
+        &self.entries[start..end]
     }
 
     /// All ships within `range_nm` of `pos` (true Euclidean distance)
     /// for which `filter(id)` returns true. The filter is invoked only
     /// for entries that pass the distance check. Order of returned ids
-    /// is deterministic (BTreeMap iteration over cells, then insertion
-    /// order within each cell).
+    /// is deterministic.
     pub fn neighbors<F>(&self, pos: Position, range_nm: f32, mut filter: F) -> Vec<ShipId>
     where
         F: FnMut(ShipId) -> bool,
     {
+        debug_assert!(
+            self.sorted,
+            "SpatialHash::neighbors called before finalize(); call finalize() after inserts"
+        );
         let mut out = Vec::new();
         let r2 = range_nm * range_nm;
-        // Bounding box of cells that could contain a ship within range.
         let span = (range_nm / SPATIAL_CELL_NM).ceil() as i32;
         let (cx, cy) = cell_of(pos);
         for dx in -span..=span {
             for dy in -span..=span {
-                if let Some(bucket) = self.cells.get(&(cx + dx, cy + dy)) {
-                    for (id, p) in bucket {
-                        if p.distance_squared(pos) <= r2 && filter(*id) {
-                            out.push(*id);
-                        }
+                for entry in self.cell_slice((cx + dx, cy + dy)) {
+                    if entry.pos.distance_squared(pos) <= r2 && filter(entry.id) {
+                        out.push(entry.id);
                     }
                 }
             }
@@ -115,7 +177,8 @@ mod tests {
 
     #[test]
     fn empty_hash_returns_nothing() {
-        let sh = SpatialHash::new();
+        let mut sh = SpatialHash::new();
+        sh.finalize();
         let v = sh.neighbors(Position::new(0.0, 0.0), 100.0, |_| true);
         assert!(v.is_empty());
         assert!(sh.is_empty());
@@ -129,6 +192,7 @@ mod tests {
         sh.insert(ids[1], Position::new(5.0, 0.0)); // 5 NM east
         sh.insert(ids[2], Position::new(50.0, 0.0)); // 50 NM east
         sh.insert(ids[3], Position::new(0.0, 9.0)); // 9 NM north
+        sh.finalize();
 
         // Range 10 NM from origin: should catch 0, 1, 3 but not 2.
         let mut got = sh.neighbors(Position::new(0.0, 0.0), 10.0, |_| true);
@@ -148,6 +212,7 @@ mod tests {
         let mut sh = SpatialHash::new();
         sh.insert(ids[0], Position::new(0.5, 0.5));
         sh.insert(ids[1], Position::new(7.0, 7.0)); // ~9.19 NM away
+        sh.finalize();
 
         let near = sh.neighbors(Position::new(0.5, 0.5), 10.0, |_| true);
         assert!(near.contains(&ids[0]) && near.contains(&ids[1]));
@@ -163,6 +228,7 @@ mod tests {
         sh.insert(ids[0], Position::new(0.0, 0.0));
         sh.insert(ids[1], Position::new(2.0, 0.0));
         sh.insert(ids[2], Position::new(3.0, 0.0));
+        sh.finalize();
 
         let me = ids[0];
         let others = sh.neighbors(Position::new(0.0, 0.0), 100.0, |id| id != me);
@@ -184,13 +250,35 @@ mod tests {
 
     #[test]
     fn cells_partition_negative_coords() {
-        // Verifies cell_of handles negative positions correctly (floor,
-        // not truncate). Ships at (-1, -1) and (1, 1) live in cells
-        // (-1, -1) and (0, 0) respectively.
         let ids = mk_ids(2);
         let mut sh = SpatialHash::new();
         sh.insert(ids[0], Position::new(-1.0, -1.0));
         sh.insert(ids[1], Position::new(1.0, 1.0));
-        assert_eq!(sh.cells.len(), 2);
+        sh.finalize();
+        let near = sh.neighbors(Position::new(1.0, 1.0), 0.5, |_| true);
+        assert_eq!(near, vec![ids[1]]);
+    }
+
+    #[test]
+    fn deterministic_neighbor_order_across_rebuilds() {
+        let ids = mk_ids(5);
+        let positions = [
+            Position::new(0.0, 0.0),
+            Position::new(2.0, 0.0),
+            Position::new(0.0, 2.0),
+            Position::new(2.0, 2.0),
+            Position::new(50.0, 50.0),
+        ];
+        let mut a = SpatialHash::new();
+        let mut b = SpatialHash::new();
+        for i in 0..ids.len() {
+            a.insert(ids[i], positions[i]);
+            b.insert(ids[i], positions[i]);
+        }
+        a.finalize();
+        b.finalize();
+        let na = a.neighbors(Position::new(0.0, 0.0), 5.0, |_| true);
+        let nb = b.neighbors(Position::new(0.0, 0.0), 5.0, |_| true);
+        assert_eq!(na, nb);
     }
 }

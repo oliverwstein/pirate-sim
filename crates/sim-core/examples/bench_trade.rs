@@ -222,10 +222,12 @@ fn main() {
         let Some(ship) = world.ships.get(id) else {
             continue;
         };
-        let pl = (ship.silver - ship.starting_silver) + ship.lifetime_dividends - ship.debt;
+        let pl = (ship.silver - ship.starting_silver + ship.lifetime_dividends - ship.debt)
+            .as_pesos_f32();
         total_pl += pl;
-        total_debt += ship.debt;
-        let is_bankrupt = ship.silver < 50.0 && ship.lifetime_dividends < 1.0;
+        total_debt += ship.debt.as_pesos_f32();
+        let is_bankrupt = ship.silver < sim_core::money::Pesos::from_pesos(50)
+            && ship.lifetime_dividends < sim_core::money::Pesos::from_pesos(1);
         if is_bankrupt {
             bankrupt += 1;
         }
@@ -252,7 +254,7 @@ fn main() {
         let b = buckets.entry((faction_key, type_key)).or_default();
         b.n += 1;
         b.pl += pl;
-        b.debt += ship.debt;
+        b.debt += ship.debt.as_pesos_f32();
         b.hull_pct += hull_pct;
         b.rig_pct += rig_pct;
         if ship.policy == ShipPolicy::Pirate {
@@ -360,6 +362,10 @@ fn main() {
             "Prize outcomes: {} taken (flipped to pirate), {} sold at haven, {} sunk, {} released",
             world.prizes_taken, world.prizes_sold, world.prizes_sunk, world.prizes_released,
         );
+        println!(
+            "Prize tow:      {} still in tow at end-of-run, {} orphaned (victor sank en route); arrived-and-sold tows are counted in `sold at haven` above",
+            world.prizes_in_tow, world.prizes_orphaned,
+        );
         // Step 10.b: non-combat attrition breakdown. Storm/foundering/
         // fire counters are sinkings only; storm damage that didn't
         // sink the hull lives in `weather.hazards.counters.storms_damaged`.
@@ -411,7 +417,9 @@ fn main() {
     if world.ships.len() > n_ships {
         let mut counts: std::collections::BTreeMap<&str, u32> = std::collections::BTreeMap::new();
         for &id in ship_ids.iter().skip(n_ships) {
-            let ship = &world.ships[id];
+            let Some(ship) = world.ships.get(id) else {
+                continue;
+            };
             let name = world.ship_types.get(ship.ship_type).name.as_str();
             *counts.entry(name).or_insert(0) += 1;
         }
@@ -640,7 +648,7 @@ fn main() {
     let losers = world
         .ships
         .values()
-        .filter(|s| (s.silver - s.starting_silver) + s.lifetime_dividends < 0.0)
+        .filter(|s| (s.silver - s.starting_silver + s.lifetime_dividends).is_negative())
         .count();
     if bankrupt > 0 {
         println!(
@@ -652,7 +660,14 @@ fn main() {
             "  ⚠ {} ship(s) ended in the red — successful voyages should reliably profit",
             losers
         );
-    } else if total_pl < world.ships.values().map(|s| s.starting_silver).sum::<f32>() * 0.5 {
+    } else if total_pl
+        < world
+            .ships
+            .values()
+            .map(|s| s.starting_silver.as_pesos_f32())
+            .sum::<f32>()
+            * 0.5
+    {
         println!("  ⚠ fleet barely profitable — trade margins or world prices may be too thin");
     } else {
         println!("  ✓ every ship in the black with healthy variance");

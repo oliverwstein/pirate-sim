@@ -92,6 +92,15 @@ pub const WINNER_CASUALTY_RATE: f32 = 0.20;
 /// giving the prize enough hands to make port.
 pub const PRIZE_CREW_SPLIT: f32 = 0.5;
 
+/// Phase 4 §3c-2b: fraction of the victor's surviving crew transferred
+/// to a *tow* prize (the `sell` outcome — prize sails to the victor's
+/// port and sells on arrival). Smaller than `PRIZE_CREW_SPLIT` because
+/// the tow prize only needs enough hands to sail, not to fight. If the
+/// victor cannot spare even this many crew, `resolve_prize_action`
+/// falls back to the instant-sell behavior (cargo stripped + prize
+/// sunk, silver paid immediately).
+pub const PRIZE_TOW_CREW_SPLIT: f32 = 0.20;
+
 /// Minimum closest approach (NM) between two line segments over a unit
 /// tick. Both ships are modeled as travelling at constant velocity for
 /// the duration of the tick — a good approximation for the 1-hour
@@ -194,6 +203,62 @@ pub fn broadside_supply_cost(cannons: u16) -> (f32, f32) {
     let guns = cannons as f32;
     (POWDER_TONS_PER_GUN * guns, SHOT_TONS_PER_GUN * guns)
 }
+
+// ── Phase 4 §3b: sub-tick reload model ──────────────────────────────────
+
+/// Minutes for a fully-seasoned crew (`seasoned_ratio == 1.0`) to reload
+/// the great-gun battery. Three minutes ≈ the published RN ideal for
+/// well-drilled 17C ships; faster crews (Nelson-era 90-second drills)
+/// are out of period for this sim.
+pub const RELOAD_MINUTES_SEASONED: f32 = 3.0;
+
+/// Minutes for a fully-green crew (`seasoned_ratio == 0.0`) to reload.
+/// Six minutes matches contemporary complaints about scratch crews on
+/// freshly-pressed Spanish galleons and merchantmen converted to
+/// privateers, where the time between effective broadsides was twice
+/// or more that of veteran ships. The 2× spread between seasoned and
+/// green is the single biggest payoff of the `crew_seasoned` machinery
+/// (Phase 3 / A2).
+pub const RELOAD_MINUTES_GREEN: f32 = 6.0;
+
+/// Phase 4 §3b: minutes from `now` before this crew can next fire a
+/// broadside. Linear interpolation in the seasoned ratio between
+/// `RELOAD_MINUTES_GREEN` (ratio = 0.0) and `RELOAD_MINUTES_SEASONED`
+/// (ratio = 1.0). Floored at 1 minute so the u64 sub-tick clock can
+/// always make forward progress.
+pub fn reload_minutes(seasoned_ratio: f32) -> u64 {
+    let r = seasoned_ratio.clamp(0.0, 1.0);
+    let mins = RELOAD_MINUTES_GREEN + r * (RELOAD_MINUTES_SEASONED - RELOAD_MINUTES_GREEN);
+    mins.round().max(1.0) as u64
+}
+
+/// Phase 4 §3b: minutes per sub-tick step inside an engagement-locked
+/// hour. 12 sub-ticks fit in one hourly tick (12 × 5 = 60).
+pub const MINUTES_PER_SUB_TICK: u64 = 5;
+
+/// Phase 4 §3b: number of sub-tick steps per hourly tick.
+pub const SUB_TICKS_PER_HOUR: u64 = 12;
+
+// ── Phase 4 §3c-1: tactical-judgment threshold ──────────────────────────
+
+/// Range (NM) beyond which a ship may consider the engaged counterpart
+/// to be "opening" rather than "closing". Used by tactical-judgment
+/// conditions in `ai.rs` (e.g., a slower defender that has already
+/// pulled past this threshold and is faster may safely break off).
+/// Tuned to roughly two cannon ranges so a single tack outside the
+/// fight envelope does not count as a real opening.
+pub const ESCAPE_THRESHOLD_NM: f32 = 4.0;
+
+// ── Phase 4 §3c-2: surrender threshold ──────────────────────────────────
+
+/// Composite threshold on `morale × hull_fraction` below which a ship's
+/// captain considers striking colors (surrender). At 0.15 this fires
+/// for, e.g., 30% morale with 50% hull, or 50% morale with 30% hull —
+/// both consistent with the historical "fight is lost, save the crew"
+/// inflection. Combined in `ai.rs::should_strike` with a "cannot
+/// outrun the counterpart" gate so a fast, lightly-damaged ship still
+/// tries to escape before surrendering.
+pub const STRIKE_THRESHOLD: f32 = 0.15;
 
 #[cfg(test)]
 mod tests {

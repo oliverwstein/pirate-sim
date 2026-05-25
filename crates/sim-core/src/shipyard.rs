@@ -35,6 +35,7 @@
 
 use crate::goods::{ids, GoodsRegistry};
 use crate::market::PortMarket;
+use crate::money::Pesos;
 use crate::port::Port;
 use crate::ship::Ship;
 use crate::shiptype::{ShipType, ShipTypeId, ShipTypeRegistry};
@@ -59,7 +60,7 @@ pub const REFERENCE_CARGO_TONS: f32 = 60.0;
 /// Lower bound on the starting silver handed to a freshly-built
 /// ship. Even if the home port has nothing cheap to export, we don't
 /// want a brand-new vessel to be unable to buy *any* cargo.
-pub const STARTING_SILVER_FLOOR: f32 = 2000.0;
+pub const STARTING_SILVER_FLOOR: Pesos = Pesos::from_pesos(2000);
 
 /// Soft cap on starting silver: at most this fraction of the port's
 /// treasury, so a flagship Amsterdam ship can't bankrupt its own
@@ -69,15 +70,20 @@ pub const STARTING_SILVER_PORT_FRACTION_CAP: f32 = 0.5;
 /// Cost decomposition of a single build, in pesos.
 #[derive(Debug, Clone, Copy)]
 pub struct BuildCost {
-    pub silver: f32,
+    pub silver: Pesos,
     pub naval_stores: f32,
     pub manufactures: f32,
     pub provisions: f32,
 }
 
 impl BuildCost {
+    /// Aggregate cost for ROI comparison. The silver line is currency
+    /// (pesos); the other lines are tons × buy-price (f32 pesos). For
+    /// the shipyard's relative ROI ranking we add them in f32 — the
+    /// silver column is converted back via `as_pesos_f32()`. Storage
+    /// stays exact; this helper is just a scoring aid.
     pub fn total(&self) -> f32 {
-        self.silver + self.naval_stores + self.manufactures + self.provisions
+        self.silver.as_pesos_f32() + self.naval_stores + self.manufactures + self.provisions
     }
 }
 
@@ -96,7 +102,7 @@ pub fn build_cost(ty: &ShipType, market: &PortMarket, goods: &GoodsRegistry) -> 
 /// home port: enough to buy one full hold of the average local
 /// export, floored at `STARTING_SILVER_FLOOR` and capped at
 /// `STARTING_SILVER_PORT_FRACTION_CAP × port_silver`.
-pub fn starting_silver(ty: &ShipType, market: &PortMarket, goods: &GoodsRegistry) -> f32 {
+pub fn starting_silver(ty: &ShipType, market: &PortMarket, goods: &GoodsRegistry) -> Pesos {
     let outputs = &market.recipe.monthly_outputs;
     let raw = if outputs.is_empty() {
         STARTING_SILVER_FLOOR
@@ -106,9 +112,9 @@ pub fn starting_silver(ty: &ShipType, market: &PortMarket, goods: &GoodsRegistry
             .map(|(g, _)| market.buy_price(*g, goods))
             .sum::<f32>()
             / outputs.len() as f32;
-        ty.stats.cargo_capacity_tons * avg_export_price
+        Pesos::from_pesos_f32(ty.stats.cargo_capacity_tons * avg_export_price)
     };
-    let cap = market.silver * STARTING_SILVER_PORT_FRACTION_CAP;
+    let cap = market.silver.scale(STARTING_SILVER_PORT_FRACTION_CAP);
     raw.max(STARTING_SILVER_FLOOR)
         .min(cap.max(STARTING_SILVER_FLOOR))
 }
@@ -129,8 +135,8 @@ pub enum BuildOutcome {
     NoTypePencils, // all allowed types failed the hurdle or input checks
     Built {
         ship_type: ShipTypeId,
-        cost: f32,
-        starting_silver: f32,
+        cost: Pesos,
+        starting_silver: Pesos,
     },
 }
 
@@ -237,7 +243,7 @@ pub fn try_build(
     (
         BuildOutcome::Built {
             ship_type: chosen,
-            cost: total_cost,
+            cost: Pesos::from_pesos_f32(total_cost),
             starting_silver: start_silver,
         },
         Some(ship),
@@ -282,7 +288,7 @@ mod tests {
         market.stockpile.add(ids::NAVAL_STORES, 200.0);
         market.stockpile.add(ids::MANUFACTURES, 200.0);
         market.stockpile.add(ids::PROVISIONS, 200.0);
-        market.silver = 100_000.0;
+        market.silver = Pesos::from_pesos(100_000);
         market
     }
 
@@ -350,7 +356,7 @@ mod tests {
         let (outcome, _ship) = try_build(&port, 0, &mut market, &goods, &types, 500.0);
         assert!(matches!(outcome, BuildOutcome::Built { .. }));
         let sloop = types.get(st_ids::SLOOP);
-        assert!((silver_before - market.silver - sloop.build_silver).abs() < 1e-2);
+        assert_eq!(silver_before - market.silver, sloop.build_silver);
         assert!(
             ns_before - market.stockpile.get(ids::NAVAL_STORES) >= sloop.build_naval_stores - 1e-3
         );

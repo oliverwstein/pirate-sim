@@ -11,6 +11,7 @@ use sim_core::combat::{
     broadside_supply_cost, compute_broadside_damage, CANNON_RANGE_NM, LONG_RANGE_FALLOFF,
 };
 use sim_core::goods::ids::{CANNON_SHOT, GUNPOWDER};
+use sim_core::money::Pesos;
 use sim_core::ship::{Ship, ShipStats};
 use sim_core::types::WindVector;
 use std::path::Path;
@@ -193,7 +194,7 @@ fn pirate_boards_dismasted_merchant_and_resolves_prize() {
     let pirate_stats = world.ship_types.get(pirate.ship_type).stats.clone();
     pirate.crew_alive = pirate_stats.crew_typical();
     pirate.morale = 1.0;
-    pirate.silver = 0.0;
+    pirate.silver = Pesos::ZERO;
     pirate.cargo = Cargo::new();
     pirate.cargo.add(GUNPOWDER, 4.0);
     pirate.cargo.add(CANNON_SHOT, 4.0);
@@ -211,14 +212,19 @@ fn pirate_boards_dismasted_merchant_and_resolves_prize() {
     // boarders stripped both.
     merchant.cargo = Cargo::new();
     merchant.cargo.add(SUGAR, 20.0);
-    merchant.silver = 500.0;
+    merchant.silver = Pesos::from_pesos(500);
     let merchant_id = world.add_ship(merchant, ShipAI::with_seed(11));
 
     world.tick();
 
-    // Some prize outcome must have been recorded.
-    let total_outcomes =
-        world.prizes_taken + world.prizes_sold + world.prizes_sunk + world.prizes_released;
+    // Some prize outcome must have been recorded. §3c-2b: a sell roll
+    // now places the prize *in tow* rather than instantly sinking her,
+    // so `prizes_in_tow` counts toward the outcome tally.
+    let total_outcomes = world.prizes_taken
+        + world.prizes_sold
+        + world.prizes_sunk
+        + world.prizes_released
+        + world.prizes_in_tow;
     assert!(
         total_outcomes >= 1,
         "boarding should have produced at least one prize outcome, counters were 0"
@@ -234,19 +240,26 @@ fn pirate_boards_dismasted_merchant_and_resolves_prize() {
     assert!(pirate_after.crew_alive < pirate_stats.crew_typical());
 
     if let Some(merch) = world.ships.get(merchant_id) {
-        // If the merchant survived, it must be either released (still
-        // a merchant) or taken (flag flipped, faction inherited). In
-        // either case its cargo should have been stripped of sugar.
+        // §3c-2b: a `sell` outcome now sets the prize in tow rather
+        // than instant-selling. In that case the prize is still in
+        // the world with cargo intact, `prize_owner == Some(pirate)`,
+        // policy flipped to Pirate. Other surviving outcomes are
+        // `take` (flag flipped, cargo intact) and `release` (cargo
+        // stripped, original policy). Sink/instant-sell would have
+        // removed the ship from the world (handled in the `else`).
         let sugar_left = merch.cargo.get(SUGAR);
-        assert!(
-            sugar_left == 0.0,
-            "merchant's cargo should be stripped after the boarding (sugar={})",
-            sugar_left
-        );
-        if merch.policy == ShipPolicy::Pirate {
+        if merch.prize_owner == Some(pirate_id) {
+            assert_eq!(world.prizes_in_tow, 1);
+            assert_eq!(merch.policy, ShipPolicy::Pirate);
+        } else if merch.policy == ShipPolicy::Pirate {
             assert_eq!(world.prizes_taken, 1);
         } else {
             assert_eq!(world.prizes_released, 1);
+            assert!(
+                sugar_left == 0.0,
+                "released merchant's cargo should be stripped (sugar={})",
+                sugar_left
+            );
         }
     } else {
         // Ship gone: must have been sunk or sold (both reaped).
@@ -256,7 +269,7 @@ fn pirate_boards_dismasted_merchant_and_resolves_prize() {
         );
         // And the attacker should have pocketed the cargo silver.
         assert!(
-            pirate_after.silver > 0.0,
+            pirate_after.silver > Pesos::ZERO,
             "non-take outcomes should bank stripped cargo silver"
         );
     }
@@ -362,4 +375,97 @@ fn under_crewed_pirate_cannot_take_prize() {
             "release outcome must leave the defender as a Merchant"
         );
     }
+}
+
+// ── Phase 4 §3a — sub-tick clock plumbing ─────────────────────────────
+
+/// Phase 4 §3a: `World::sim_minute` must advance by exactly 60 each
+/// hourly `tick()`. The upcoming sub-tick combat loop (§3b) keys
+/// reload timing off this counter, so any drift between calendar
+/// hours and the minute clock would silently miscalibrate reload
+/// rates.
+#[test]
+fn sim_minute_advances_60_per_hour() {
+    let mut world = fresh_world();
+    let start = world.sim_minute;
+    world.tick();
+    assert_eq!(world.sim_minute, start + sim_core::world::MINUTES_PER_HOUR);
+    for _ in 0..23 {
+        world.tick();
+    }
+    assert_eq!(
+        world.sim_minute,
+        start + 24 * sim_core::world::MINUTES_PER_HOUR
+    );
+}
+
+/// A2 (postmortem §3.2): hiring from a port with both seasoned and
+/// unseasoned hands draws seasoned first and the ship's
+/// `crew_seasoned` count matches exactly how many of the drawn sailors
+/// were seasoned. This is the only thing keeping `crew_seasoned` from
+/// silently drifting to zero across a fleet's lifetime.
+#[test]
+fn hiring_draws_seasoned_first_and_tracks_count() {
+    use sim_core::ai::ShipAI;
+    use sim_core::port::Faction;
+    use sim_core::ship::{Ship, ShipState};
+
+    let mut world = fresh_world();
+
+    // Pick port 0 as the hiring port and hand-set a known split:
+    // 3 seasoned + 100 unseasoned, well above any per-day cap so the
+    // hire is capped only by the daily cap (5/day at full morale).
+    let port_idx = 0usize;
+    {
+        let demo = world
+            .demographics
+            .get_mut(port_idx)
+            .expect("port 0 should have demographics");
+        demo.seasoned = 3;
+        demo.unseasoned = 100;
+    }
+    let port_pos = world.ports[port_idx].position;
+
+    // Place a freshly-built sloop in Hiring at that port with 0 crew.
+    let mut hull = Ship::seeded_at_port(port_pos, port_idx, Faction::England);
+    hull.state = ShipState::Hiring;
+    hull.crew_alive = 0;
+    hull.crew_seasoned = 0;
+    hull.silver = Pesos::from_pesos(10_000);
+    hull.nav.docked_at_port = None;
+    let id = world.add_ship(hull, ShipAI::with_seed(1));
+
+    // `tick_daily_hiring` only fires when the day-of-year changes,
+    // and `World::load` initializes `last_hire_day` to the current
+    // day. We need to roll the clock forward by 24 hourly ticks to
+    // cross into a new day and trigger one hire pass.
+    for _ in 0..48 {
+        world.tick();
+    }
+
+    let ship = world.ships.get(id).expect("hiring ship should survive");
+    // Per-day cap is 5; over 48 hours we cross one day boundary, so
+    // up to 5 sailors should have been drawn (one day of hiring).
+    // Critical invariant: of however many were drawn, the *seasoned*
+    // count must equal min(drawn, initial_seasoned_pool=3). The pool
+    // was 3 seasoned + 100 unseasoned, so any draw ≥ 3 should have
+    // exactly 3 seasoned in `crew_seasoned`.
+    assert!(
+        ship.crew_alive >= 3,
+        "expected at least 3 hires after a day rollover, got {}",
+        ship.crew_alive
+    );
+    let expected_seasoned = 3u16.min(ship.crew_alive);
+    assert_eq!(
+        ship.crew_seasoned, expected_seasoned,
+        "seasoned-first draw should have taken all {} seasoned hands before any unseasoned",
+        expected_seasoned
+    );
+    assert!(ship.crew_seasoned <= ship.crew_alive);
+
+    let demo = &world.demographics[port_idx];
+    assert_eq!(demo.seasoned, 0, "seasoned pool should be drained");
+    // Unseasoned pool drained by (drawn - seasoned_drawn).
+    let expected_unseasoned_left = 100u32 - (ship.crew_alive as u32 - expected_seasoned as u32);
+    assert_eq!(demo.unseasoned, expected_unseasoned_left);
 }

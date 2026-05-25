@@ -9,11 +9,18 @@
 //! equivalent over distances larger than a few NM and avoids the whole
 //! class of bugs where physical zig-zagging pushes a ship into a coastline.
 
-use std::collections::VecDeque;
+use arrayvec::ArrayVec;
 
 use crate::map::land::LandMap;
 use crate::ship::{angle_diff, normalize_angle, speed_at_heading, ShipStats};
+use crate::sim_rng::SimRng;
 use crate::types::{Position, ShipId, WindVector};
+
+/// Maximum number of intermediate waypoints a planned path may hold.
+/// Pathfind benchmark (1406 ordered port pairs) tops out at 37; 64 leaves
+/// generous headroom for future routes (e.g. via the Cape of Good Hope)
+/// without paying the per-ship heap allocation a `VecDeque` would.
+pub const MAX_WAYPOINTS: usize = 64;
 
 /// A steering command: the heading to set on the ship and the speed it
 /// should make good toward its target this tick (pre-fouling).
@@ -63,31 +70,8 @@ const NOON_SIGHT_NOISE_NM: f32 = 0.5;
 /// think you are — far better than a noon sight in both axes.
 const LANDMARK_FIX_NOISE_NM: f32 = 1.0;
 
-/// xorshift64 — same generator the AI already uses; mutates `state`.
-fn xorshift64(state: &mut u64) -> u64 {
-    let mut x = *state;
-    x ^= x << 13;
-    x ^= x >> 7;
-    x ^= x << 17;
-    *state = x;
-    x
-}
-
-/// Uniform in (0, 1].
-fn uniform01(state: &mut u64) -> f32 {
-    // Mask to 53 bits, divide by 2^53 — gives [0, 1). Add epsilon so
-    // the Box-Muller log doesn't blow up on 0.
-    let bits = xorshift64(state) >> 11;
-    (bits as f32 / (1u64 << 53) as f32).max(1e-7)
-}
-
-/// One sample of N(0, 1) via Box-Muller. Cheap (two uniforms, one log,
-/// one cos) and deterministic given the RNG state.
-fn gaussian(state: &mut u64) -> f32 {
-    let u1 = uniform01(state);
-    let u2 = uniform01(state);
-    (-2.0 * u1.ln()).sqrt() * (2.0 * std::f32::consts::PI * u2).cos()
-}
+// xorshift64 — legacy. Removed after PCG migration; the project-wide
+// generator now lives in `crate::sim_rng::SimRng`.
 
 /// Walk the dead-reckoning estimate by one hour. Error scales with the
 /// commanded speed — a ship hove-to at zero kt doesn't drift. The
@@ -97,11 +81,11 @@ pub fn apply_dr_error(
     estimate: &mut Position,
     speed_kt: f32,
     error_multiplier: f32,
-    rng_state: &mut u64,
+    rng: &mut SimRng,
 ) {
     let scale = (speed_kt.max(0.0) / 6.0) * error_multiplier; // 6 kt ≈ typical sloop cruise
-    estimate.x += gaussian(rng_state) * DR_ERROR_LON_NM_PER_HOUR * scale;
-    estimate.y += gaussian(rng_state) * DR_ERROR_LAT_NM_PER_HOUR * scale;
+    estimate.x += rng.gaussian() * DR_ERROR_LON_NM_PER_HOUR * scale;
+    estimate.y += rng.gaussian() * DR_ERROR_LAT_NM_PER_HOUR * scale;
 }
 
 /// Attempt a noon sight: at most once per simulated day. Returns `true`
@@ -113,12 +97,12 @@ pub fn try_noon_sight(
     truth: Position,
     day_of_year: u16,
     last_sight_day: &mut u16,
-    rng_state: &mut u64,
+    rng: &mut SimRng,
 ) -> bool {
     if day_of_year == 0 || day_of_year == *last_sight_day {
         return false;
     }
-    estimate.y = truth.y + gaussian(rng_state) * NOON_SIGHT_NOISE_NM;
+    estimate.y = truth.y + rng.gaussian() * NOON_SIGHT_NOISE_NM;
     *last_sight_day = day_of_year;
     true
 }
@@ -136,12 +120,12 @@ pub fn try_landmark_fix(
     estimate: &mut Position,
     truth: Position,
     ports: &[crate::port::Port],
-    rng_state: &mut u64,
+    rng: &mut SimRng,
 ) -> Option<usize> {
     for (idx, port) in ports.iter().enumerate() {
         if truth.distance(port.position) <= LANDMARK_SIGHT_NM {
-            estimate.x = truth.x + gaussian(rng_state) * LANDMARK_FIX_NOISE_NM;
-            estimate.y = truth.y + gaussian(rng_state) * LANDMARK_FIX_NOISE_NM;
+            estimate.x = truth.x + rng.gaussian() * LANDMARK_FIX_NOISE_NM;
+            estimate.y = truth.y + rng.gaussian() * LANDMARK_FIX_NOISE_NM;
             return Some(idx);
         }
     }
@@ -223,8 +207,10 @@ pub struct NavTrack {
     pub docked_at_port: Option<usize>,
     /// Ordered intermediate waypoints (front = next target). The final
     /// element should equal the captain's `NavGoal.destination` when a path
-    /// was planned.
-    pub waypoints: VecDeque<Position>,
+    /// was planned. Capped at [`MAX_WAYPOINTS`] so the queue lives inline
+    /// in the `Ship` struct (no per-ship heap allocation, no pointer chase
+    /// when combat/weather iterate over fleets).
+    pub waypoints: ArrayVec<Position, MAX_WAYPOINTS>,
 }
 
 impl NavTrack {
@@ -232,12 +218,22 @@ impl NavTrack {
         Self::default()
     }
 
-    /// Replace the current waypoint queue with a planned path. Caller is
-    /// responsible for keeping the captain's `NavGoal.destination` in sync
-    /// with the path's final waypoint (typically they already match because
-    /// the path was planned *to* the destination).
+    /// Replace the current waypoint queue with a planned path. Truncates
+    /// silently if `waypoints.len() > MAX_WAYPOINTS`; with the current
+    /// 64-slot cap and a measured max of 37, this never fires in practice
+    /// — a debug_assert catches it in dev so we notice if a future route
+    /// (e.g. a longer trans-oceanic leg) starts to need a bigger cap.
     pub fn set_path(&mut self, waypoints: Vec<Position>) {
-        self.waypoints = waypoints.into();
+        debug_assert!(
+            waypoints.len() <= MAX_WAYPOINTS,
+            "planned path of {} waypoints exceeds MAX_WAYPOINTS={}",
+            waypoints.len(),
+            MAX_WAYPOINTS
+        );
+        self.waypoints.clear();
+        for wp in waypoints.into_iter().take(MAX_WAYPOINTS) {
+            self.waypoints.push(wp);
+        }
     }
 
     /// Clear any planned path (keeps `goal.destination` in place).
@@ -247,7 +243,7 @@ impl NavTrack {
 
     /// The current heading target: front waypoint if any, else goal destination.
     fn current_target(&self, goal: &NavGoal) -> Option<Position> {
-        self.waypoints.front().copied().or(goal.destination)
+        self.waypoints.first().copied().or(goal.destination)
     }
 
     /// Compute steering (heading + commanded speed) given current position,
@@ -287,9 +283,11 @@ impl NavTrack {
         // DR plot, not at a GPS truth. The minor "corner cutting"
         // this causes when estimate is biased is bounded by DR
         // noise (a NM or two) — well under WAYPOINT_REACHED_NM.
-        while let Some(&wp) = self.waypoints.front() {
+        // ArrayVec has no pop_front; remove(0) is O(n) but n <= 64 and
+        // typically we pop at most a handful per tick.
+        while let Some(&wp) = self.waypoints.first() {
             if pos_estimate.distance(wp) < WAYPOINT_REACHED_NM {
-                self.waypoints.pop_front();
+                self.waypoints.remove(0);
             } else {
                 break;
             }

@@ -1011,3 +1011,744 @@ The bankruptcy bump is the expected counterpart to the mutiny drop: ships that p
 - Added `mutiny_skips_when_roll_above_probability`: with all deterministic conditions met but a roll just above the probability gate, no flip occurs.
 
 158 tests pass.
+
+## 2025-XX-XX — Phase 3 post-mortem cleanup (A1/A2/A3)
+
+Three focused refactors against `planning/phase-3-postmortem.md`, batched into one cleanup pass before drafting `phase-4-plan.md`.
+
+### A1 — Read-Compute-Write split in `tick_hourly_ai_and_physics` (`world.rs`)
+
+**Problem (postmortem §1).** The hourly tick fused three concerns into one per-ship loop: (a) the ship's AI ran and pushed `ShipCommand`s, (b) those commands were drained and applied *for that ship only*, and (c) the ship's resource/morale/physics tick ran. Combat commands push tuples shaped `(me, cmd)` where `me` is the *issuing* ship — but the drain step's filter conflated "this loop's ship" with "this command's target", giving order-dependent first-strike privileges to whichever ship's index was iterated first.
+
+**Fix.** Lifted the drain *out* of the per-ship loop. The hourly tick is now three phases iterating the same `ids` snapshot:
+
+1. **AI Phase** — `ai.tick(...)` for each ship; pushes to `self.commands`. No cross-ship mutation.
+2. **Resolution Phase** — drain `self.commands` once. Each tuple's first element is the attacker (no filtering needed). Steer / FireBroadside / AttemptBoard arms unchanged in mechanics, just relocated. Renamed local from `target` to `attacker` to match the tuple's semantics; fixed two stale `let attacker_id = id` references that should have been `let attacker_id = attacker`.
+3. **Mutation/Physics Phase** — for each ship: tick_resources, tick_morale, try_mutiny, hazards, wages, swept-physics-with-land. Order matches the original loop.
+
+**Determinism preserved** because the `ids` snapshot is collected once and reused across all three phases, and the per-ship RNG mixers (mutiny rolls share `self.combat_rng_state`; hazards use `self.weather.hazards`) read in the same order as before.
+
+**Validation.** All tests pass (158 → still 158 here, A2's tests come next). `bench_trade 730` post-A1: bankrupt 99→90, lost pirates 18→11, attrition 13→10 storm sinkings. The improvement is consistent with eliminating the artificial first-strike — the previous "faster ship in the iteration always shoots first" effect was reliably winning trades for pirates that shouldn't have won them.
+
+### A2 — `crew_seasoned: u16` on `Ship` (`ship.rs`)
+
+**Problem (postmortem §2 / crewing-plan §7.3).** `crew_alive` tracked headcount only — there was no way to distinguish a freshly-hired greenhorn crew from one that had survived a season of boarding actions and storms. Combat doctrine (Phase 4 +) needs this as a multiplier on rate-of-fire and boarding effectiveness.
+
+**Implementation.** New `u16` field with the invariant `crew_seasoned ≤ crew_alive`. Initialization:
+
+- `Ship::new` and `seeded_at_port_typed` → fully seasoned (veteran crews seeded on world genesis).
+- `freshly_built` (shipyard output) → 0 seasoned (hull-only).
+
+New methods:
+
+- `seasoned_ratio() -> f32` — for future combat modifiers.
+- `apply_crew_losses(losses)` — integer pro-rata split between seasoned and unseasoned, rounds toward zero (slightly biases losses toward unseasoned; acceptable for v1 and avoids float-determinism concerns).
+- `detach_prize_crew(amount) -> (alive, seasoned)` — pro-rata transfer when forming a prize crew.
+
+Wired in:
+
+- `tick_daily_hiring`: the hire loop already draws seasoned-first from the port pool; we now track the seasoned slice of `drawn` and credit it to `s.crew_seasoned` alongside `s.crew_alive`.
+- Boarding casualty application: replaced raw `saturating_sub` with `apply_crew_losses`.
+- "Take prize" branch: uses `detach_prize_crew` so the prize inherits its share of veterans.
+
+Three new unit tests in `ship.rs`: ratio preservation under losses, saturation + invariant, prize-crew split. 158 → 161 tests pass.
+
+### A3 — Multi-hop trade planning (`trade.rs`)
+
+**Problem (postmortem §2 "Home Bias / Amsterdam Fluyt pathology").** `find_best_trade` greedily scored single legs `A → B` by `sell_price_B − buy_price_A − distance_cost`, with a `home_bias` bonus applied to the immediate destination. Result: Barbados sloops locked onto Barbados↔Martinique oscillations (high single-leg margin, no onward export at Martinique), and Amsterdam-bound fluyts saturated single corridors because every cash-laden ship saw "going home" as the best single leg.
+
+**Fix.** Two-hop horizon (rolling — the AI still re-plans at every port, but it *scores* with a one-hop lookahead):
+
+1. For each candidate first hop `A → B`, look up the best speculative onward leg `B → C` (excluding `C = A` to forbid immediate-bounce trades).
+2. Score = `profit_AB + ONWARD_LOOKAHEAD_WEIGHT * min(profit_BC, profit_AB) + home_bonus`. Cap on `profit_BC` is critical (see calibration below).
+3. `home_bonus` applies to the *circuit terminus* (either `dest_idx == home` OR `onward_terminus == home`) — not just the immediate first hop. This is what kills the "ship goes home for the home bonus" pathology: the bias now requires the ship to *end* the multi-leg circuit at home.
+4. If there is no profitable onward leg from `B`, charge a `DEAD_END_PENALTY_PESOS_PER_TON` against the score.
+
+API back-compat preserved — `TradePlan` still carries only the first hop. Reported `estimated_profit_per_ton` is the unbiased single-leg margin (score is internal; analytics want the raw number).
+
+**Calibration story (worth recording).**
+
+| Variant | bankrupt @ 730d | notes |
+|---|---:|---|
+| Pre-A3 (post-A1 baseline) | 90 | |
+| `ONWARD_WEIGHT=0.5`, no cap | **162** | drained downstream ports forecast 300+ pesos/ton phantom sells; ships chased phantom circuits and over-committed |
+| `ONWARD_WEIGHT=0.15`, cap onward ≤ first-leg profit | **86** | clamp prevents speculative future from out-voting the certain present |
+
+Final constants: `ONWARD_LOOKAHEAD_WEIGHT = 0.15`, `DEAD_END_PENALTY_PESOS_PER_TON = 1.5`, `onward_used = min(onward_raw, first_leg_profit)`. The cap is the key insight: the lookahead is *real but speculative*; we don't trust it to override the immediate margin, only to break ties between equally-attractive immediate destinations.
+
+New private helper `best_single_leg_excluding(origin, exclude, ...)` factored out so both `find_best_trade` (for the lookahead) and future callers (post-prize replan, scout/observer behaviors) can share the same single-leg scoring path. New test `prefers_working_circuit_over_dead_end` pins the dead-end-vs-circuit decision with explicit recipes (custom `ProductionRecipe` for full control, since archetype defaults had confounding cross-good stockpiles).
+
+**Validation.** 162 tests pass (was 161; one new). Clippy clean. `bench_trade 730`: bankrupt 90 → 86 (∼5% drop, within noise but consistent). Prize activity up: from 0 taken / 1 sold / 1 sunk → 0 taken / 3 sold / 3 sunk (more ships now reach more ports). `bench_pathfind` unchanged (1406/1406 routes).
+
+**Performance.** Multi-hop is O(N²M²) per `find_best_trade` call (60 ports × 11 goods → ~436k inner ops). Called only at port re-plan, not every tick — well within budget.
+
+**Limitations recorded for Phase 4+.** The lookahead doesn't account for cargo-capacity differences between the first and second leg, doesn't model congestion (multiple ships converging on the same circuit), and treats all onward goods as fungible from the planner's perspective even though the ship will need to actually unload at B before reloading. None of these matter at the current scale; revisit if convoy behavior becomes a goal.
+
+## Phase 4 — Combat Realism (in progress)
+
+### §1 — Ordnance supply (`market.rs`, `ai.rs`)
+
+**Premise from postmortem.** "Ordnance consumption is wired; nobody produces gunpowder or shot. Ships start with seeded cargo and can never refill once empty."
+
+**What we found mid-implementation.** Step 7 had already done more than the plan credited: production was wired at three of four planned European hubs (London / Amsterdam / Cadiz), and the AI top-up at port was wired in `ai::act_sell_all → replenish_ordnance`. The actual gaps in §1 were small: Nantes had no powder recipe, and the magazine targets were flat (`(4,4)` pirate, `(1,1)` merchant) regardless of cannon count.
+
+**Changes shipped.**
+
+- `market.rs`: `PortArchetype::EuropeanNantes` recipe now produces 4 t/mo gunpowder (French royal foundries at Essonnes, est. 1664 by Colbert). Powder-only — French shot output largely went into army artillery, not naval export. Two regression-guard tests: every European hub produces powder; the three major arsenals also produce shot.
+
+- `ai.rs`: replaced the flat magazine constants with `ordnance_target(ship, stats)` keyed on cannon count via `combat::broadside_supply_cost`. Targets expressed directly in "broadsides of reserve":
+  - `MERCHANT_BROADSIDES_TARGET = 20`
+  - `PIRATE_BROADSIDES_TARGET = 40`
+
+  With `POWDER_TONS_PER_GUN = 0.01`, a 24-gun pirate ship now carries ~9.6 t powder + shot (was 4 t each), an 8-gun sloop merchant ~1.6 t each (was 1 t). Historically defensible: indiamen carried 5–10 broadsides of reserve, privateers 30+.
+
+**Calibration.** `bench_trade 730 d`: bankrupt 86 → 80 (slight improvement), gunpowder annualized flow +252 t/yr, cannon shot +324 t/yr at producer hubs. Top-up loop reaches Caribbean ports without strangling cargo capacity (magazine is bounded by cannons, not by hold size).
+
+**Decision recorded.** Considered the plan's `cap × scale × 0.5` formula (cargo-size-scaled) but chose cannons-scaled instead because consumption itself is cannon-keyed — the target should track the demand source directly. A fluyt with 12 guns now matches a frigate-converted-merchant of 12 guns regardless of cargo capacity, which is the right invariant.
+
+### §2 — Repair at port (`ship.rs`, `ai.rs`)
+
+**Course correction during planning.** The original plan framed both hull and rigging as "monotonically decaying state". Reviewing the code: hull degrades from storms + fires + combat (all in place); rigging degrades from combat *only*. That changed the model.
+
+- **Rigging is a combat reserve, not a wear part.** Sails, cordage, spars come from bo's'n stores carried aboard. Historical port turnaround included re-rigging as a normal item — a yard could put a new spar up in a day. So rigging gets a one-shot full top-off on undock (like provisions), billed at 1.5 pesos/HP.
+- **Hull is a wear part.** Storm damage + combat damage accumulate; only the carpenters can fix it. Ticks while docked at 0.3 HP/hr, billed at 6 pesos/HP, sized so a 100-HP rebuild ≈ 14 days at port for ~600 pesos (about 30% of a sloop's build cost, matching RN "great repair" line-items).
+
+**New API on `Ship`.**
+
+- `tick_repair_hull(stats) -> bool` — one hour of carpentry. Always applies the full HP delta (carpenters work regardless of payment); silver covers the bill if available, otherwise the shortfall accrues to `Ship::debt` (composes with existing wage / chandler debt: bankruptcy threshold, shipyard scrap, mutiny pressure already cover it).
+- `top_off_rigging(stats) -> f32` — full one-shot restore, returns HP delta. Same silver/debt path. Returns 0.0 (no-op) when rigging already at max.
+
+**Wiring.**
+
+- `ai.rs::act_careen` now ticks both `tick_careen` (fouling + teredo) *and* `tick_repair_hull` in parallel; only returns Success when both complete. A battle-damaged ship stays at port until it's actually seaworthy — historically correct.
+- `ai.rs::act_undock` calls `top_off_rigging` immediately before clearing the dock state.
+
+**Calibration.** `bench_trade 730 d`: bankrupt 80 → 83 (+3). Marginal — current pre-§3 combat cadence is rare enough that most ships pay only a few pesos for the storm hits they took. The real test is after §3 when combat damage scales up. Avg fleet hull integrity target ≥ 60% can't yet be meaningfully checked.
+
+**Future work captured (FW-8).** Repair currently silver-only. Eventually we want hull repair to consume `NAVAL_STORES` + `MANUFACTURES` from the port market and rigging top-off to consume `NAVAL_STORES`. Decoupled from §2 deliberately — kept the v1 path independent of market stock so we can validate the rate / cost / debt machinery first.
+
+### §3 — Sub-tick combat (next up)
+
+Pending; planning notes in `planning/phase-4-plan.md §3`.
+
+### §3c-1 — Symmetric engagement (CA-style per-hour tactical judgment)
+
+**Problem.** The initial §3c-1 implementation used a role-based design: the ship that opened fire became `Attacker`, the other `Defender`, and the engaged subtree branched on role. Two issues emerged: (1) the rigid role lock did not match the historical pattern where each captain re-evaluates fight/flee each hour from his own view, and (2) calibration regressed — `bench_trade 730` jumped from 85 baseline to 118 bankrupt, primarily because merchants tagged "Defender" were stuck in `FleeAndFire` even after the pirate had exhausted ordnance and was no longer a threat.
+
+**Alternatives considered.**
+- *Keep roles but add role-swap heuristics.* Rejected — adds complexity to preserve a label that does not earn its keep; the resulting logic would just be `should_fight`/`should_flee` reading role state.
+- *Drop the engaged branch entirely and lean on `see_threat`/`see_prey`.* Rejected — that's what the old code effectively did (the engaged branches were dead code in practice), and it gave no way to express "I commit to staying in this fight even though you're momentarily out of range" or to gate disengage on a cooldown.
+
+**Decision.** Symmetric engagement, no role enum. `engage(a, b)` is a mutual flip gated by a `disengaged_until_minute` cooldown. The engaged subtree is itself a Selector with priority-ordered conditions evaluated every hour from each ship's own snapshot: `should_disengage` → `should_fight` → `should_flee` → `hold`. A new `ShipCommand::Disengage { other }` clears both ships' `engaged_with` and stamps a 60-minute cooldown on both, preventing thrashing.
+
+`ShipSnapshot` was extended with `hull_frac` and `cannons` so the heuristics can compare strengths from world view alone.
+
+**Results.** Colosseum: scenarios 1/2/4/5 now end with `DEFENDER ESCAPED` at h65–h81 (merchants break off once pirates exhaust ordnance and pick `should_disengage`); scenario 3 still ends `TARGET SUNK` h12 (24-gun vs bark — expected). `bench_trade 730` = 100 bankrupt — above 85 baseline but well below the 118 role-based regression, within tolerance for §3c-1 (further calibration in §3.6).
+
+**BT framework pitfall (caught mid-validation).** While validating, the engaged branches appeared to never re-evaluate — `COND_IS_ENGAGED` was checked once at hour 0 and then never again, even though `engage()` was firing correctly. Root cause: the Selector in `bt.rs` has memory via `state.running_child[depth]`. When a child returns `Status::Running`, that child index is *cached* and re-entered next tick, **skipping higher-priority siblings entirely** until the cached child returns Success/Failure. `act_pursue` and `act_flee` were returning `Running`, so the BT never climbed back up to re-check `IS_ENGAGED`.
+
+**Fix.** `act_pursue` and `act_flee` now return `Status::Success` after pushing their intents. This forces a full top-down re-evaluation each tick — true CA-style judgment. Dock-tree actions that genuinely need multi-tick state (`act_resupply`, `act_careen`) keep `Running` deliberately. *This is the silent assumption to remember: in this codebase, any BT leaf that should be reconsidered every tick must return Success, not Running. Returning Running is a commitment to multi-tick state, not a polite "still working" signal.* The old role-based engaged branches were dead code masked by exactly this bug — `see_threat`/`see_prey` in the default subtree happened to produce roughly the right behavior, so no one noticed.
+
+**Future work.** §3c-2 (Strike + prize), §3c-3 (boarding integration), §3d (forts), §3e (calibration sweep — likely needs to revisit `should_disengage` thresholds and the "outnumbered" rule once Phase 5's relations matrix replaces the ShipPolicy hostile-proxy).
+
+### §3c-2 (minimal) — Strike colors + shared prize resolver
+
+**Problem.** §3c-1 gave ships `should_disengage`, but a ship that is hopelessly beaten — torn rigging, half its crew dead, morale collapsed, counterpart faster — should *surrender* rather than try to break off into a hail of fire. The existing boarding-victory path already had a take/sell/sink/release prize roll, but it was bolted to `resolve_boarding`; surrender-without-boarding had no path through the world resolver.
+
+**Alternatives considered.**
+- *Full §3c-2 per the original plan (Follow BT branch + prize sails with victor to port + sells on arrival).* Rejected for this commit — meaningful scope creep (touches movement/physics, station-keeping, port-trigger sells), and we want to see Strike alone behave in bench_trade before investing in the follow voyage.
+- *Reuse `Disengage` and have the world infer surrender from low morale.* Rejected — violates the principle that the AI decides intent and the world resolves it. Surrender is a distinct intent and deserves its own command.
+
+**Decision.**
+- New `ShipCommand::Strike { to: ShipId }`. Issuer = prize; `to` = victor.
+- New `COND_SHOULD_STRIKE` + `ACT_STRIKE` in `ai.rs`. Priority *above* `should_disengage` in the engaged-subtree Selector — a hopelessly beaten ship surrenders cleanly rather than trying to break contact.
+- `should_strike` fires when *both*: (a) `morale × hull_fraction < STRIKE_THRESHOLD` (0.15), and (b) cannot outrun the counterpart (own effective speed ≤ counterpart's, *or* own rigging is below the boarding threshold).
+- New `STRIKE_THRESHOLD = 0.15` constant in `combat.rs`.
+- Extracted the boarding-victory prize block (~140 lines) into `World::resolve_prize_action(victor, prize)`. The boarding path now just calls it; the new Strike resolution in the command-drain loop also calls it (deferred to after the drain to avoid double-borrowing `self`).
+- The instant-despawn model for take/sell/sink/release is preserved — *no* follow voyage in this commit. Take still flips the prize to `Pirate` policy in-place; sell/sink set hull=0 → Sunk; release leaves the target afloat with cargo stripped.
+
+**Results.**
+- 173 tests pass, fmt + clippy clean.
+- Colosseum: same 5 scenarios produce the same outcomes (4× DEFENDER ESCAPED, 1× TARGET SUNK) — none of them stress the strike condition cleanly. The `PRIZE SURRENDERED` verdict is wired and will fire when a scenario does trigger it.
+- `bench_trade 730d`: **89 bankrupt** (down from 100 after §3c-1; baseline 85, tolerance ≤95). Prize ledger shows 74 prize events total (5 taken, 26 sold, 33 sunk, 10 released) — Strike is doing real work in the broader sim, letting beaten merchants surrender (preserving capital that would otherwise be lost to sinking).
+
+**Future work.**
+- §3c-2b: Follow BT branch + `follow_target` field + prize physically sails with victor and sells when victor reaches friendly port. Replaces the instant `take`/`sell` despawn with a real voyage.
+- Calibration: 89 bankrupt is in tolerance but worth revisiting once §3d (forts) and §3e (calibration sweep) land — Strike may be too generous, and `STRIKE_THRESHOLD` 0.15 is unvalidated.
+- Open question: should ships of certain factions (Navy, Privateer with Letter of Marque) be forbidden from striking? In Phase 5 (Relations Matrix) the surrender decision will gain a "honor of the flag" gate. For now any policy can strike.
+
+### §3c-3 — Boarding as a first-class engaged-subtree choice
+
+**Problem.** §3c-1's engaged subtree had a silent hole: a pirate engaged with a rigging-crippled merchant but out of powder would route through `should_fight` (false, requires ordnance) → `should_flee` (true, the fall-through) and *flee from helpless prey it could trivially board*. `act_pursue` already called `maybe_board` for pirates, so when `should_fight` did fire (ammo + prey crippled) boarding worked — but with an empty magazine the BT never reached `act_pursue` at all. The `should_disengage` rule had a `can_board` guard that prevented disengage in this case, but nothing then routed the ship into the board.
+
+**Decision.** New `COND_SHOULD_BOARD` + `ACT_BOARD` in the engaged subtree. Priority is *above* `should_fight` (so a pirate facing crippled prey commits to the grapple even with ammo — fire-and-board was the historical combined-arms approach, and `act_board` still calls `maybe_fire_at` to soften the deck if magazine permits) and *above* `should_disengage` (so the disengage rule cannot itself preempt a viable board).
+
+`should_board` gate: Pirate policy + engaged + counterpart visible in snapshots + counterpart rigging < `BOARDING_RIGGING_THRESHOLD` + own crew ≥ 2. Sets `goal.pursue_target = engaged_with` so `act_board` (which reuses the `act_pursue` steering machinery) steers at the right ship.
+
+Final engaged-subtree priority: **strike → board → disengage → fight → flee → hold**.
+
+**Results.**
+- 174 tests pass (1 new regression test added: `engaged_pirate_with_no_powder_boards_crippled_prey`). The test sets a Pirate with empty Cargo + `engaged_with = merchant_id`, places a crippled-rigging merchant 0.1 NM away, and asserts that the BT emits `AttemptBoard` (and does *not* emit a southbound flee Steer).
+- bench_trade 730d: **89 bankrupt** (unchanged from §3c-2). Prize ledger also unchanged at 74 events. The no-ammo-vs-crippled case is rare in this seed, so §3c-3 is correctness-only here — it doesn't shift the calibration metric. Worth re-checking after §3d (forts) and §3e (calibration sweep) bring more combat events into the run.
+- Colosseum: same 5 outcomes (none of the scripted scenarios end with an out-of-ammo pirate facing crippled prey).
+
+**Open question.** `act_board` currently still calls `maybe_fire_at` even when it has ordnance, which means a pirate with a healthy magazine and crippled prey will fire a softening broadside *and* attempt to board on the same tick. That's historically accurate (fire-and-board) but it does mean the boarding gate can fail (rigging may regenerate? no — actually it doesn't, but range may open if the target sails away after the broadside). In v1 we accept this — `maybe_board` re-gates `BOARDING_RANGE_NM` on the same tick using the *commanded* attacker velocity, so if the steer-toward-target keeps us in range, the board still fires.
+
+**Future work.** §3d (forts), §3e (calibration sweep), §3c-2b (Follow voyage), Phase 5 (Relations Matrix + naval boarders).
+
+---
+
+### Phase 4 §3c-2b — Prize tow via destination mirroring
+
+**Problem.** `resolve_prize_action`'s `sell` outcome was an instant-resolve: the prize despawned in place and the victor pocketed `cargo_silver + hull_bounty` immediately. That's a tolerable abstraction for sinkings but completely skips the period-canonical "prize sails to friendly port under a skeleton crew, sells, captor gets a share" arc — the one moment where pirate economics is most legible.
+
+**Design pivot from earlier draft.** The original spec called for a `follow_target` field plus a Follow BT branch with station-keeping math. Discarded as overkill: the prize doesn't need to formation-sail with her captor, she just needs to end up at the same port. Settled on the much simpler rule: **prize copies owner's destination each tick, runs her own AI, sells on dock.**
+
+**Implementation.**
+- `Ship.prize_owner: Option<ShipId>` added near the engagement fields. `None` for normal ships and for `take` / `sink` / `release` outcomes.
+- `combat::PRIZE_TOW_CREW_SPLIT = 0.20` (smaller than the 0.50 used for `take` — sailing only, no fighting).
+- `World.prizes_in_tow` / `prizes_orphaned` counters added.
+- `resolve_prize_action` sell branch split into `sell_tow` and `sell_instant`. Tow is chosen when the victor can spare `tow_crew` while staying ≥ `crew_min`. If not, the existing instant-sell behavior runs unchanged.
+- Two new passes in `tick_hourly_ai_and_physics`:
+  - **Pre-AI copy-owner-nav pass.** After the `ids` snapshot, build a `SecondaryMap<ShipId, (destination, dest_port)>` from every ship's current goal. Then for each ship with `prize_owner = Some(v)`: if `v` is gone, clear `prize_owner` + bump `prizes_orphaned`; else copy `v`'s goal into the prize's. Waypoints are cleared on change so `act_sail` re-routes.
+  - **Post-physics pay-at-port pass.** Scan for `state == Docked && prize_owner.is_some()`. Pay the victor `cargo_silver + hull_bounty` (same formulae as instant-sell), bump morale, mark the prize Sunk so the Cleanup phase reaps her, increment `prizes_sold`.
+
+**Orphan rule.** Settled on a universal "no rescue from beyond the grave": if the victor sinks, the prize's `prize_owner` is cleared and she continues with her last-known destination under her own (now-pirate, since the policy/faction were already flipped at capture) colors. No silver is paid. This is historically defensible (a prize crew with no captor would absolutely sell their own loot at the nearest friendly port — but we don't yet model that, so the loot just rides into oblivion when she eventually sinks or is engaged). Web-searched several period sources; the no-rescue rule was the cleanest invariant.
+
+**Scope limit.** `take` outcome stays instant flip-to-pirate in place. The user's "share a destination" intent technically applies to all prize voyages, but `take` is much rarer (0.05 weight, gated on hull upgrade) and the existing flip-in-place gives the new pirate captain a free re-plan, which is fine. Revisit in Phase 5 if it becomes a bottleneck.
+
+**Calibration shift.** 730d bench_trade 89 → **105 bankrupt** (~18% regression, well below the 118 ceiling that triggered the symmetric-engagement rewrite). The capital dip is real: a sell that used to pay out in tick T now pays in tick T + (voyage length), so victors run their wages owed up before the bonus lands. At end of run: 9 prizes still in tow, 1 orphaned, 2 instant-sold (crew-spare failure), 20 sunk, 8 released. Acceptable trade for the much richer narrative payoff.
+
+**Combat test fixture updated.** `pirate_boards_dismasted_merchant_and_resolves_prize` now also counts `prizes_in_tow` toward total outcomes and branches on `prize_owner` to recognize the tow case (cargo intact, policy flipped, prize_owner set) as distinct from `take` (cargo intact, policy flipped, no prize_owner) and `release` (cargo stripped, original policy).
+
+**Open question / future work.** The orphaning rule could be softened (prize crew "switches sides" to whichever faction's port is closest, sells under their own name) but that needs a port-affinity model that doesn't exist yet. Defer.
+
+---
+
+### Post-Phase-3 cleanup A2 — `crew_seasoned` invariant + tests
+
+**Status going in.** The `crew_seasoned: u16` field was already on `Ship` from earlier work, alongside pro-rata `apply_crew_losses` / `detach_prize_crew` helpers and a `seasoned_ratio()` accessor. The hiring loop in `tick_daily_hiring` was already drawing seasoned-first from the port pool and incrementing `ship.crew_seasoned` in lockstep with `ship.crew_alive`. Combat call sites (`world.rs:1274, 1278`) use the pro-rata helpers. So the postmortem A2 work was almost entirely already-done — but had **no tests**, which meant any regression to the invariant `crew_seasoned <= crew_alive` would have gone silent.
+
+**One deliberate departure from the postmortem spec.** Postmortem §3.2 said "Initialize to 0 on `Ship::new`; shipyard build initializes 0 (hull only)." The current code does the *opposite* for `Ship::new` and `Ship::seeded_at_port_typed`: they seed `crew_seasoned = crew_typical()` (100% seasoned). The in-source comments document the reasoning: "Seed-fleet ships are fully crewed (no Hiring loop) and are assumed to be veteran crews — bench fleets represent established merchant captains." Setting these to 0 would mean every ship at simulation start is staffed by complete greenhorns, which would dominate the bench_trade economy with mutinies and crew-induced sail-handling losses the moment crew modifiers land in Phase 5. Calibration-wise the current default is the right one; only `Ship::freshly_built` (shipyard hull launch) initializes to 0, which matches the postmortem intent for *new* hulls. Leaving as-is.
+
+**What A2 added.**
+- 5 unit tests in `ship.rs` covering: pro-rata casualties (`apply_crew_losses_pro_rata_preserves_invariant`), saturation at full crew loss (`apply_crew_losses_saturates_at_alive_and_zeroes_seasoned`), prize-crew detach pro-rata (`detach_prize_crew_returns_pro_rata_split`), `seasoned_ratio` on empty crew, and `seasoned_ratio` as a proper fraction.
+- 1 integration test in `combat.rs` (`hiring_draws_seasoned_first_and_tracks_count`): hand-sets a port pool to `(3 seasoned, 100 unseasoned)`, plants a `state == Hiring` ship at that port with empty crew, advances 48 hourly ticks to cross a day boundary, and asserts that the ship's `crew_seasoned` ends up exactly equal to `min(crew_alive, 3)` — i.e., all seasoned hands were drawn before any unseasoned. Total tests: 174 → **180**.
+
+**Test fixture gotcha worth recording.** `World::tick` advances 1 *hour*, not 1 day. The daily hiring path is gated on a day-of-year change (`if today == self.last_hire_day { return; }`), and `last_hire_day` is initialized to the world's load-time day. So the first 24-hour window often doesn't fire any hiring at all, because the day-of-year check is evaluated *before* `advance_hours(1)`. The test loops 48 ticks to guarantee a crossing. Other future hiring tests should follow the same pattern (or expose `tick_daily_hiring` as `pub(crate)` for direct invocation).
+
+**No calibration impact.** This is a test-only change plus already-shipped helpers. bench_trade not re-run.
+
+**Next.** A1 — clean three-phase split of `tick_hourly_ai_and_physics`.
+
+---
+
+## 2025-XX-XX — Phase 5 prep: diplomacy.md gaps filled
+
+**Context.** Before drafting the Phase 5 plan (Relations Matrix + Letters of Marque + war cycle + port BTs), wanted to close the 9 research gaps flagged in `planning/research/diplomacy.md` lines 682–701. Most were Wikipedia rate-limit failures from the original research pass; a few were areas where secondary literature was vague on specific simulation-relevant numbers.
+
+**What was done.** Background research agent (`diplomacy-gaps`) executed a focused pass and produced `planning/research/diplomacy-gaps.md` (~59KB). Of the 9 gaps:
+
+- **Fully filled:** GAP 4 (Western Design fleet composition).
+- **Substantially filled:** GAPs 1, 3, 6, 7 — including a detailed Modyford commission timeline (1664 anti-privateer proclamation → reversal within weeks; the 1668/1669/1670 commissions to Morgan; the Treaty of Madrid lag-failure timeline with specific weeks; the Morgan/Byndloss/Tortuga kickback arrangement post-1675).
+- **Partially filled:** GAPs 2, 5, 8, 9 — best-available web sources exhausted; remaining detail would require book-level sources (Pares 1936, Haring 1910, Pestana 2017, Rediker 2004, Lane 1998, Calendars of State Papers Colonial).
+
+**Simulation-actionable numbers extracted** (see `diplomacy-gaps.md` "CROSS-CUTTING SIMULATION PARAMETERS"):
+
+- **Communication lag:** war declaration Europe→Jamaica central 8 wk, range 4–16 wk; treaty news similar.
+- **Bond:** standard English privateer bond £1,500.
+- **Prize split (Porto Bello, 1668):** ~10% Crown Admiralty Tenth + ~10% governor commission fee + ~5% admiral + ~75% owners/crew. (Residual: whether Modyford's 10% was *the* Admiralty Tenth diverted locally vs. an additional fee is still ambiguous — flag for design decision.)
+- **Bribery rates:** small ops £20–100, major (ship + cargo) several thousand £, Kidd's failed cache £14,000.
+- **Force sizes:** Western Design 38 ships / 8,000 troops; Morgan/Panama 30+ ships / ~2,000; Cartagena 1697 10+ naval / 1,850; typical buccaneer fleet 3–15 ships.
+
+**Design implications already visible (to be folded into Phase 5 plan):**
+
+1. **Communication lag is THE mechanic** that makes "No Peace Beyond the Line" emerge naturally — if treaty effects arrive in the Caribbean with a 4–16 week stochastic delay, the gap between metropolitan policy and local reality writes itself.
+2. **Governor commission fees are separate from Crown Admiralty Tenth** — suggests Port struct needs both a faction-level "Crown share %" and a port-level "governor's cut %", configurable per-governor (Modyford = 10%, others lower).
+3. **Modyford reversal pattern** (issuing anti-privateer order, then reversing under economic pressure) is the canonical example of *Port BT vs. Faction BT* conflict — supports modeling governor as a semi-autonomous agent with their own utility function (local revenue, personal wealth), not a deterministic relay of metropolitan policy.
+4. **Byndloss/Tortuga kickback** justifies modeling commissions as a *tradeable* mechanic: when a governor's own faction is at peace, captains can still buy commissions from foreign governors at currently-warring factions, with intermediary fees.
+
+**Next.** Draft `planning/phase-5-plan.md` — likely split into 5a (Static Relations + LoM substrate, unblocks Forts) and 5b (Dynamic diplomacy, Port BT, communication lag).
+
+---
+
+## 2026-05-24 — DOD/Perf Refactor #1: Fixed-point currency (`Pesos`)
+
+**Context.** External code review (May 2026) flagged that the simulation
+stored every silver/debt/wage balance as `f32`, with `cost > silver + 1e-4`
+style guards papering over accumulated drift. Over 730 in-game days × thousands
+of transactions, this can leak phantom pesos or reject valid trades.
+
+**Decision.** Introduced `sim_core::money::Pesos`, an `i64`-backed fixed-point
+type with centavo precision (1/100 peso). All *stored* balances now live in
+`Pesos`; prices remain `f32` (they're computed fresh per call and never
+accumulate). Conversion is one-way per transaction: float bill computed from
+float price, rounded to centavos via `Pesos::from_pesos_f32` or
+`Pesos::scale(f32)`, then exact integer arithmetic forever after.
+
+**Alternatives considered:**
+- *Whole pesos (i64)*: rejected — would round wage accrual (per-hour) and per-ton
+  resupply costs.
+- *Millipesos*: rejected — overkill for 17C economy.
+- *Status quo with tighter epsilons*: rejected — the drift is fundamental, not
+  a tolerance issue.
+
+**Scope.** Converted: `Ship.{silver, starting_silver, lifetime_dividends, debt,
+wages_owed_pesos}`, `PortMarket.silver`, `ShipType.build_silver`,
+`BuildCost.silver`, `World.{silver_at_month_start, last_month_avg_profit}`,
+and all currency constants (`STARTING_SILVER_PESOS`, `MAX_SHIP_DEBT`,
+`MUTINY_DEBT_THRESHOLD`, `WAGE_PESOS_PER_MAN_MONTH`, `SIGN_ON_BOUNTY_PESOS`,
+`HULL/RIGGING_REPAIR_COST_PESOS_PER_HP`, `INITIAL_PORT_SILVER_PESOS`,
+`STARTING_SILVER_FLOOR`). `PortMarket.debt: Cargo` (commodity tons owed to
+hinterland) intentionally left as-is. All `+ 1e-4` currency epsilons deleted.
+
+**Validation.** 187 tests pass; clippy clean; `bench_trade` numbers
+near-identical to baseline (79 → 80 bankrupt ships, well within rounding
+noise — confirms economics unchanged). Pre-existing equilibrium calibration
+gap (Tobacco/Manufactures price deltas of 1000s of %) is unrelated and
+predates this work.
+
+**Notes for next phases.**
+- Pesos's `Serialize`/`Deserialize` is transparent on `i64` centavos. Any
+  future save-game format will read/write integer cents.
+- The `BuildCost.total() -> f32` mixes pesos and tons; kept as f32 since
+  it's only used as a relative ROI score, with `silver` line converted via
+  `as_pesos_f32()` at the boundary.
+- Remaining DOD/perf items from the review (Cargo flat array, spatial hash
+  flat-vec, PRNG → `rand_pcg`, NavTrack → ArrayVec) are queued in the
+  session plan and will land as separate commits.
+
+---
+
+## 2026-05-24 — DOD/Perf Refactor #2: Cargo flat array
+
+**Decision.** Replaced `Cargo`'s internal `Vec<(GoodId, f32)>` with a flat
+`[f32; CARGO_SLOTS]` where `CARGO_SLOTS = 16` (room for the 11 starter goods
+plus headroom). `Cargo` is now exactly 64 bytes — one cache line on
+common x86_64 / aarch64 — and held inline on every ship and port.
+
+**Wins.** `get`/`add` become O(1) indexed loads with no branch and no
+heap allocation. Every `Ship` is fully inline (no pointer chase from
+Ship into a heap-allocated cargo Vec). `iter()` is now deterministic by
+`GoodId` ascending (previously by insertion order), which is a strict
+improvement for reproducibility.
+
+**Contract changes.** None visible to callers — the public API
+(`new`, `get`, `add`, `remove`, `iter`, `is_empty`, `len`, `clear`,
+`total_tons`) is unchanged. `iter` now yields slots with positive stock
+only, in `GoodId` order; one test in `cargo.rs` was updated to assert
+the new ordering (and a `size_of::<Cargo>() == 64` guard added so this
+property doesn't regress).
+
+**Out-of-range goods.** `GoodId.0 >= CARGO_SLOTS` panics in debug,
+silently no-ops in release. The current registry is 11 wide so this is
+unreachable in practice; if `goods.ron` ever grows past 16, bumping
+`CARGO_SLOTS` is a single-constant change (and the cache-line guard
+test will fail, which is the prompt to revisit the size choice).
+
+**Validation.** 188 tests pass; clippy clean; `bench_trade` 82 vs 80
+bankruptcies (within centavo-rounding noise from Phase 1 + new iteration
+order influencing per-port settlement order).
+
+---
+
+## DOD Refactor — Phase 3: SpatialHash flat-vec (2026-05)
+
+**Context.** External review flagged that `SpatialHash` used
+`BTreeMap<(i32,i32), Vec<(ShipId, Position)>>`. BTrees are cache-unfriendly
+(node-jumping on lookup) and the per-cell `Vec` adds another heap
+indirection on every query. With ~500 ships querying every tick, this is
+a hot path.
+
+**Alternatives considered.**
+1. *Lazy sort inside `neighbors(&mut self, …)`.* Simple but pushes a `&mut`
+   requirement through every caller. AI ticks hold concurrent borrows on
+   `World`; demanding `&mut spatial` broke compilation in `ai.rs`.
+2. *Keep BTreeMap, swap inner `Vec` for `SmallVec`.* Half-measure that
+   leaves the BTree pointer-chasing in place.
+3. *Flat `Vec<Entry>` with explicit `finalize()`.* Chosen. One sort per
+   tick, then all queries are `&self` binary searches over a contiguous
+   buffer. Deterministic via a total order on `(cell, ship_id)`.
+
+**Resolution.** `SpatialHash` is now `Vec<Entry { cell, id, pos }>`.
+Build phase calls `clear()` → many `insert()` → exactly one `finalize()`.
+Queries use `partition_point` to locate each of the 9 neighbour cells
+in O(log n) and then scan the contiguous slice. A `debug_assert` in
+`neighbors()` catches missing `finalize()` calls in dev.
+
+The single integration point in `world.rs` adds one `self.spatial.finalize();`
+call after the per-tick build loop. Test helpers in `ai_behavior.rs` were
+updated to call `finalize()` after their inserts.
+
+**Validation.** 189 tests pass; clippy clean; `bench_trade` 82
+bankruptcies (identical to Phase 2 baseline); `bench_pathfind` 1406/1406
+routes ok, 1.36 ms avg.
+
+---
+
+## DOD Refactor — Phase 4: PRNG → `rand_pcg` (2026-05)
+
+**Context.** Four call sites (`ai.rs`, `nav.rs`, `weather/hazards.rs`,
+`world.rs`) hand-rolled the same xorshift64 + 53-bit-mantissa-mixer
+pattern, each as a private helper. Hand-rolled xorshift has documented
+weak low bits; the multiplicative mixer was added as folk wisdom rather
+than from a stated mathematical guarantee. Five separate copies also
+made it impossible to swap algorithms without touching every site.
+
+**Alternatives considered.**
+1. *`rand` (full crate).* Brings in `OsRng`, distributions, and the
+   getrandom platform shim — overkill for a deterministic sim that only
+   needs uniform f32 and Gaussians.
+2. *`fastrand`.* Tiny, but the algorithm is wyrand (a multiplier hash);
+   designed for speed in tooling, not statistically scrutinized at the
+   level PCG is.
+3. *`rand_pcg::Pcg64Mcg` behind a thin newtype.* Chosen. Stable,
+   documented determinism contract, ~5 ns per draw, and the only
+   surface area we need (`next_u64` + uniform_f32 + Box-Muller).
+
+**Resolution.** New `sim_rng::SimRng` newtype wraps `Pcg64Mcg`. Three
+methods: `uniform_f32`, `gaussian` (Box-Muller), `next_u64`. Seeded via
+`SeedableRng::seed_from_u64` so existing u64 seeds keep their public
+meaning. All four sites converted: `ShipAI` now stores `rng` + `nav_rng`
+as `SimRng`; `HazardSystem` stores `rng: SimRng`; `World.combat_rng:
+SimRng` replaces the free `combat_rng_step(&mut u64)` helper (the
+borrow-checker dance that motivated it is unaffected — `&mut self.combat_rng`
+works inside drain loops the same way `&mut self.combat_rng_state` did).
+
+Tests that depend on specific RNG outcomes (combat rolls at given seeds,
+e.g. `pirate_in_cannon_range_damages_merchant`, prize-disposition tests)
+were re-validated under the new generator; **all 192 tests pass** with
+no golden-value adjustments needed — the affected tests check
+qualitative invariants (cargo missing, hull damaged) rather than exact
+roll values.
+
+**Validation.** 192 tests pass; clippy clean; `bench_trade` 79
+bankruptcies (vs 82 pre-Phase-4 — within noise; the equilibrium gap is
+unchanged); `bench_pathfind` 1406/1406 routes ok, 1.42 ms avg.
+
+---
+
+## DOD Refactor — Phase 5: NavTrack waypoints as ArrayVec (2026-05)
+
+**Context.** `NavTrack.waypoints` was a `VecDeque<Position>`. Every
+`Ship` therefore held a heap allocation that resized and got dropped
+constantly; for 500 ships doing periodic re-planning, the allocator
+traffic alone is meaningful, and the pointer chase pulls cache lines
+into `Ship` iteration loops (combat, weather, AI tick) that have no
+business touching the waypoint buffer.
+
+**Sizing the cap.** `bench_pathfind` exhaustively walks all 1406 ordered
+port pairs in the historical 11-port set. Measured max path length is
+37 waypoints. A 64-slot `ArrayVec<Position, 64>` is 64 × 8 bytes = 512
+bytes (Position is two f32), with no extra indirection. Future routes
+(e.g. trans-Atlantic dogleg around the Cape of Good Hope) get
+generous headroom; a `debug_assert!` in `set_path` will fire if the
+planner ever exceeds the cap in dev so we notice when it's time to raise.
+
+**Alternatives considered.**
+1. *`tinyvec` instead of `arrayvec`.* Spills to heap when capped —
+   defeats the determinism-of-layout argument and re-introduces the
+   allocator traffic we're trying to remove.
+2. *`SmallVec<[Position; 32]>`.* Same spillover issue plus extra
+   discriminant per slot.
+3. *Pull `NavTrack` into a parallel ECS-style component.* The reviewer's
+   alternative suggestion. Defers to the "skip ECS" decision; we can
+   revisit if `Ship` itself ever grows uncomfortably wide.
+
+**Resolution.** `waypoints: ArrayVec<Position, 64>` (constant exported
+as `MAX_WAYPOINTS`). API stays nearly identical — `front()` becomes
+`first()`, `pop_front()` becomes `remove(0)`. The O(n) front-pop is
+trivial at n ≤ 64 and we typically remove at most a handful per tick.
+
+**Validation.** 192 tests pass; clippy clean; `bench_trade` 79
+bankruptcies (unchanged from Phase 4); `bench_pathfind` 1406/1406 ok,
+1.37 ms avg. No path ever exceeded 64 waypoints in either benchmark.
+
+---
+
+## Phase 6 — Command-buffered, call-auction port economy (2025)
+
+**Context.** With the layout work (Phases 1–5) done, the next perf
+target is parallelizing the AI tick. Today every ship's AI mutates
+its docking port's `PortMarket` directly (buy/sell/extend_credit/
+draw_for_outfit), which forces strictly serial iteration across
+ships. The goal is to make the AI tick *read-only* against world
+state, emit `ShipCommand`s, and have the resolver apply them in a
+deterministic post-pass — a classic command-buffer pattern that
+unlocks Rayon parallelism over ships.
+
+**Attempt 1 — naïve per-command resolver (abandoned).** First cut
+introduced `MarketBuy/MarketSell/...` variants and applied each one
+in command order using market prices read at start-of-tick. Build /
+clippy / tests all passed but `bench_trade` regressed from
+**79 → 172 bankruptcies** (a 2.2× explosion). Root cause: when
+several ships at the same port all bid at start-of-tick prices,
+they all observe a low (high-stockpile) buy price, drain the
+stockpile via hinterland debt in sequence, and the *next* tick's
+ships see prices spike with no in-tick feedback to back off.
+Discarded.
+
+**Pivot to per-port call auction.** Reframed the resolver as
+something historically more faithful: factors at each port hold a
+single-price call auction every hour. Ships docked at the port
+post limit-priced bids and asks; the port computes a clearing
+price from the post-tick effective stockpile and crosses every
+order on the right side. Pro-rata payouts to sellers if treasury
+is short. Silver-only intents (debt collection, dividends, outfit
+draw, tramping credit) run before the auction in ship-id order so
+the auction's affordability check sees up-to-date strongboxes.
+
+**Intent set.**
+```
+MarketBid          { port, good, tons, limit_price }
+MarketAsk          { port, good, tons, limit_price }
+MarketResupplyBid  { port, tons, limit_price }    // PROVISIONS
+MarketDeposit      { port, amount }               // home-port profit
+MarketCollectDebt  { port }                       // owed by factor
+MarketDrawOutfit   { port, target_silver }
+MarketCreditBid    { port, max_amount }           // tramping advance
+```
+
+**Clearing price.** For each (port, good), the resolver computes
+the effective post-tick stockpile (`pre + Σ ask − Σ bid`) and pipes
+that through the existing `buy_price/sell_price` formulas. Bids
+with `limit ≥ p_buy` and asks with `limit ≤ p_sell` cross. AI
+heuristics use ±20–30% spreads around the formula price, wide
+enough that single-ship cases (the steady state) cross
+deterministically.
+
+**Why not strict serial replay.** The reviewer's classic
+command-buffer pattern would replay each command in order against
+mutable market state, which preserves exact pre-Phase-6 behavior
+but degrades to serial. The auction is strictly better: it gives
+the same answer when there's one ship at a port, and gives a
+*better* answer when there are several (everyone sees the same
+clearing price, no first-mover advantage).
+
+**Test impact.** The single-ship `tick_ai_with_markets` helper in
+`ai_behavior.rs` now applies market intents via the legacy
+`market.buy/sell/...` methods. Result is identical to the auction
+in single-bidder cases, so the existing test assertions hold
+unchanged.
+
+**Open trade-off.** Multi-tick docking is now implicit — ships sit
+in port until their `MarketResupplyBid` and `MarketBid` clear. The
+behavior-tree dock sequence handles this naturally (each leaf
+returns `Running` when not yet done). Patience-based bid walking
+(raising bid / lowering ask as `ticks_pending` grows) is in the
+design but not yet implemented; a static ±20–30% spread is enough
+to clear in the current calibration regime.
+
+**Validation.**
+- 192 tests pass; clippy clean; fmt clean.
+- `bench_trade`: **36 bankruptcies** (baseline 79 → improvement of 43).
+  Several flow categories are now self-consistent over the 60-day
+  run that previously bled silver. The price-vs-equilibrium
+  comparison is still ugly for a couple of goods (Tobacco wedged
+  high at North-Atlantic ports), but those are calibration issues
+  separate from the resolver mechanics.
+- `bench_pathfind`: 1406/1406 ok, 1.44 ms avg, 2023 ms total.
+  Unchanged from Phase 5.
+
+**Follow-ups (not in this commit).**
+- Rayon-parallelize the AI tick (the whole point of the
+  command-buffer). Now unblocked.
+- Patience-driven limit walking per ship (`ticks_pending`-weighted
+  ε on the buy/sell spread).
+- A proper auction unit test in `market.rs` that exercises the
+  multi-bidder pro-rata path directly.
+
+---
+
+## Phase 6 follow-up — Rayon-parallel AI tick (2025)
+
+**Context.** Phase 6's command-buffer redesign made the AI tick
+read-only against world state and write-only to a per-ship
+command buffer. That was the whole point: unblock Rayon
+parallelism over ships.
+
+**Measurement first.** Added `examples/bench_ai_tick.rs` and a
+`World::last_ai_phase_ns` instrumentation field. Loaded the
+historical fleet (503 ships), warmed up 24 ticks, then measured
+720 hourly ticks. Baseline numbers (single-threaded):
+
+```
+avg : 1.080 ms    p50 : 0.111 ms
+p95 : 7.020 ms    max : 36.580 ms
+Per-ship-per-tick avg: 2.15 µs
+AI-phase share of wall time: 95.8%
+```
+
+The variance is the headline: most ships are sailing or idle
+(microsecond-scale), but on tick boundaries where many ships
+simultaneously plan A* paths, a single hour can spike to 36 ms.
+That spike is what would hurt the visualizer's frame budget once
+we run real-time.
+
+**Implementation.** Replaced the `for id in ids` loop with:
+
+1. Materialize `Vec<(ShipId, &mut Ship, &mut ShipAI)>` by zipping
+   `ships.iter_mut()` and `ship_ais.iter_mut()` (both slot-ordered;
+   a `debug_assert_eq!` catches any divergence).
+2. `into_par_iter().map(...)` where each closure builds a *local*
+   `Vec<(ShipId, ShipCommand)>` and calls `ai.tick(&mut inputs)`.
+3. `sort_by_key(|(id, _)| id.data())` on the collected results
+   before flattening into `self.commands`. This restores the
+   serial drain order so the resolution phase (combat,
+   auction, etc.) sees identical input regardless of thread
+   scheduling.
+
+All shared references (ports/harbors/markets/goods/snapshots/
+spatial/pathfind/weather.wind/ship_types) are `&_` to plain data
+and trivially `Sync`.
+
+**Why a Vec materialization instead of slotmap-direct.** SlotMap
+doesn't expose disjoint-mut random access (only `iter_mut`). The
+intermediate `Vec` is 503 × 24 bytes ≈ 12 KB per tick — well
+below any noise floor, and it lets us use `into_par_iter`
+without unsafe.
+
+**Determinism.** `bench_trade` reported the same 36 bankruptcies
+as the serial baseline; the per-port auction's ship-id-sorted
+ordering is preserved through the sort step.
+
+**Measured results.**
+
+```
+parallel  →  avg : 0.765 ms (-29%)
+             p50 : 0.086 ms (-23%)
+             p95 : 5.343 ms (-24%)
+             max : 11.620 ms (-68%)
+             wall: 587 ms   (-28%)
+```
+
+The avg/p50 win is moderate — most ticks are too small to
+amortize Rayon's task spawn overhead. The dramatic win is the
+max-tick latency (68% reduction): pathfind-heavy hours that
+would have stuttered the simulation now flatten out across
+cores.
+
+**Out of scope (next opportunities).**
+- Larger fleets would amortize task overhead better; if we
+  push past ~2000 ships the avg-tick gain should grow toward
+  the core-count ratio.
+- Parallelizing the resolution phase (combat sub-tick, auction)
+  requires more care: combat has cross-ship writes. Probably
+  worth it once the AI phase is no longer the dominant
+  fraction of wall time.
+- Could chunk ships into batches with `par_chunks` to reduce
+  per-task overhead for short ticks; not obviously worth the
+  added complexity yet.
+
+---
+
+## Phase 7 — Stochastic trade destination selection (2025)
+
+**Context.** Eyeballing the visualizer after Phase 6 showed an
+obvious pathology: every ship at a given port picked the same
+"best" destination on the same tick, then they all sailed
+together, all arrived together, all sold into the same port at
+once. This is a direct consequence of strict argmax in
+`find_best_trade` — the planner is deterministic given the
+world state, so two ships looking at identical state make
+identical choices.
+
+**Fix.** `find_best_trade` now takes an optional `&mut SimRng`.
+
+- `rng = None` → strict argmax (existing behavior; preserved
+  for unit tests that want deterministic outcomes).
+- `rng = Some(_)` → softmax-sample over every candidate clearing
+  `MIN_PROFIT_THRESHOLD_PESOS_PER_TON`, weighted by
+  `exp((score - max_score) / TRADE_CHOICE_TEMPERATURE_PESOS_PER_TON)`.
+
+**Temperature tuning.** T = 10 pesos/ton:
+
+```
+score lead over runner-up    top option mass
+        0                          ~50%   (ties split evenly)
+       10                          ~73%
+       30                          ~95%
+       50                          ~99%
+```
+
+Strong opportunities still dominate; the change matters when
+several candidates are within a few pesos/ton of each other,
+which is exactly when the stampede pathology fires.
+
+**Plumbing.** `act_buy_best` passes `Some(self.rng)` from the
+behavior-tree context. Each ShipAI has its own seeded
+`SimRng`, so per-ship choices are deterministic given the seed
+and the world state — fleet-level stochasticity emerges from
+the *combination* of independent RNG streams, not from any
+global random source.
+
+**Calibration result.** `bench_trade` bankruptcies dropped from
+**36 → 14** (-61%). Spreading destinations across the fleet
+keeps the "best" port's stockpile from being drained in a single
+tick, which keeps prices healthier downstream and lets more
+voyages clear.
+
+**Perf cost.** AI phase avg 0.78 ms → 1.21 ms (+55%), max
+11.6 ms → 29.4 ms; wall time 595 ms → 909 ms (+53%) on
+bench_ai_tick (503-ship historical fleet, 720 ticks). Root
+cause: ships now visit a more diverse set of destinations, so
+the A* pathfind cache is hit less often and more fresh paths
+are computed per tick. The calibration win justifies the cost;
+if pathfind churn becomes problematic at larger fleet sizes,
+caching trade plans for K ticks (e.g. re-evaluate every 3-5
+dock visits) is the cleanest follow-up.
+
+**Validation.** 192 tests pass; clippy clean; bench_pathfind
+unchanged.
+
+---
+
+## 2026-05-24 — Exploration branch wrap-up: deferred follow-ups
+
+Closing out the `exploration` branch (DOD refactor + Phases 6/7)
+before opening the faction-design branch. The original code-review
+items are all resolved:
+
+- ✅ Cargo as flat `[f32; 16]` (no heap)
+- ✅ NavTrack as `ArrayVec<Position, 64>` (inline)
+- ✅ SpatialHash as flat sorted `Vec` (cache-friendly, deterministic)
+- ✅ Pesos as `i64` centavos (no float drift)
+- ✅ `SimRng` via `rand_pcg` (no hand-rolled xorshift)
+- ⏸️ Mega-context (`ShipBtContext`) — the review said "keep an
+  eye on this," not "fix now." Deferred until faction code
+  actually grows the context further; ECS migration would be the
+  bigger answer.
+
+**Deferred items captured for future branches:**
+
+1. **Patience-based limit walking.** Auction bids/asks currently
+   post at exactly formula price. Walking the limit by
+   `ε = k * ticks_pending` would let stuck ships clear faster
+   without breaking the post-tick clearing-price invariant.
+
+2. **Multi-bidder pro-rata auction unit test.** The auction
+   resolver has a treasury-shortfall pro-rata code path that is
+   only exercised end-to-end via `bench_trade`. Worth a focused
+   `market.rs` test before we add factions that pile more buyers
+   on the same port.
+
+3. **Trade-plan caching.** Phase 7 cost +53% wall time because
+   stochastic destination selection blew up A* cache reuse.
+   Caching the chosen plan for K dock visits (or until target port
+   stock changes meaningfully) should recover most of that.
+
+4. **Per-port auction parallelization.** `clear_markets` is still
+   serial across ports. Per-port auctions are independent — a
+   Rayon `par_iter_mut` over the port list should be safe and is
+   the natural next perf win after the AI tick.
+
+5. **Tobacco / Manufactures price calibration.** Pre-existing
+   ~6000% deviation at Nantes/Ouidah/Elmina/Cadiz for Tobacco and
+   3000% for Cadiz Manufactures. Not a regression — these were
+   already off before the refactor — but they should be fixed in
+   the next calibration pass.
+
+**Final branch state.** `cargo fmt` clean, `cargo clippy
+--workspace --all-targets -D warnings` clean, 192 tests pass,
+bench_trade 14 bankruptcies (baseline 79), bench_pathfind
+1406/1406, bench_ai_tick AI avg 1.23 ms.

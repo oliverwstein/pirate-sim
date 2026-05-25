@@ -16,7 +16,7 @@ const SHIP_SIGHT_RANGE_NM: f32 = SPATIAL_CELL_NM;
 /// Stroke color/alpha for "I see a foreign sail" sight-lines.
 const SIGHT_LINE_COLOR: Color = Color::new(0.85, 0.85, 0.9, 0.18);
 const WIND_COLOR: Color = Color::new(0.5, 0.7, 1.0, 0.6);
-const PATH_COLOR: Color = Color::new(1.0, 0.9, 0.2, 0.5);
+const PATH_COLOR: Color = Color::new(1.0, 0.9, 0.2, 0.15);
 const SELECT_COLOR: Color = Color::new(0.4, 0.9, 1.0, 1.0);
 
 /// Discrete level-of-detail zoom steps in pixels-per-NM. Mouse wheel
@@ -368,10 +368,11 @@ fn draw_hud(world: &World, camera: &Camera, paused: bool, ticks_per_frame: u32) 
             // refactor lets viz peek mid-tick).
             ShipState::Sunk => {}
         }
-        total_silver += ship.silver;
-        total_dividends += ship.lifetime_dividends;
-        total_debt += ship.debt;
-        total_pnl += (ship.silver - ship.starting_silver) + ship.lifetime_dividends - ship.debt;
+        total_silver += ship.silver.as_pesos_f32();
+        total_dividends += ship.lifetime_dividends.as_pesos_f32();
+        total_debt += ship.debt.as_pesos_f32();
+        total_pnl += (ship.silver - ship.starting_silver + ship.lifetime_dividends - ship.debt)
+            .as_pesos_f32();
     }
 
     let line1 = format!(
@@ -471,7 +472,7 @@ fn draw_ship_panel(world: &World, ship_id: ShipId) {
     };
 
     let prov_pct = (ship.provisions / stats.provision_capacity * 100.0) as i32;
-    let pnl = (ship.silver - ship.starting_silver) + ship.lifetime_dividends - ship.debt;
+    let pnl = ship.silver - ship.starting_silver + ship.lifetime_dividends - ship.debt;
 
     let lines: [(String, Color); 9] = [
         (state_line, LIGHTGRAY),
@@ -491,21 +492,29 @@ fn draw_ship_panel(world: &World, ship_id: ShipId) {
         ),
         (format!("hull fouling {:.0}", ship.hull_fouling), LIGHTGRAY),
         (String::new(), LIGHTGRAY),
-        (format!("silver     ${:>9.0}", ship.silver), WHITE),
         (
-            format!("debt       ${:>9.0}", ship.debt),
-            if ship.debt > 0.0 { ORANGE } else { LIGHTGRAY },
+            format!("silver     ${:>9.0}", ship.silver.as_pesos_f32()),
+            WHITE,
+        ),
+        (
+            format!("debt       ${:>9.0}", ship.debt.as_pesos_f32()),
+            if ship.debt.is_positive() {
+                ORANGE
+            } else {
+                LIGHTGRAY
+            },
         ),
         (
             format!(
                 "dividends  ${:>9.0}   (start ${:.0})",
-                ship.lifetime_dividends, ship.starting_silver
+                ship.lifetime_dividends.as_pesos_f32(),
+                ship.starting_silver.as_pesos_f32()
             ),
             LIGHTGRAY,
         ),
         (
-            format!("P/L        ${:>+9.0}", pnl),
-            if pnl >= 0.0 { GREEN } else { RED },
+            format!("P/L        ${:>+9.0}", pnl.as_pesos_f32()),
+            if !pnl.is_negative() { GREEN } else { RED },
         ),
     ];
     for (i, (text, color)) in lines.iter().enumerate() {
@@ -559,7 +568,7 @@ fn draw_market_panel(world: &World, port_idx: usize) {
 
     draw_text(&port.name, x + 10.0, y + 22.0, 20.0, YELLOW);
     draw_text(
-        &format!("Treasury: ${:.0}", market.silver),
+        &format!("Treasury: ${:.0}", market.silver.as_pesos_f32()),
         x + 10.0,
         y + 42.0,
         16.0,
@@ -613,10 +622,10 @@ fn pick_port_at(world: &World, world_pos: Position) -> Option<usize> {
     best.map(|(i, _)| i)
 }
 
-#[macroquad::main("Pirate Sim - Phase 2")]
+#[macroquad::main("Pirate Sim - Phase 3")]
 async fn main() {
     let mut world = World::load(Path::new("data/"));
-    spawn_demo_ships(&mut world);
+    seed_full_fleet(&mut world);
 
     let mut camera = Camera::new();
     let mut paused = false;
@@ -639,7 +648,7 @@ async fn main() {
         }
         if is_key_pressed(KeyCode::R) {
             world = World::load(Path::new("data/"));
-            spawn_demo_ships(&mut world);
+            seed_full_fleet(&mut world);
             ticks_per_frame = 1;
             selected_port = None;
             selected_ship = None;
@@ -698,10 +707,26 @@ async fn main() {
     }
 }
 
+/// Seed the historically-scaled starter fleet (~480 ships across all
+/// ports — see `planning/research/atlantic-fleet-numbers-1650-1720.md`
+/// and `bench_trade.rs`). The viz now mirrors the bench's full-scope
+/// world so what you see is what the calibration runs against.
+///
+/// `0xCAFE_1680` is the same base seed `bench_trade` uses, so the viz
+/// shows the exact deterministic fleet the benchmarks are tuned for —
+/// handy when something goes wrong in a 730-day run and we want to
+/// scrub the headless replay frame-by-frame.
+fn seed_full_fleet(world: &mut World) {
+    let _ = world.seed_historical_fleet(0xCAFE_1680);
+}
+
+#[allow(dead_code)]
 fn spawn_demo_ships(world: &mut World) {
-    // A starter fleet spread across Caribbean, North America, and
-    // Europe — gives the trader AI all three legs of the triangular
-    // trade visible from tick zero.
+    // Legacy 10-merchant + 3-pirate starter from Phases 2/early-3.
+    // Retained for ad-hoc debugging of single-ship behaviors where
+    // the full historical fleet's traffic obscures the path of any
+    // one captain. Not called from `main`; switch the call site if
+    // you need it.
     let starts: &[(&str, u64)] = &[
         ("Bridgetown", 7),
         ("Port Royal", 13),
@@ -724,9 +749,6 @@ fn spawn_demo_ships(world: &mut World) {
         }
     }
 
-    // Step 6: pirate sloops at the major Caribbean havens — gives the
-    // viz at least one visibly hostile encounter during a normal
-    // session. See `bench_trade.rs` for the same set + rationale.
     for (name, seed) in &[
         ("Tortuga", 1009u64),
         ("Petit-Goâve", 1031),
