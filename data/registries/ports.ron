@@ -78,9 +78,12 @@
     // 1-NM grid resolution can't open the Thames itself, and 1680s
     // ocean-going ships anchored at the Nore for lighter transfer anyway.
     (name: "London",          position: (4410.0, 2040.0), faction: England, harbor_radius_nm: 30.0, shipyard: Some(["brigantine", "bark", "ship"]), category: EuropeanHub),
-    // Amsterdam at Ijmuiden / North Sea (52.4°N 4.9°E). Dutch yards
-    // pioneered the fluyt.
-    (name: "Amsterdam",       position: (4644.0, 2092.0), faction: Netherlands, harbor_radius_nm: 25.0, shipyard: Some(["fluyt", "ship"]), category: EuropeanHub),
+    // Amsterdam represented at Ijmuiden / North Sea (52.46°N 4.59°E),
+    // nudged slightly NW of the historical river mouth so the harbor
+    // zone sits cleanly offshore instead of jammed against the Dutch
+    // coast (which caused mass loitering — see development-log).
+    // Dutch yards pioneered the fluyt.
+    (name: "Amsterdam",       position: (4625.0, 2105.0), faction: Netherlands, harbor_radius_nm: 25.0, shipyard: Some(["fluyt", "ship"]), category: EuropeanHub),
     // Cadiz: Bay of Cadiz (36.5°N 6.3°W). Royal yards built large ships.
     (name: "Cadiz",           position: (3972.0, 1142.0), faction: Spain,   harbor_radius_nm: 20.0, shipyard: Some(["ship"]), category: EuropeanHub),
     // Nantes: anchorage at Paimboeuf / Loire estuary mouth near St-Nazaire
