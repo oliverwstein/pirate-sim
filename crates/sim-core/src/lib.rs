@@ -16,6 +16,7 @@ pub mod pathfind;
 pub mod policy;
 pub mod pop;
 pub mod port;
+pub mod portroutes;
 pub mod ship;
 pub mod shiptype;
 pub mod shipyard;

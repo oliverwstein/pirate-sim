@@ -63,6 +63,11 @@ pub struct World {
     /// ship's flag. Constructed at load time from `faction_defaults()`
     /// overlaid with `port_policies.ron` deltas; read-only thereafter.
     pub policy: crate::policy::PolicyResolver,
+    /// Pre-computed shortest paths to every port over the static
+    /// navmesh. Built once at load by `PortRouteCache::build`; every
+    /// per-tick `find_path_to_harbor` call becomes a constant-time
+    /// lookup + predecessor walk. See `portroutes.rs`.
+    pub port_routes: crate::portroutes::PortRouteCache,
     /// Per-port sailor population, parallel to `ports`. Evolves on the
     /// monthly tick: organic growth + maturation + mortality.
     /// See `planning/crewing-plan.md`.
@@ -194,6 +199,12 @@ impl World {
         let last_market_month = date.month();
         let last_hire_day = date.day_of_year;
 
+        // Perf phase 7: pre-compute SSSP-to-each-port tables over the
+        // static navmesh. Per-tick voyage planning becomes a lookup
+        // instead of an A* run. Must be built after `harbors` and
+        // `navmesh` are constructed; ~1 s for 38 ports × 37k nodes.
+        let port_routes = crate::portroutes::PortRouteCache::build(&map.land, &navmesh, &harbors);
+
         Self {
             map,
             weather,
@@ -208,6 +219,7 @@ impl World {
             port_telemetry,
             faction_telemetry: Default::default(),
             policy,
+            port_routes,
             demographics,
             ships: SlotMap::with_key(),
             ship_ais: SecondaryMap::new(),
@@ -605,7 +617,8 @@ impl World {
             pathfind_stats,
             month,
             &self.navmesh,
-        );
+        )
+        .with_port_routes(&self.port_routes);
 
         // Rebuild the spatial index over Sailing ships before any AI
         // decisions are made this tick. Cheap (single pass, BTreeMap

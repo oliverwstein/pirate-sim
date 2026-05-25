@@ -17,6 +17,7 @@ use std::collections::HashSet;
 use crate::harbor::Harbor;
 use crate::map::land::LandMap;
 use crate::navmesh::Navmesh;
+use crate::portroutes::PortRouteCache;
 use crate::ship::ShipStats;
 use crate::types::Position;
 use crate::weather::wind::WindGrid;
@@ -28,6 +29,10 @@ pub struct PathfindContext<'a> {
     pub stats: &'a ShipStats,
     pub month: u8,
     pub navmesh: &'a Navmesh,
+    /// Optional per-port SSSP cache. When present, `find_path_to_harbor`
+    /// uses it instead of running A* every call. Tests and small
+    /// fixtures may pass `None` to skip the precomputation step.
+    pub port_routes: Option<&'a PortRouteCache>,
 }
 
 impl<'a> PathfindContext<'a> {
@@ -44,7 +49,14 @@ impl<'a> PathfindContext<'a> {
             stats,
             month,
             navmesh,
+            port_routes: None,
         }
+    }
+
+    /// Attach a [`PortRouteCache`] to enable cached harbor pathing.
+    pub fn with_port_routes(mut self, cache: &'a PortRouteCache) -> Self {
+        self.port_routes = Some(cache);
+        self
     }
 }
 
@@ -89,6 +101,12 @@ pub fn find_path(
 /// Plan a path from `start` to any cell of `harbor`'s zone, ending at the
 /// harbor anchor. Returns `None` if the navmesh has no route between any
 /// node visible from `start` and any node visible from the anchor.
+///
+/// When `ctx.port_routes` is set (the production world configuration),
+/// the per-port SSSP cache is consulted first — for any voyage to a
+/// well-connected harbor, this turns A* into a constant-time lookup
+/// plus a predecessor walk. Cache misses (start has no path to the
+/// port's entry set) silently fall back to live A* via `navmesh_path`.
 pub fn find_path_to_harbor(
     ctx: &PathfindContext<'_>,
     start: Position,
@@ -110,7 +128,48 @@ pub fn find_path_to_harbor(
         return Some(vec![harbor.anchor]);
     }
 
+    if let Some(cache) = ctx.port_routes {
+        if let Some(path) = navmesh_path_cached(land, ctx.navmesh, cache, start, harbor) {
+            return Some(path);
+        }
+    }
+
     navmesh_path(land, ctx.navmesh, start, &[harbor.anchor], harbor.anchor)
+}
+
+/// Cached variant of [`navmesh_path`]: looks up a precomputed SSSP
+/// path to the harbor's entry-node set instead of running A*. Returns
+/// `None` on cache miss (no entry for this port, or no reachable
+/// start) so the caller can fall back to live A*.
+fn navmesh_path_cached(
+    land: &LandMap,
+    nm: &Navmesh,
+    cache: &PortRouteCache,
+    start: Position,
+    harbor: &Harbor,
+) -> Option<Vec<Position>> {
+    let starts = nm.visible_from(
+        land,
+        start,
+        ENTRY_RADIUS_NM,
+        ENTRY_CANDIDATES,
+        ENTRY_MARGIN_NM,
+    );
+    if starts.is_empty() {
+        return None;
+    }
+
+    let route = cache.route_from(&starts, harbor.port_index)?;
+
+    let mut points: Vec<Position> = Vec::with_capacity(route.len() + 2);
+    points.push(start);
+    for idx in &route {
+        points.push(nm.nodes[*idx as usize].pos);
+    }
+    points.push(harbor.anchor);
+
+    let smoothed = smooth_path(land, &points);
+    Some(smoothed.into_iter().skip(1).collect())
 }
 
 /// Plan a path through the navmesh from `start` to any of the goal anchors,
