@@ -23,6 +23,15 @@ const INITIAL_STOCKPILE_TONS: f32 = 1000.0;
 /// month of trading; production tick doesn't (yet) replenish it.
 const INITIAL_PORT_SILVER_PESOS: Pesos = Pesos::from_pesos(50_000);
 
+/// Fraction of `crown_silver` transferred into the port treasury each
+/// month — historically, the crown's collected duties paid the
+/// governor, garrison, and dockworkers, putting silver back into the
+/// local economy. A 100% monthly bleed keeps the simulation from
+/// deflating as duties accumulate; future Faction AI can intercept
+/// part of this flow to fund metropolitan budgets (fleets, fortified
+/// works) before it reaches the port treasury.
+const CROWN_SILVER_MONTHLY_BLEED: f32 = 1.0;
+
 /// Buy/sell spread (port "vig"). Buying costs base × (1 + SPREAD);
 /// selling earns base × (1 - SPREAD). Stops infinite arbitrage of a
 /// stationary stockpile.
@@ -75,8 +84,23 @@ pub struct PortMarket {
     /// for pricing = `stockpile − debt`, so each successive draw on
     /// the hinterland raises the price for the next buyer.
     pub debt: Cargo,
-    /// Pesos in the port's treasury. Unused until step 5.
+    /// Pesos in the port's treasury (the merchants' / governor's
+    /// working capital). Used to settle the *base* leg of every
+    /// transaction: a ship buying pays `base_price × tons` into
+    /// `silver`; a ship selling is paid the same out of `silver`.
     pub silver: Pesos,
+    /// Pesos collected as duties (tariffs) on behalf of the crown.
+    /// On every transaction, the wedge between the gross price the
+    /// ship sees and the base price the port treasury exchanges
+    /// accrues here. Bled into `silver` each monthly tick at
+    /// `CROWN_SILVER_MONTHLY_BLEED` (currently 100%) — the historical
+    /// model is the crown spending its duty revenue on the local
+    /// governor's salary, garrison wages, and dockyard contracts,
+    /// which puts the silver right back into the local economy. The
+    /// separation exists for instrumentation today and as the hook
+    /// for a future Faction AI that diverts a share to metropolitan
+    /// budgets (fleets, fortifications).
+    pub crown_silver: Pesos,
     pub recipe: ProductionRecipe,
 }
 
@@ -94,6 +118,7 @@ impl PortMarket {
             stockpile,
             debt: Cargo::new(),
             silver: INITIAL_PORT_SILVER_PESOS,
+            crown_silver: Pesos::ZERO,
             recipe: ProductionRecipe::empty(),
         }
     }
@@ -135,6 +160,7 @@ impl PortMarket {
             stockpile,
             debt: Cargo::new(),
             silver: INITIAL_PORT_SILVER_PESOS,
+            crown_silver: Pesos::ZERO,
             recipe,
         }
     }
@@ -157,6 +183,13 @@ impl PortMarket {
             self.stockpile.remove(id, tons * prosperity);
         }
         self.settle_debt();
+        // Crown-spending bleed: governor salary, garrison pay,
+        // dockyard contracts. Returns collected duties to local
+        // circulation so the closed economy doesn't deflate as
+        // duty wedges accumulate.
+        let bleed = self.crown_silver.scale(CROWN_SILVER_MONTHLY_BLEED);
+        self.silver += bleed;
+        self.crown_silver -= bleed;
     }
 
     /// Whenever stockpile goes positive, use it to pay down any
@@ -295,19 +328,27 @@ impl PortMarket {
     /// and prices rise accordingly via the effective-stock formula.
     /// Goods the port doesn't produce — only imports — hard-fail when
     /// stockpile runs out.
+    ///
+    /// `duty` is the ad-valorem export duty fraction the port levies
+    /// on this ship's flag for this good. The ship pays
+    /// `base × (1 + duty)`, the port treasury receives the *base*
+    /// price, and the duty wedge accrues to `crown_silver`.
     pub fn buy(
         &mut self,
         ship: &mut crate::ship::Ship,
         ship_stats: &crate::ship::ShipStats,
         id: GoodId,
         requested_tons: f32,
+        duty: f32,
         registry: &GoodsRegistry,
     ) -> Result<Pesos, TradeError> {
         if requested_tons <= 0.0 {
             return Err(TradeError::NonPositiveAmount);
         }
         let unit = self.buy_price(id, registry);
-        let cost = Pesos::from_pesos_f32(unit * requested_tons);
+        let base = Pesos::from_pesos_f32(unit * requested_tons);
+        let duty_amount = base.scale(duty.max(0.0));
+        let cost = base + duty_amount;
         if cost > ship.silver {
             return Err(TradeError::InsufficientSilver);
         }
@@ -325,7 +366,8 @@ impl PortMarket {
             }
         }
         ship.silver -= cost;
-        self.silver += cost;
+        self.silver += base;
+        self.crown_silver += duty_amount;
         let from_wharf = requested_tons.min(in_stock);
         if from_wharf > 0.0 {
             self.stockpile.remove(id, from_wharf);
@@ -339,12 +381,18 @@ impl PortMarket {
     }
 
     /// Sell `requested_tons` of `id` from `ship` into this market.
-    /// Atomic. Returns proceeds in pesos on success.
+    /// Atomic. Returns ship proceeds in pesos on success.
+    ///
+    /// `duty` is the ad-valorem import duty fraction the port levies
+    /// on this ship's flag for this good. The port treasury pays the
+    /// full *base* price (formula sell-price), the ship receives
+    /// `base × (1 − duty)`, and the wedge accrues to `crown_silver`.
     pub fn sell(
         &mut self,
         ship: &mut crate::ship::Ship,
         id: GoodId,
         requested_tons: f32,
+        duty: f32,
         registry: &GoodsRegistry,
     ) -> Result<Pesos, TradeError> {
         if requested_tons <= 0.0 {
@@ -354,18 +402,21 @@ impl PortMarket {
             return Err(TradeError::InsufficientShipCargo);
         }
         let unit = self.sell_price(id, registry);
-        let proceeds = Pesos::from_pesos_f32(unit * requested_tons);
-        if proceeds > self.silver {
+        let base = Pesos::from_pesos_f32(unit * requested_tons);
+        if base > self.silver {
             return Err(TradeError::InsufficientPortSilver);
         }
+        let duty_amount = base.scale(duty.max(0.0));
+        let ship_proceeds = base - duty_amount;
         ship.cargo.remove(id, requested_tons);
         self.stockpile.add(id, requested_tons);
-        self.silver -= proceeds;
-        ship.silver += proceeds;
+        self.silver -= base;
+        self.crown_silver += duty_amount;
+        ship.silver += ship_proceeds;
         // Resold inventory pays down any outstanding hinterland debt
         // for this good before remaining as visible stockpile.
         self.settle_debt();
-        Ok(proceeds)
+        Ok(ship_proceeds)
     }
 
     /// Home-port settlement. Called when a ship docks at its owner
@@ -990,7 +1041,7 @@ mod tests {
         let port_silver_before = market.silver;
         let stockpile_before = market.stockpile.get(ids::SUGAR);
         let cost = market
-            .buy(&mut ship, &stats, ids::SUGAR, 5.0, &registry)
+            .buy(&mut ship, &stats, ids::SUGAR, 5.0, 0.0, &registry)
             .unwrap();
 
         // Ship paid; port received; stockpile decreased; cargo grew.
@@ -1010,7 +1061,7 @@ mod tests {
         let stats = ShipStats::sloop();
         let mut ship = Ship::new(Position::ZERO, ShipState::Docked);
         ship.silver = Pesos::from_pesos(1);
-        let result = market.buy(&mut ship, &stats, ids::SUGAR, 50.0, &registry);
+        let result = market.buy(&mut ship, &stats, ids::SUGAR, 50.0, 0.0, &registry);
         assert_eq!(result, Err(TradeError::InsufficientSilver));
         // Ship still has its silver; cargo still empty.
         assert_eq!(ship.silver, Pesos::from_pesos(1));
@@ -1028,7 +1079,7 @@ mod tests {
         let mut ship = Ship::new(Position::ZERO, ShipState::Docked);
         // Pre-load cargo to capacity.
         ship.cargo.add(ids::TOBACCO, stats.cargo_capacity_tons);
-        let result = market.buy(&mut ship, &stats, ids::SUGAR, 1.0, &registry);
+        let result = market.buy(&mut ship, &stats, ids::SUGAR, 1.0, 0.0, &registry);
         assert_eq!(result, Err(TradeError::InsufficientCargoSpace));
     }
 
@@ -1045,9 +1096,11 @@ mod tests {
 
         // Tiny round trip: buy 1t and immediately sell it back.
         market
-            .buy(&mut ship, &stats, ids::SUGAR, 1.0, &registry)
+            .buy(&mut ship, &stats, ids::SUGAR, 1.0, 0.0, &registry)
             .unwrap();
-        market.sell(&mut ship, ids::SUGAR, 1.0, &registry).unwrap();
+        market
+            .sell(&mut ship, ids::SUGAR, 1.0, 0.0, &registry)
+            .unwrap();
 
         // Spread must take a bite — ship strictly poorer.
         assert!(ship.silver < initial_silver);
@@ -1062,7 +1115,7 @@ mod tests {
         let registry = GoodsRegistry::starter();
         let mut market = PortMarket::with_recipe(&registry, PortArchetype::SugarIsland.recipe());
         let mut ship = Ship::new(Position::ZERO, ShipState::Docked);
-        let result = market.sell(&mut ship, ids::SUGAR, 1.0, &registry);
+        let result = market.sell(&mut ship, ids::SUGAR, 1.0, 0.0, &registry);
         assert_eq!(result, Err(TradeError::InsufficientShipCargo));
     }
 
@@ -1116,14 +1169,14 @@ mod tests {
         // Drain the visible wharf.
         let wharf = market.stockpile.get(ids::SUGAR);
         market
-            .buy(&mut ship, &stats, ids::SUGAR, wharf, &registry)
+            .buy(&mut ship, &stats, ids::SUGAR, wharf, 0.0, &registry)
             .unwrap();
         let price_at_zero = market.buy_price(ids::SUGAR, &registry);
 
         // Now buy more — must succeed via the hinterland-debt path.
         let further = 5.0;
         let cost = market
-            .buy(&mut ship, &stats, ids::SUGAR, further, &registry)
+            .buy(&mut ship, &stats, ids::SUGAR, further, 0.0, &registry)
             .unwrap();
         let unit_paid = cost.as_pesos_f32() / further;
         assert!(
@@ -1160,9 +1213,9 @@ mod tests {
 
         let wharf = market.stockpile.get(ids::MANUFACTURES);
         market
-            .buy(&mut ship, &stats, ids::MANUFACTURES, wharf, &registry)
+            .buy(&mut ship, &stats, ids::MANUFACTURES, wharf, 0.0, &registry)
             .unwrap();
-        let err = market.buy(&mut ship, &stats, ids::MANUFACTURES, 1.0, &registry);
+        let err = market.buy(&mut ship, &stats, ids::MANUFACTURES, 1.0, 0.0, &registry);
         assert!(matches!(err, Err(TradeError::InsufficientStockpile)));
     }
 

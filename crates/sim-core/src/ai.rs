@@ -443,6 +443,7 @@ impl ShipAI {
             pathfind: inputs.pathfind,
             markets: inputs.markets,
             goods: inputs.goods,
+            policy: inputs.policy,
             commands: inputs.commands,
             snapshots: inputs.snapshots,
             spatial: inputs.spatial,
@@ -480,6 +481,11 @@ pub struct ShipTickInputs<'a> {
     pub pathfind: Option<&'a PathfindContext<'a>>,
     pub markets: &'a [PortMarket],
     pub goods: &'a GoodsRegistry,
+    /// Precomputed faction trade policy (docking permission, per-good
+    /// legality, ad-valorem duties). Read-only; the planner uses it
+    /// to filter destinations and goods and to compute post-duty
+    /// effective prices for arbitrage scoring.
+    pub policy: &'a crate::policy::PolicyResolver,
     /// Output buffer for `ShipCommand`s emitted this tick. Owned by the
     /// world and drained by the Resolution Phase.
     pub commands: &'a mut Vec<(ShipId, ShipCommand)>,
@@ -566,6 +572,7 @@ pub struct ShipBtContext<'a> {
     pathfind: Option<&'a PathfindContext<'a>>,
     markets: &'a [PortMarket],
     goods: &'a GoodsRegistry,
+    policy: &'a crate::policy::PolicyResolver,
     commands: &'a mut Vec<(ShipId, ShipCommand)>,
     snapshots: &'a SecondaryMap<ShipId, ShipSnapshot>,
     spatial: &'a SpatialHash,
@@ -661,6 +668,25 @@ impl<'a> ShipBtContext<'a> {
         // up the Delaware) — that's fine.
         if self.in_destination_harbor() {
             let port_idx = self.goal.dest_port;
+            // Docking gate: an arrival event at a port that refuses
+            // this flag is silently rejected. The planner already
+            // filters closed ports out of its destination set, so a
+            // refusal here only happens for prize-chase detours,
+            // player-issued commands, or future AI behaviors. We
+            // clear the destination and let `act_choose_destination`
+            // (or the next tick's planner) pick a new heading —
+            // no event, no log spam, per the design note.
+            if let Some(idx) = port_idx {
+                if !matches!(
+                    self.policy.dock_legality(idx, self.ship.faction),
+                    crate::policy::DockLegality::Open
+                ) {
+                    self.goal.destination = None;
+                    self.goal.dest_port = None;
+                    self.ship.nav.clear_path();
+                    return Status::Failure;
+                }
+            }
             self.ship.dock();
             self.ship.dock_action = DockAction::Idle;
             self.ship.nav.docked_at_port = port_idx;
@@ -810,7 +836,20 @@ impl<'a> ShipBtContext<'a> {
         if stockpile <= 0.0 {
             return true;
         }
-        let unit_price = market.buy_price(provisions_id, self.goods).max(0.0001);
+        // Provisions are the lifeblood of the voyage; if a port
+        // bans them on this flag (essentially a wartime starvation
+        // tactic), treat the chandler as dry. Otherwise, fold the
+        // duty wedge into the unit price so the bid limit and
+        // affordability checks both work in gross pesos.
+        let buy_duty = match self
+            .policy
+            .buy_legality(idx, self.ship.faction, provisions_id)
+        {
+            crate::policy::TradeLegality::Legal { duty } => duty,
+            crate::policy::TradeLegality::Prohibited => return true,
+        };
+        let unit_base = market.buy_price(provisions_id, self.goods).max(0.0001);
+        let unit_price = unit_base * (1.0 + buy_duty);
         let hour_bill =
             crate::money::Pesos::from_pesos_f32(unit_price * crate::ship::RESUPPLY_RATE_PER_HOUR);
         // Chandler credit bid: if we can't pay cash but have debt
@@ -895,11 +934,27 @@ impl<'a> ShipBtContext<'a> {
         if self.ports.is_empty() {
             return Status::Failure;
         }
-        let mut idx = (self.rng.next_u64() as usize) % self.ports.len();
-        if self.estimated_position().distance(self.ports[idx].position) < 20.0 {
-            idx = (idx + 1) % self.ports.len();
+        // Filter to ports that will actually let us dock. A ship that picks
+        // a closed port would sail there only for `act_sail` to silently
+        // reject the arrival and re-plan — wasted miles and (more
+        // importantly) a re-plan loop if every random pick lands on a
+        // closed port. Filtering here keeps wander behavior alive even
+        // under restrictive faction policies.
+        let here = self.estimated_position();
+        let candidates: Vec<usize> = (0..self.ports.len())
+            .filter(|&i| {
+                matches!(
+                    self.policy.dock_legality(i, self.ship.faction),
+                    crate::policy::DockLegality::Open
+                )
+            })
+            .filter(|&i| here.distance(self.ports[i].position) >= 20.0)
+            .collect();
+        if candidates.is_empty() {
+            return Status::Failure;
         }
-        self.assign_destination_port(idx);
+        let pick = candidates[(self.rng.next_u64() as usize) % candidates.len()];
+        self.assign_destination_port(pick);
         Status::Success
     }
 
@@ -937,12 +992,21 @@ impl<'a> ShipBtContext<'a> {
                 tons
             };
             if sellable > 0.0 {
+                // Skip goods the port refuses to import on this
+                // flag (e.g., English enumerated colonial staples
+                // on a Dutch hull). The captain's emergency reflex
+                // would be to dump such cargo elsewhere; in v1 we
+                // just don't emit an ask, leaving the cargo aboard.
+                let sell_duty = match self.policy.sell_legality(idx, self.ship.faction, gid) {
+                    crate::policy::TradeLegality::Legal { duty } => duty,
+                    crate::policy::TradeLegality::Prohibited => continue,
+                };
                 anything_remaining = true;
                 let unit = market.sell_price(gid, self.goods);
-                // Accept any price down to 80% of the formula sell
-                // price — gives the auction headroom to absorb same-
-                // tick concurrent sells without dropping every ask.
-                let limit = (unit * 0.8).max(0.01);
+                // Auction returns a net-of-duty price to the ship;
+                // scale the 80% reservation floor by the same wedge
+                // so a duty-bearing leg remains reachable.
+                let limit = (unit * (1.0 - sell_duty) * 0.8).max(0.01);
                 self.commands.push((
                     self.me,
                     ShipCommand::MarketAsk {
@@ -975,14 +1039,27 @@ impl<'a> ShipBtContext<'a> {
             if have >= target {
                 continue;
             }
+            // Skip ordnance the port refuses to export to this flag
+            // (e.g., gunpowder under a wartime embargo, modeled as
+            // Prohibited via a future per-port override).
+            let buy_duty = match self
+                .policy
+                .buy_legality(market_idx, self.ship.faction, good)
+            {
+                crate::policy::TradeLegality::Legal { duty } => duty,
+                crate::policy::TradeLegality::Prohibited => continue,
+            };
             let want = target - have;
-            let unit = market.buy_price(good, self.goods).max(0.0001);
-            let affordable = (self.ship.silver.as_pesos_f32() / unit).max(0.0);
+            let unit_base = market.buy_price(good, self.goods).max(0.0001);
+            let unit_gross = unit_base * (1.0 + buy_duty);
+            let affordable = (self.ship.silver.as_pesos_f32() / unit_gross).max(0.0);
             let in_stock = market.stockpile.get(good);
             let cargo_room = self.stats.cargo_capacity_tons - self.ship.cargo.total_tons();
             let tons = want.min(affordable).min(in_stock).min(cargo_room).max(0.0);
             if tons > 0.0 {
-                let limit = unit * 1.2;
+                // 20% headroom over gross-of-duty price — captain's
+                // limit is what they're willing to pay all-in.
+                let limit = unit_gross * 1.2;
                 self.commands.push((
                     self.me,
                     ShipCommand::MarketBid {
@@ -1024,6 +1101,8 @@ impl<'a> ShipBtContext<'a> {
         });
         let plan = crate::trade::find_best_trade(
             idx,
+            self.ship.faction,
+            self.policy,
             self.ports,
             self.markets,
             self.goods,
@@ -1038,7 +1117,16 @@ impl<'a> ShipBtContext<'a> {
         };
 
         let market = &self.markets[idx];
-        let unit = market.buy_price(plan.good, self.goods).max(0.0001);
+        // The planner already verified this leg is legal at origin
+        // (`buy_legality != Prohibited`); look up the duty here so
+        // every cost calculation in the bid block uses the gross
+        // (silver-out-of-pocket) price the captain will actually pay.
+        let buy_duty = match self.policy.buy_legality(idx, self.ship.faction, plan.good) {
+            crate::policy::TradeLegality::Legal { duty } => duty,
+            crate::policy::TradeLegality::Prohibited => return Status::Success,
+        };
+        let unit_base = market.buy_price(plan.good, self.goods).max(0.0001);
+        let unit = unit_base * (1.0 + buy_duty);
         let cargo_room = self.stats.cargo_capacity_tons - self.ship.cargo.total_tons();
         let want_tons = cargo_room.min(market.stockpile.get(plan.good));
 
@@ -1138,11 +1226,28 @@ impl<'a> ShipBtContext<'a> {
         // resupply port (or, if every port within range is dry, push
         // on toward the trade destination and fail gracefully).
         let provisions = crate::goods::ids::PROVISIONS;
+        let ship_flag = self.ship.faction;
         let nearest = self
             .ports
             .iter()
             .enumerate()
             .filter(|(idx, _)| {
+                // Closed harbors can't save a hungry crew — `act_sail` would
+                // turn us away on arrival. Also require Provisions to be
+                // legally sellable on our flag (a port that prohibits
+                // foreign provisioning is just as useless as a dry one).
+                if !matches!(
+                    self.policy.dock_legality(*idx, ship_flag),
+                    crate::policy::DockLegality::Open
+                ) {
+                    return false;
+                }
+                if matches!(
+                    self.policy.buy_legality(*idx, ship_flag, provisions),
+                    crate::policy::TradeLegality::Prohibited
+                ) {
+                    return false;
+                }
                 self.markets
                     .get(*idx)
                     .map(|m| m.stockpile.get(provisions) > 0.5)

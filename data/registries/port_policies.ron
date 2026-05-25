@@ -1,0 +1,60 @@
+// Per-port trade-policy overrides. Each entry is a sparse delta
+// applied on top of the port's faction default (see
+// `sim_core::policy::faction_defaults`). Ports not listed here inherit
+// their faction default verbatim.
+//
+// Fields:
+//   port      — must match a name in `ports.ron` (typo → load error)
+//   docking   — Some(Open) | Some(OnlyFlags([...])) | Some(ClosedTo([...]))
+//               or omit to keep the faction default.
+//   trade     — list of overrides, each of which targets one (flag, good)
+//               or one (flag, *) pair:
+//                   flag : Spain | England | France | Netherlands | Free
+//                   good : Some("Muscovado Sugar")  // override one good
+//                          None                      // replace the
+//                                                    // default rule for
+//                                                    // this flag
+//                   rule : (
+//                     buy_allowed: bool,
+//                     sell_allowed: bool,
+//                     tariff: (buy_duty: f32, sell_duty: f32)
+//                   )
+//
+// See `planning/research/trade-restrictions.md` for the historical
+// sourcing of these exceptions.
+
+[
+    // Petit-Goâve — the French buccaneer base on Hispaniola. The
+    // governor turned a blind eye to foreigners trading colonial
+    // staples; effectively a free port within the Exclusif. Open
+    // docking; foreign flags pay 5% flat (no enumerated-goods ban).
+    (
+        port: "Petit-Goâve",
+        docking: Some(Open),
+        trade: [
+            (flag: England,     good: None, rule: (buy_allowed: true, sell_allowed: true, tariff: (buy_duty: 0.05, sell_duty: 0.05))),
+            (flag: Netherlands, good: None, rule: (buy_allowed: true, sell_allowed: true, tariff: (buy_duty: 0.05, sell_duty: 0.05))),
+            (flag: Spain,       good: None, rule: (buy_allowed: true, sell_allowed: true, tariff: (buy_duty: 0.05, sell_duty: 0.05))),
+            (flag: Free,        good: None, rule: (buy_allowed: true, sell_allowed: true, tariff: (buy_duty: 0.0,  sell_duty: 0.0 ))),
+        ],
+    ),
+
+    // Charleston in the 1680s — Crown writ thin, the proprietary
+    // colony tolerated foreign-flag commerce on the down-low. We
+    // keep the enumerated-goods sell ban (sugar/tobacco still legally
+    // had to leave on an English bottom) but drop the import duty on
+    // everything else to 5% and accept foreign sellers of provisions
+    // and manufactures.
+    (
+        port: "Charleston",
+        docking: Some(Open),
+        trade: [
+            (flag: Netherlands, good: None, rule: (buy_allowed: true, sell_allowed: true, tariff: (buy_duty: 0.05, sell_duty: 0.05))),
+            // Re-impose the enumerated bans on top of the relaxed default.
+            (flag: Netherlands, good: Some("Muscovado Sugar"),   rule: (buy_allowed: false, sell_allowed: false, tariff: (buy_duty: 0.0, sell_duty: 0.0))),
+            (flag: Netherlands, good: Some("Tobacco"),           rule: (buy_allowed: false, sell_allowed: false, tariff: (buy_duty: 0.0, sell_duty: 0.0))),
+            (flag: Netherlands, good: Some("Rum"),               rule: (buy_allowed: false, sell_allowed: false, tariff: (buy_duty: 0.0, sell_duty: 0.0))),
+            (flag: Netherlands, good: Some("Molasses"),          rule: (buy_allowed: false, sell_allowed: false, tariff: (buy_duty: 0.0, sell_duty: 0.0))),
+        ],
+    ),
+]
