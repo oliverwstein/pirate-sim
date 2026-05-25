@@ -1981,3 +1981,106 @@ or per-good per-flag matrices that can't be precomputed — return to
 they remain useful as cached aggregates even when events are added,
 and the update sites are the same locations where events would be
 emitted.
+
+## Perf series — Phases 1, 6, 7 (entity-telemetry branch, 2026)
+
+**Context.** Profiling on `entity-telemetry` after the per-entity
+telemetry work landed showed `bench_ai_tick` spending most of its
+budget in two places: (a) the parallel AI closure, where each ship
+cloned its `ShipStats`, and (b) the navmesh A* called from
+`assign_destination_port` / `replan_to_port` when many ships'
+waypoint queues emptied in the same tick. The p50→p95 ratio was
+~40× — classic "common cheap + occasional very expensive" shape.
+
+An 8-phase plan was drafted (P0 baseline → P1 build flags → P2 alloc
+hygiene → P3 cohort scheduling → P4 OD matrices → P5 onward-leg
+cache → P6 A* arrays → P7 batched A* → P8 SIMD). Phases 2, 5a were
+tried/dropped; Phases 3/4/8 deferred. The three that landed are
+documented below.
+
+### Phase 1 — Workspace LTO + ShipStats borrow
+
+- `Cargo.toml`: `[profile.release] lto = "fat", codegen-units = 1`.
+  Build time 2.7 s → 12–21 s; runtime −10% AI tick avg.
+- `world.rs`: parallel AI closure now borrows `&ship_types.get(...).stats`
+  instead of cloning. `ShipStats` is small but cloned per ship per
+  tick, so removing the clone gives a measurable win.
+- `panic = "abort"` deliberately *not* set — it would break
+  should_panic-style tests and Rayon panic propagation.
+- Bit-identical telemetry preserved. Commit `7527bd5`.
+
+### Phase 6 — Thread-local Vec scratch for A*
+
+Replace per-call `HashMap<u32,f32>` / `HashMap<u32,u32>` / `HashSet<u32>`
+in `navmesh::route` with thread-local Vec-backed scratch
+(`g_score`, `came_from`, `in_goal`) sized to `nodes.len()` (~37 588).
+Each Rayon worker keeps its own `RouteScratch`; the per-node arrays
+are allocated once and reset O(touched) instead of O(N) between
+calls via two `touched: Vec<u32>` lists.
+
+Algorithm preserved bit-for-bit: same neighbor iteration order,
+same `BinaryHeap` tie-breaks via reversed `Ord` on `f`. Telemetry
+identical. The spike-tick cost was many ships' A* calls in the same
+tick eating ~150 KB of HashMap setup each; eliminating that removed
+about half of the AI tick cost. Commit `e5ad2ca`:
+
+| Metric | Phase 1 | Phase 6 | Δ |
+| --- | --- | --- | --- |
+| AI avg | 0.748 ms | 0.396 ms | −47% |
+| p95 | 4.442 ms | 2.080 ms | −53% |
+| max | 9.997 ms | 3.984 ms | −60% |
+
+### Phase 7 — Per-port SSSP cache (vs bidirectional A*)
+
+New module `portroutes::PortRouteCache`. The navmesh graph is
+static; every port destination has a fixed harbor-entry node set.
+So at world load we run one multi-source Dijkstra per port from
+those entry nodes, producing `(dist, pred)` arrays of size
+`nodes.len()`. Per-tick `find_path_to_harbor` becomes a
+constant-time lookup (pick the start node with min cached distance)
+plus an O(path-length) predecessor walk. Live A* fallback remains
+for arbitrary-goal `find_path` and tests that don't construct a
+cache.
+
+API extension: `PathfindContext` gained an optional
+`port_routes: &PortRouteCache` field, attached via
+`with_port_routes` in the production tick path. Existing
+tests/examples were untouched.
+
+Memory: 38 ports × 37 588 nodes × 8 bytes ≈ 11 MB.
+Build cost: ~1 s added to `World::load` (38 Dijkstras on a ~1.3 M
+edge graph). Commit `99a9bdf`:
+
+| Metric | Baseline (P1) | Phase 6 | Phase 7-SSSP | Δ vs baseline |
+| --- | --- | --- | --- | --- |
+| AI avg | 0.748 ms | 0.396 ms | 0.220 ms | −71% |
+| p95 | 4.442 ms | 2.080 ms | 0.837 ms | −81% |
+| max | 9.997 ms | 3.984 ms | 2.132 ms | −79% |
+| µs/ship | 1.49 | 0.79 | 0.44 | −70% |
+| Wall | 575 ms | 320 ms | 192 ms | −67% |
+
+**Tradeoff.** Dijkstra returns an optimal-cost path that can break
+ties differently than live A*. `bench_trade` telemetry shifted ~1%
+on France (crown_revenue +6%) and ~0.4% on Netherlands (silver
++0.4%); Spain/England/Free numbers, the "24 ships in red" verdict,
+and the inactive-port list were unchanged. Total cost preserved.
+Accepted because the magnitude is below the noise floor of the
+calibration bench and the perf win is large.
+
+**Bidirectional A* (Phase 7-B) — failed alternative.** Implemented
+side-by-side as a comparison: two simultaneous A* frontiers with
+front-to-front termination. Result was a **regression vs Phase 6**
+(avg 0.638 ms / p95 4.04 ms / max 7.16 ms). The navmesh has very
+high local connectivity (avg degree 35) and the Euclidean heuristic
+is already tight, so forward A* prunes aggressively — the 2×
+frontier maintenance + termination check cost dwarfed the
+expansion savings. SSSP beats bidirectional ~3× head-to-head on
+this graph; the lesson is "theoretical 2-4× speedup of
+bidirectional A* doesn't survive when the forward search is
+already cheap".
+
+**Deferred.** Phase 3 (cohort scheduling), Phase 4 (OD matrices),
+Phase 8 (SIMD) all stand to gain from the now-much-cheaper pathing
+baseline. Cohort scheduling in particular is no longer obviously
+worth it — the spike cost is gone — and may be revisited only if
+profiling identifies a new hotspot.
