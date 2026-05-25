@@ -10,7 +10,8 @@
 
 use crate::goods::{GoodId, GoodsRegistry};
 use crate::market::PortMarket;
-use crate::port::Port;
+use crate::policy::{DockLegality, PolicyResolver, TradeLegality};
+use crate::port::{Faction, Port};
 use crate::ship::ShipStats;
 
 /// Approximate per-ton-mile cost charged against arbitrage profits.
@@ -138,6 +139,8 @@ pub struct HomeBias {
 #[allow(clippy::too_many_arguments)]
 pub fn find_best_trade(
     origin_idx: usize,
+    ship_flag: Faction,
+    policy: &PolicyResolver,
     ports: &[Port],
     markets: &[PortMarket],
     goods: &GoodsRegistry,
@@ -149,6 +152,15 @@ pub fn find_best_trade(
     if origin_idx >= ports.len() || origin_idx >= markets.len() {
         return None;
     }
+    // If the captain can't even dock at the origin we'd never get
+    // here in production (the docking gate denies it earlier), but
+    // be defensive in case a caller plans from a snapshot.
+    if !matches!(
+        policy.dock_legality(origin_idx, ship_flag),
+        DockLegality::Open
+    ) {
+        return None;
+    }
     let origin = &ports[origin_idx];
     let origin_market = &markets[origin_idx];
 
@@ -158,24 +170,49 @@ pub fn find_best_trade(
     let mut best: Option<(TradePlan, f32)> = None;
     let mut candidates: Vec<(TradePlan, f32)> = Vec::new();
     for good in goods.iter() {
-        let buy_p = origin_market.buy_price(good.id, goods);
         // Refuse to even consider goods the origin is dry on — saves
         // a bunch of pointless candidates.
         if origin_market.stockpile.get(good.id) <= 0.0 {
             continue;
         }
+        // Buy-side legality at origin: enumerated bans (Spanish
+        // foreign flag, English navigation acts on foreign hulls)
+        // remove the good entirely. The duty wedge widens the
+        // effective price the ship faces.
+        let buy_duty = match policy.buy_legality(origin_idx, ship_flag, good.id) {
+            TradeLegality::Legal { duty } => duty,
+            TradeLegality::Prohibited => continue,
+        };
+        let buy_p_base = origin_market.buy_price(good.id, goods);
+        let buy_p_eff = buy_p_base * (1.0 + buy_duty);
         for (dest_idx, dest) in ports.iter().enumerate() {
             if dest_idx == origin_idx {
                 continue;
             }
+            // Docking gate: if the destination won't receive this
+            // flag at all, skip silently — the captain re-plans
+            // around the closed port without surfacing an event.
+            if !matches!(
+                policy.dock_legality(dest_idx, ship_flag),
+                DockLegality::Open
+            ) {
+                continue;
+            }
+            // Sell-side legality: enumerated bans (Spanish/English
+            // metropolitan staples on foreign hulls).
+            let sell_duty = match policy.sell_legality(dest_idx, ship_flag, good.id) {
+                TradeLegality::Legal { duty } => duty,
+                TradeLegality::Prohibited => continue,
+            };
             let dist = origin.position.distance(dest.position);
             let voyage_days = stats.estimated_voyage_days(dist);
             if voyage_days + REACHABILITY_BUFFER_DAYS > provision_days_budget {
                 continue;
             }
-            let sell_p = markets[dest_idx].sell_price(good.id, goods);
+            let sell_p_base = markets[dest_idx].sell_price(good.id, goods);
+            let sell_p_eff = sell_p_base * (1.0 - sell_duty);
             let cost = dist * TRADE_COST_PER_TON_NM;
-            let profit = sell_p - buy_p - cost;
+            let profit = sell_p_eff - buy_p_eff - cost;
 
             // Speculative onward leg: where could the ship go *next*
             // from `dest_idx`, excluding the immediate-return path
@@ -187,6 +224,8 @@ pub fn find_best_trade(
             let onward = best_single_leg_excluding(
                 dest_idx,
                 Some(origin_idx),
+                ship_flag,
+                policy,
                 ports,
                 markets,
                 goods,
@@ -283,9 +322,12 @@ pub fn find_best_trade(
 /// during lookahead to prevent the planner from "rewarding" an
 /// immediate Barbados → Martinique → Barbados bounce as if it were
 /// a genuine onward leg. Returns `(good, dest, profit_per_ton)`.
+#[allow(clippy::too_many_arguments)]
 fn best_single_leg_excluding(
     origin_idx: usize,
     exclude: Option<usize>,
+    ship_flag: Faction,
+    policy: &PolicyResolver,
     ports: &[Port],
     markets: &[PortMarket],
     goods: &GoodsRegistry,
@@ -295,14 +337,24 @@ fn best_single_leg_excluding(
     if origin_idx >= ports.len() || origin_idx >= markets.len() {
         return None;
     }
+    if !matches!(
+        policy.dock_legality(origin_idx, ship_flag),
+        DockLegality::Open
+    ) {
+        return None;
+    }
     let origin = &ports[origin_idx];
     let origin_market = &markets[origin_idx];
     let mut best: Option<(GoodId, usize, f32)> = None;
     for good in goods.iter() {
-        let buy_p = origin_market.buy_price(good.id, goods);
         if origin_market.stockpile.get(good.id) <= 0.0 {
             continue;
         }
+        let buy_duty = match policy.buy_legality(origin_idx, ship_flag, good.id) {
+            TradeLegality::Legal { duty } => duty,
+            TradeLegality::Prohibited => continue,
+        };
+        let buy_p_eff = origin_market.buy_price(good.id, goods) * (1.0 + buy_duty);
         for (dest_idx, dest) in ports.iter().enumerate() {
             if dest_idx == origin_idx {
                 continue;
@@ -310,14 +362,24 @@ fn best_single_leg_excluding(
             if exclude == Some(dest_idx) {
                 continue;
             }
+            if !matches!(
+                policy.dock_legality(dest_idx, ship_flag),
+                DockLegality::Open
+            ) {
+                continue;
+            }
+            let sell_duty = match policy.sell_legality(dest_idx, ship_flag, good.id) {
+                TradeLegality::Legal { duty } => duty,
+                TradeLegality::Prohibited => continue,
+            };
             let dist = origin.position.distance(dest.position);
             let voyage_days = stats.estimated_voyage_days(dist);
             if voyage_days + REACHABILITY_BUFFER_DAYS > provision_days_budget {
                 continue;
             }
-            let sell_p = markets[dest_idx].sell_price(good.id, goods);
+            let sell_p_eff = markets[dest_idx].sell_price(good.id, goods) * (1.0 - sell_duty);
             let cost = dist * TRADE_COST_PER_TON_NM;
-            let profit = sell_p - buy_p - cost;
+            let profit = sell_p_eff - buy_p_eff - cost;
             if profit > MIN_PROFIT_THRESHOLD_PESOS_PER_TON
                 && best.as_ref().is_none_or(|(_, _, p)| profit > *p)
             {
@@ -348,6 +410,19 @@ mod tests {
         }
     }
 
+    /// All trade tests below use English ports + an English-flagged
+    /// captain, which is the faction-default "Open + 5% own-flag
+    /// duty" case. Tests assert relative ordering of margins and
+    /// existence of profit, both of which still hold with a uniform
+    /// 5% wedge on every leg.
+    fn synth_resolver(ports: &[Port]) -> crate::policy::PolicyResolver {
+        crate::policy::PolicyResolver::from_factions(ports)
+    }
+
+    fn english_flag() -> crate::port::Faction {
+        crate::port::Faction::England
+    }
+
     fn full_budget(stats: &ShipStats) -> f32 {
         stats.provision_capacity / stats.daily_provision_consumption()
     }
@@ -368,8 +443,11 @@ mod tests {
             .remove(ids::SUGAR, market_b.stockpile.get(ids::SUGAR));
 
         let markets = vec![market_a, market_b];
+        let resolver = synth_resolver(&ports);
         let plan = find_best_trade(
             0,
+            english_flag(),
+            &resolver,
             &ports,
             &markets,
             &goods,
@@ -396,8 +474,11 @@ mod tests {
             PortMarket::with_recipe(&goods, PortArchetype::Minor.recipe()),
             PortMarket::with_recipe(&goods, PortArchetype::Minor.recipe()),
         ];
+        let resolver = synth_resolver(&ports);
         assert!(find_best_trade(
             0,
+            english_flag(),
+            &resolver,
             &ports,
             &markets,
             &goods,
@@ -423,8 +504,11 @@ mod tests {
         let market_b =
             PortMarket::with_recipe(&goods, PortArchetype::NorthAmericanFarming.recipe());
         let markets = vec![market_a, market_b];
+        let resolver = synth_resolver(&ports);
         assert!(find_best_trade(
             0,
+            english_flag(),
+            &resolver,
             &ports,
             &markets,
             &goods,
@@ -452,8 +536,11 @@ mod tests {
             .stockpile
             .remove(ids::SUGAR, market_b.stockpile.get(ids::SUGAR));
         let markets = vec![market_a, market_b];
+        let resolver = synth_resolver(&ports);
         assert!(find_best_trade(
             0,
+            english_flag(),
+            &resolver,
             &ports,
             &markets,
             &goods,
@@ -529,8 +616,11 @@ mod tests {
             .remove(ids::TOBACCO, market_d.stockpile.get(ids::TOBACCO));
 
         let markets = vec![market_a, market_b_dead, market_b_work, market_d];
+        let resolver = synth_resolver(&ports);
         let plan = find_best_trade(
             0,
+            english_flag(),
+            &resolver,
             &ports,
             &markets,
             &goods,

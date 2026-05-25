@@ -50,6 +50,11 @@ pub struct World {
     pub ship_types: ShipTypeRegistry,
     /// Per-port economic state, parallel to `ports` (index = port index).
     pub markets: Vec<PortMarket>,
+    /// Faction trade-policy table: per-port docking permission, per-good
+    /// legality, and ad-valorem duties as a function of the visiting
+    /// ship's flag. Constructed at load time from `faction_defaults()`
+    /// overlaid with `port_policies.ron` deltas; read-only thereafter.
+    pub policy: crate::policy::PolicyResolver,
     /// Per-port sailor population, parallel to `ports`. Evolves on the
     /// monthly tick: organic growth + maturation + mortality.
     /// See `planning/crewing-plan.md`.
@@ -161,6 +166,14 @@ impl World {
                 PortMarket::with_recipe(&goods, archetype.recipe())
             })
             .collect();
+        // Faction trade policy: load bundled per-port overrides (if
+        // the file is missing, every port falls back to its faction
+        // default). Unknown port names in the overrides are a fatal
+        // typo — surfaced by an early panic so they're caught in CI.
+        let policy = match crate::policy::load_port_policies(&ports, &goods) {
+            Ok(overrides) => crate::policy::PolicyResolver::build(&ports, &overrides),
+            Err(e) => panic!("failed to load port_policies.ron: {e}"),
+        };
         let demographics: Vec<PortDemographics> = ports
             .iter()
             .map(|p| PortDemographics::seed(p.category, p.faction))
@@ -181,6 +194,7 @@ impl World {
             goods,
             ship_types,
             markets,
+            policy,
             demographics,
             ships: SlotMap::with_key(),
             ship_ais: SecondaryMap::new(),
@@ -737,6 +751,7 @@ impl World {
         let harbors = &self.harbors;
         let markets = &self.markets;
         let goods = &self.goods;
+        let policy_ref = &self.policy;
         let snapshots_ref = &snapshots;
         let spatial_ref = &self.spatial;
         let pathfind_ref = &pathfind;
@@ -762,6 +777,7 @@ impl World {
                         pathfind: Some(pathfind_ref),
                         markets,
                         goods,
+                        policy: policy_ref,
                         commands: &mut local_commands,
                         day_of_year,
                         snapshots: snapshots_ref,
@@ -1352,7 +1368,11 @@ impl World {
         asks: Vec<AuctionAsk>,
     ) {
         // Provisional total flow at face-value (before limit-price
-        // filtering). Used to derive the clearing price.
+        // filtering). Used to derive the clearing price. The net
+        // stockpile movement is unaffected by duty — the wedge
+        // splits the cleared price between the port treasury and
+        // the crown, but doesn't change the tonnage flow — so we
+        // can compute p_buy / p_sell once at the gross flow.
         let total_bid_tons: f32 = bids.iter().map(|b| b.tons).sum();
         let total_ask_tons: f32 = asks.iter().map(|a| a.tons).sum();
         if total_bid_tons <= 0.0 && total_ask_tons <= 0.0 {
@@ -1361,38 +1381,64 @@ impl World {
         let market = &self.markets[port_idx];
         let pre_stockpile = market.stockpile.get(good);
         let pre_debt = market.debt.get(good);
-        // Post-tick effective stock if every bid and ask filled:
-        // selling adds to stockpile, buying subtracts. Hinterland
-        // absorbs negative overshoot.
         let post_effective = pre_stockpile + total_ask_tons - total_bid_tons - pre_debt;
         let p_buy = market.buy_price_at(good, post_effective, &self.goods);
         let p_sell = market.sell_price_at(good, post_effective, &self.goods);
 
-        // Filter bids/asks by limit price. A bid clears if it's willing
-        // to pay at least p_buy; an ask clears if it accepts at most p_sell.
-        let crossing_bids: Vec<AuctionBid> = bids
-            .into_iter()
-            .filter(|b| b.limit_price >= p_buy)
-            .collect();
-        let crossing_asks: Vec<AuctionAsk> = asks
-            .into_iter()
-            .filter(|a| a.limit_price <= p_sell)
-            .collect();
+        // ── Filter by faction policy and per-flag duty wedge ──
+        //
+        // Each ship's flag determines its tariff schedule. A bid
+        // clears iff the captain's *gross* limit covers the post-
+        // duty out-of-pocket price (`p_buy × (1 + buy_duty)`). An
+        // ask clears iff the ship's *net* receive at clearing
+        // (`p_sell × (1 - sell_duty)`) still meets the captain's
+        // reservation floor. Prohibited goods drop out entirely.
+        // `(bid, buy_duty)` and `(ask, sell_duty)` pairs flow into
+        // settlement so we don't re-query the resolver later.
+        let mut crossing_bids: Vec<(AuctionBid, f32)> = Vec::with_capacity(bids.len());
+        for b in bids {
+            let flag = match self.ships.get(b.ship_id) {
+                Some(s) => s.faction,
+                None => continue,
+            };
+            let buy_duty = match self.policy.buy_legality(port_idx, flag, good) {
+                crate::policy::TradeLegality::Legal { duty } => duty,
+                crate::policy::TradeLegality::Prohibited => continue,
+            };
+            let gross_price = p_buy * (1.0 + buy_duty);
+            if b.limit_price >= gross_price {
+                crossing_bids.push((b, buy_duty));
+            }
+        }
+        let mut crossing_asks: Vec<(AuctionAsk, f32)> = Vec::with_capacity(asks.len());
+        for a in asks {
+            let flag = match self.ships.get(a.ship_id) {
+                Some(s) => s.faction,
+                None => continue,
+            };
+            let sell_duty = match self.policy.sell_legality(port_idx, flag, good) {
+                crate::policy::TradeLegality::Legal { duty } => duty,
+                crate::policy::TradeLegality::Prohibited => continue,
+            };
+            let net_price = p_sell * (1.0 - sell_duty);
+            if net_price >= a.limit_price {
+                crossing_asks.push((a, sell_duty));
+            }
+        }
         if crossing_bids.is_empty() && crossing_asks.is_empty() {
             return;
         }
 
         // ── Sell side ──
         //
-        // Sellers want their `tons` worth of stockpile-add + treasury
-        // pay. If the port can't cover the full payout (even after
-        // accounting for buyer inflow this tick), pro-rata the fill so
-        // every seller gets the same fraction. Matches the spirit of
-        // the old "drop the sale if port broke" rule but distributes
-        // the loss across all sellers instead of order-dependently
-        // failing the latest ones.
-        let total_sell_tons: f32 = crossing_asks.iter().map(|a| a.tons).sum();
-        let total_sell_revenue = crate::money::Pesos::from_pesos_f32(total_sell_tons * p_sell);
+        // The port treasury still settles the full *base* price on
+        // every sold ton. Sellers whose duty wedge is non-zero see
+        // a lower net pay, with the wedge routed to `crown_silver`.
+        // The pro-rata payout_ratio (port-broke handling) is keyed
+        // off the base revenue, so all sellers and the crown
+        // shrink proportionally if the port can't cover.
+        let total_sell_tons: f32 = crossing_asks.iter().map(|(a, _)| a.tons).sum();
+        let total_sell_revenue_base = crate::money::Pesos::from_pesos_f32(total_sell_tons * p_sell);
 
         // ── Buy side ──
         //
@@ -1401,48 +1447,48 @@ impl World {
         // first, hinterland debt absorbs the rest (only allowed for
         // locally-produced goods — for pure imports the auction caps
         // total fills at current stockpile).
-        let mut buy_fills: Vec<(ShipId, f32, bool)> = Vec::with_capacity(crossing_bids.len());
+        let mut buy_fills: Vec<(ShipId, f32, f32, bool)> = Vec::with_capacity(crossing_bids.len());
         let mut total_buy_tons: f32 = 0.0;
         let producing = self.markets[port_idx].produces_good(good);
-        // Available stockpile after sells land: pre_stockpile + actual
-        // sells. We don't yet know actual sells (depends on payout
-        // ratio), but the stockpile cap on buys only matters for non-
-        // producing ports; for those, allow buyers up to pre_stockpile.
         let buy_stock_cap = if producing {
             f32::INFINITY
         } else {
             pre_stockpile
         };
-        for b in &crossing_bids {
+        for (b, buy_duty) in &crossing_bids {
             let want = b.tons;
             let room = (buy_stock_cap - total_buy_tons).max(0.0);
             let take = want.min(room);
             if take > 0.0 {
-                buy_fills.push((b.ship_id, take, b.is_resupply));
+                buy_fills.push((b.ship_id, take, *buy_duty, b.is_resupply));
                 total_buy_tons += take;
             }
         }
 
-        let buyer_payments = crate::money::Pesos::from_pesos_f32(total_buy_tons * p_buy);
-        let available_for_sellers = self.markets[port_idx].silver + buyer_payments;
-        let payout_ratio = if total_sell_revenue.is_positive() {
-            (available_for_sellers.as_pesos_f32() / total_sell_revenue.as_pesos_f32())
+        // Port treasury sees the *base* leg of every transaction;
+        // available_for_sellers is therefore a base-currency figure.
+        let buyer_payments_base = crate::money::Pesos::from_pesos_f32(total_buy_tons * p_buy);
+        let available_for_sellers = self.markets[port_idx].silver + buyer_payments_base;
+        let payout_ratio = if total_sell_revenue_base.is_positive() {
+            (available_for_sellers.as_pesos_f32() / total_sell_revenue_base.as_pesos_f32())
                 .clamp(0.0, 1.0)
         } else {
             1.0
         };
 
-        // Apply buys to ships.
-        for (ship_id, tons, is_resupply) in &buy_fills {
+        // ── Apply buys to ships ──
+        //
+        // Ship pays gross (base + duty); duty wedge accrues to
+        // `crown_silver`; port treasury gets base. The grand total
+        // of duty wedge per ton is `p_buy × buy_duty`.
+        let mut total_buy_duty_pesos = crate::money::Pesos::ZERO;
+        for (ship_id, tons, buy_duty, is_resupply) in &buy_fills {
             let ship = match self.ships.get_mut(*ship_id) {
                 Some(s) => s,
                 None => continue,
             };
-            let cost = crate::money::Pesos::from_pesos_f32(*tons * p_buy);
-            // Defensive clamp: limit_price ensured solvency in
-            // theory, but ship.silver may have been drained by an
-            // earlier silver-only op (CreditBid/DrawOutfit don't
-            // touch this; CollectDebt does). Skip if broke.
+            let gross_unit = p_buy * (1.0 + *buy_duty);
+            let cost = crate::money::Pesos::from_pesos_f32(*tons * gross_unit);
             if cost > ship.silver {
                 continue;
             }
@@ -1452,40 +1498,41 @@ impl World {
             } else {
                 ship.cargo.add(good, *tons);
             }
+            let duty_pesos = crate::money::Pesos::from_pesos_f32(*tons * p_buy * *buy_duty);
+            total_buy_duty_pesos += duty_pesos;
         }
 
-        // Apply asks to ships (pro-rata payouts).
+        // ── Apply asks to ships (pro-rata payouts, duty-aware) ──
         let mut total_sold_tons = 0.0_f32;
-        for a in &crossing_asks {
+        let mut total_sell_duty_pesos = crate::money::Pesos::ZERO;
+        for (a, sell_duty) in &crossing_asks {
             let ship = match self.ships.get_mut(a.ship_id) {
                 Some(s) => s,
                 None => continue,
             };
-            let pay_per_ton = crate::money::Pesos::from_pesos_f32(p_sell * payout_ratio);
             let tons = a.tons;
-            // Cargo guard: don't sell more than the ship still holds
-            // (later-resolved sells of the same good would otherwise
-            // overdraw).
             let have = ship.cargo.get(good);
             let sell_tons = tons.min(have);
             if sell_tons <= 0.0 {
                 continue;
             }
             ship.cargo.remove(good, sell_tons);
-            let pay = crate::money::Pesos::from_pesos_f32(p_sell * payout_ratio * sell_tons);
+            let net_unit = p_sell * (1.0 - *sell_duty) * payout_ratio;
+            let pay = crate::money::Pesos::from_pesos_f32(net_unit * sell_tons);
             ship.silver += pay;
+            let duty_pesos =
+                crate::money::Pesos::from_pesos_f32(sell_tons * p_sell * *sell_duty * payout_ratio);
+            total_sell_duty_pesos += duty_pesos;
             total_sold_tons += sell_tons;
-            let _ = pay_per_ton;
         }
 
-        // Apply to port treasury and stockpile.
+        // ── Apply to port treasury, crown, and stockpile ──
         let market = &mut self.markets[port_idx];
-        market.silver += buyer_payments;
-        let actual_payout =
+        market.silver += buyer_payments_base;
+        let actual_payout_base =
             crate::money::Pesos::from_pesos_f32(total_sold_tons * p_sell * payout_ratio);
-        market.silver = (market.silver - actual_payout).max_zero();
-        // Stockpile: add sells first, then deduct buys (wharf first,
-        // hinterland for the deficit — only on producing ports).
+        market.silver = (market.silver - actual_payout_base).max_zero();
+        market.crown_silver += total_buy_duty_pesos + total_sell_duty_pesos;
         if total_sold_tons > 0.0 {
             market.stockpile.add(good, total_sold_tons);
         }

@@ -1752,3 +1752,124 @@ items are all resolved:
 --workspace --all-targets -D warnings` clean, 192 tests pass,
 bench_trade 14 bankruptcies (baseline 79), bench_pathfind
 1406/1406, bench_ai_tick AI avg 1.23 ms.
+
+---
+
+## Faction trade policy: per-port docking + tariffs (auction wedge)
+
+**Context.** Trade needed to reflect faction identity beyond
+mere flag colour. Historically, mercantilism shaped the Caribbean
+as strongly as wind and current: Spain's closed Asiento system,
+England's enumerated colonial staples, France's metropole-only
+re-export rule, and the Dutch low-duty open ports each had
+distinctive economic signatures. We wanted to ship this *before*
+hostility/war so the trade layer alone could demonstrate the
+period's economic geography.
+
+**Problem.** Express two orthogonal rules per (port, flag, good):
+*may this flag dock here at all* and *may this flag buy/sell this
+good, and at what tariff*. The data shape had to compose cleanly
+with the existing planner → AI → market → call-auction pipeline
+without per-tick dictionary lookups, and leave a clean seam for
+later additions (smuggling, embargoes, treaties).
+
+**Alternatives considered.**
+
+1. *Per-port hand-authored matrices* (5 flags × N goods per port).
+   Rejected: ~5000 numbers across the map, no inheritance, no
+   policy story.
+2. *Hard-coded per-faction tables only.* Rejected: can't model
+   Petit-Goâve as a French free port, or Charleston quietly
+   tolerating Dutch shippers.
+3. **Chosen: two-tier cascade.** Per-faction default policy +
+   sparse RON overrides per port. Both compile into a flat
+   per-port `[GoodRule; CARGO_SLOTS]` cache (`PolicyResolver`)
+   so runtime lookups are an array index, not a hash.
+
+**Smuggling-ready enums.** `TradeLegality` is `Legal { duty } |
+Prohibited` and `DockLegality` is `Open | Refused`. Future
+smuggling becomes a new `Legal` variant carrying detection/bribe
+parameters — no caller refactor needed for the legal path.
+
+**Duty-wedge accounting.** Added `crown_silver: Pesos` to
+`PortMarket`. On a duty-bearing buy, the ship pays gross
+(`base × (1 + buy_duty)`), the port treasury gets `base`, and
+the wedge accrues to `crown_silver`. On a sell, symmetric: ship
+receives net (`base × (1 - sell_duty)`), port pays `base`, wedge
+accrues. A monthly 100% bleed pushes `crown_silver` back into
+`silver`, modelling governor/garrison spending recirculating
+duty revenue locally. Three settlement sites learned the wedge:
+the `market.rs` direct buy/sell APIs, the per-port call auction
+in `world::clear_one_good`, and the AI's bid-limit math.
+
+**Single-clearing-price invariant.** The auction still publishes
+one `p_buy` and one `p_sell` per port/good per pass. The duty is
+applied as a per-flag *filter and side payment* on top: a bid
+clears iff `bid.limit >= p_buy × (1 + buy_duty)` for that
+bidder's flag, an ask iff `p_sell × (1 - sell_duty) >= ask.limit`.
+Stockpile flow (and thus `p_buy/p_sell` themselves) is unaffected
+— only money is redistributed.
+
+**Planner + AI integration.**
+
+- `find_best_trade(ship_flag, &PolicyResolver, …)`: filters
+  destinations on `dock_legality`, filters goods on
+  buy/sell legality, scores by post-duty effective prices.
+- AI bid emission (`act_buy_best`, `act_sell_all`,
+  `replenish_ordnance`, `tick_resupply_bid`): bid/ask limit
+  prices scaled by the per-flag duty so a duty-bearing leg is
+  reachable.
+- `act_sail`: silent docking gate at arrival — if the port refuses
+  this flag, clear destination/path and `Status::Failure` so the
+  BT falls through to re-plan. No event, no log spam.
+- `act_choose_destination`: random walks now sample only from
+  ports admitting our flag.
+- `act_divert_to_port` (low-provisions emergency): requires both
+  `dock_legality == Open` and `Provisions` legally sellable.
+
+**Defensive duty clamp.** `PolicyResolver::{buy,sell}_legality`
+clamps duties to `[0.0, 0.99]`. Misconfigured RON can't drive
+ship proceeds negative or break the `1 - sell_duty` math.
+
+**Historical baselines (faction defaults).**
+
+| Faction       | Docks  | Own duty | Foreign duty | Notes                                  |
+| ------------- | ------ | -------- | ------------ | -------------------------------------- |
+| Spain         | Closed | 20% (quinto) | 22%      | Asiento-only foreign access            |
+| England       | Open   | 5%       | 10%          | Enumerated colonial goods banned on foreign hulls |
+| France        | Closed | 0%       | n/a          | Metropole-only re-exports              |
+| Netherlands   | Open   | 2%       | 2%           | Flat low rate, all flags               |
+| Free          | Open   | 0%       | 0%           | Pirate / neutral havens                |
+
+Sparse RON overrides for now: Petit-Goâve as a French free
+port; Charleston quietly tolerating Dutch shippers at 5%.
+
+**Validation.**
+
+- `cargo fmt`, `cargo clippy --workspace -- -D warnings` clean.
+- All workspace tests pass (3 ai_behavior tests needed flag/port
+  faction updates to land in the new policy world; one test
+  previously had a Free-flagged ship sailing to a Spanish port,
+  which now correctly refuses).
+- `bench_trade`: fleet total **+926,323 pesos**, 0 bankrupt
+  out of 507. 24 ships in the red (all small per-ship losses at
+  Spanish Main pirate-prone ports — combat exposure, not policy
+  regression).
+- The Cadiz / Nantes / Ouidah / Elmina price divergences in the
+  equilibrium report are now structural and *expected*: these
+  closed ports never get drained by foreign trade, so their local
+  prices intentionally float free of world prices. This is the
+  mercantilist signal the system was built to produce.
+
+**Open follow-ups.**
+
+1. The auction wedge code path with per-flag duties has only
+   moderate coverage. A focused `world::clear_one_good` test
+   with mixed-flag bids at a duty-bearing port would harden
+   confidence before layering hostility on top.
+2. `act_choose_destination` is still uniform-random over admitted
+   ports. Once factions have war / privateering, this should bias
+   away from enemy zones.
+3. Smuggling: the `TradeLegality` enum has the variant shape
+   ready; needs a `Smuggling { detection_base, bribe_floor }`
+   case plus a captain risk-appetite policy.

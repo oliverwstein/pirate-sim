@@ -84,6 +84,7 @@ fn tick_ai(ai: &mut ShipAI, ship: &mut Ship, stats: &ShipStats, wind: &WindVecto
     spatial.finalize();
     let me = dummy_id();
     {
+        let policy = sim_core::policy::PolicyResolver::from_factions(ports);
         let mut inputs = ShipTickInputs {
             me,
             ship,
@@ -94,6 +95,7 @@ fn tick_ai(ai: &mut ShipAI, ship: &mut Ship, stats: &ShipStats, wind: &WindVecto
             pathfind: None,
             markets: &mut markets,
             goods: &goods,
+            policy: &policy,
             commands: &mut commands,
             day_of_year: 0,
             snapshots: &snapshots,
@@ -123,6 +125,7 @@ fn tick_ai_with_markets(
     spatial.finalize();
     let me = dummy_id();
     {
+        let policy = sim_core::policy::PolicyResolver::from_factions(ports);
         let mut inputs = ShipTickInputs {
             me,
             ship,
@@ -133,6 +136,7 @@ fn tick_ai_with_markets(
             pathfind: None,
             markets,
             goods,
+            policy: &policy,
             commands: &mut commands,
             day_of_year: 0,
             snapshots: &snapshots,
@@ -202,7 +206,7 @@ fn apply_commands_with_markets(
                 limit_price: _,
             } => {
                 if let Some(m) = markets.get_mut(*port) {
-                    let _ = m.buy(ship, stats, *good, *tons, goods);
+                    let _ = m.buy(ship, stats, *good, *tons, 0.0, goods);
                 }
             }
             ShipCommand::MarketAsk {
@@ -212,7 +216,7 @@ fn apply_commands_with_markets(
                 limit_price: _,
             } => {
                 if let Some(m) = markets.get_mut(*port) {
-                    let _ = m.sell(ship, *good, *tons, goods);
+                    let _ = m.sell(ship, *good, *tons, 0.0, goods);
                 }
             }
             ShipCommand::MarketResupplyBid {
@@ -765,7 +769,7 @@ fn continuous_sailing_with_port_visits() {
         Port {
             name: "Dest".to_string(),
             position: Position { x: 30.0, y: 0.0 },
-            faction: sim_core::port::Faction::Spain,
+            faction: sim_core::port::Faction::England,
             harbor_radius_nm: DEFAULT_HARBOR_RADIUS_NM,
             shipyard: None,
             category: sim_core::pop::PortCategory::SmallColonial,
@@ -773,6 +777,7 @@ fn continuous_sailing_with_port_visits() {
     ];
 
     let mut ship = Ship::new(Position { x: 0.0, y: 0.0 }, ShipState::Sailing);
+    ship.faction = sim_core::port::Faction::England;
     let mut ai = ShipAI::with_seed(42);
 
     let mut dock_count = 0;
@@ -831,7 +836,7 @@ fn dock_cycle_sells_arriving_cargo_and_buys_outgoing() {
         Port {
             name: "Dest".to_string(),
             position: Position { x: 30.0, y: 0.0 },
-            faction: sim_core::port::Faction::Spain,
+            faction: sim_core::port::Faction::England,
             harbor_radius_nm: DEFAULT_HARBOR_RADIUS_NM,
             shipyard: None,
             category: sim_core::pop::PortCategory::SmallColonial,
@@ -849,6 +854,7 @@ fn dock_cycle_sells_arriving_cargo_and_buys_outgoing() {
     // Ship starts docked at Home with fresh provisions (skip resupply
     // dwell time) and a small dirty hull so careen passes quickly.
     let mut ship = Ship::new(Position { x: 0.0, y: 0.0 }, ShipState::Docked);
+    ship.faction = sim_core::port::Faction::England; // English flag so the trade legality at Home/Dest is unrestricted
     ship.provisions = stats.provision_capacity;
     ship.hull_fouling = 0.0;
     let mut ai = ShipAI::with_seed(42);
@@ -963,6 +969,7 @@ fn tick_ai_with_snapshots(
     let goods = GoodsRegistry::starter();
     let mut commands: Vec<(ShipId, ShipCommand)> = Vec::new();
     {
+        let policy = sim_core::policy::PolicyResolver::from_factions(ports);
         let mut inputs = ShipTickInputs {
             me,
             ship,
@@ -973,6 +980,7 @@ fn tick_ai_with_snapshots(
             pathfind: None,
             markets: &mut markets,
             goods: &goods,
+            policy: &policy,
             commands: &mut commands,
             day_of_year: 0,
             snapshots,
