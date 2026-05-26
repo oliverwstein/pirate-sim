@@ -2977,3 +2977,85 @@ correctly catches the peninsula-blocked case.
 **Status.** No raster LOS calls remain on the ship-movement
 path. `LandMap` is still loaded for `CoastlineGeom`'s bilevel
 pre-filter and for non-movement callers.
+
+---
+
+## 2025 — Port refactor, harbor proximity, deflection-aware combat steering
+
+**Context.** With Phases A–G of the tile-mesh/polygon-truth refactor
+landed, ships at Port Royal (and a handful of other small-harbor
+ports) were observed pinning against coastlines at `speed = 0`, or
+oscillating 180° in tight straits.
+
+**Changes shipped together as one navigation-robustness pass.**
+
+1. **Ports → real-world coordinates.** `data/registries/ports.ron`
+   now stores `coord: (lat, lon)` (WGS84 decimal degrees). The
+   `PortRecord` projects to engine NM at load using
+   `ORIGIN_LAT_DEG=17.5`, `ORIGIN_LON_DEG=-72.5`, `NM_PER_DEG=60.0`.
+   Kingston was removed (it merges into Port Royal for the period).
+   `tools/preprocess/visualize_navmesh.py` updated to parse the new
+   schema. No behavioural change vs. the back-calculated NM
+   coordinates that were committed in Phase B; this just makes the
+   data file self-documenting and editable from a chart.
+
+2. **Harbor proximity short-circuit.** `harbor::ANCHOR_PROXIMITY_NM`
+   raised 6 → 12 NM (matches `ARRIVAL_NM`) and the proximity check
+   runs *before* the bbox check in `Harbor::contains_pos`. This
+   closes the 6–12 NM "purgatory" annulus where `compute_steering`
+   reported arrived but `contains_pos` said not docked, causing the
+   ship to thrash near the anchor.
+
+3. **Entry-tile LOS filtering.** `pathfind::nearest_visible_entry_tiles`
+   filters candidate start/goal centroids by polygon LOS from the
+   reference position, falling back to unfiltered nearest when no
+   visible centroid exists. Used by `tile_mesh_path`,
+   `tile_mesh_cached_path`, and `find_path_to_harbor`.
+   `PortRouteCache::build` likewise restricts each port's source
+   set to anchor + LOS-clear neighbours.
+
+4. **Cooldown-gated final-replan with mandatory Steer.**
+   `ai.rs` `act_sail`'s "arrived at last waypoint but not in harbor"
+   branch now (a) gates the implicit replan on
+   `replan_cooldown_ticks`, and (b) ALWAYS emits a `Steer` command —
+   either a fresh deflection-aware steer after a successful replan,
+   or `Steer { ship.heading, 0.0 }` as a halt. Without (b),
+   `ship.heading` stayed stale for up to 30 cooldown ticks while the
+   motion sweep kept sailing into the coast.
+
+5. **Full-360° deflection scoring.** `nav::deflect_for_land` rewritten
+   to score all 36 candidate headings by clear-distance via a new
+   `heading_clear_distance` helper, breaking ties on smallest
+   absolute deflection. Guarantees the emitted heading has *some*
+   forward clearance in the chosen direction.
+
+6. **Combat steering honours the no-aground invariant.** Found that
+   `act_pursue`, `act_flee`, and `act_board` each emitted `Steer`
+   commands built directly from target/threat geometry, bypassing
+   `compute_steering` and therefore `deflect_for_land`. This was the
+   dominant remaining source of "stuck-at-coast" ships: any
+   engagement near a coastline produced a heading aimed straight at
+   land. New `nav::tactical_steering(...)` helper deflects the
+   desired heading the same way `compute_steering` does and recomputes
+   wind-adjusted speed at the resulting heading. All three combat
+   actions now route through `ShipBtContext::tactical_steer`.
+
+**Outstanding issue: numerical robustness in `coastline_geom`.**
+`first_land_hit` and `line_is_clear` exhibit non-monotonic behaviour:
+probing the same ray from the same origin at different lengths can
+report `clear` for some lengths and `hit at <0.02 NM` for others — the
+hit point is the same when reported. Root cause is almost certainly
+catastrophic cancellation in the f32 `orient` cross-product when one
+of the two segments is very short relative to the polygon edge being
+tested. Practically this means: even with the deflection now
+correctly selecting a clear heading, the motion sweep's short-segment
+probe sometimes mis-reports it as blocked, pinning the ship.
+Untouched in this pass; the right cure is either promoting the
+geometry kernel to f64 or moving entirely onto the portal-aware
+tile-mesh substrate per the planned next phase. Symptom now observed:
+a small handful of ships oscillate 180° in tight straits (e.g.
+Basse-Terre channels) where the deflection picks one valid escape
+heading, the motion fails the short-probe, deflection on the next
+tick picks the opposite escape, motion fails again — repeat.
+
+**Validation.** 237 tests pass; clippy clean; `bench_pathfind` 1332/1332.

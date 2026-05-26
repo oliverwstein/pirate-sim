@@ -253,17 +253,24 @@ def compute_buffer_contour_nm(
 
 
 def load_ports_ron(ron_path: Path) -> list[tuple[str, float, float]]:
-    """Parse ports.ron and return [(name, x_nm, y_nm), ...]."""
+    """Parse ports.ron and return [(name, x_nm, y_nm), ...].
+
+    ports.ron stores real-world WGS84 `coord: (lat, lon)`; we project
+    to the simulator's NM grid using the same equirectangular anchor
+    as the rest of the preprocessor pipeline (ORIGIN_LAT/ORIGIN_LON).
+    """
     text = ron_path.read_text(encoding="utf-8")
     pattern = re.compile(
-        r'name:\s*"([^"]+)"[^)]*position:\s*\(([^,]+),\s*([^)]+)\)'
+        r'name:\s*"([^"]+)"[^)]*coord:\s*\(([^,]+),\s*([^)]+)\)'
     )
     ports = []
     for m in pattern.finditer(text):
         name = m.group(1)
         try:
-            x = float(m.group(2).strip())
-            y = float(m.group(3).strip())
+            lat = float(m.group(2).strip())
+            lon = float(m.group(3).strip())
+            x = (lon - ORIGIN_LON) * 60.0
+            y = (lat - ORIGIN_LAT) * 60.0
             ports.append((name, x, y))
         except ValueError:
             pass

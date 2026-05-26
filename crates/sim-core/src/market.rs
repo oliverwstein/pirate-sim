@@ -610,7 +610,7 @@ pub fn archetype_for(port_name: &str) -> PortArchetype {
     match port_name {
         // Sugar islands
         "Bridgetown" => SugarIsland,
-        "Port Royal" | "Kingston" => SugarIsland,
+        "Port Royal" => SugarIsland,
         "Basseterre" | "English Harbour" => SugarIsland,
         "Fort-Royal" | "Basse-Terre" => SugarIsland,
         "Cap-Français" | "Petit-Goâve" => SugarIsland,

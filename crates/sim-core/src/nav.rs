@@ -363,58 +363,100 @@ impl NavTrack {
 }
 
 /// If the heading from `pos` would hit land within `lookahead_nm`, sweep
-/// outward from `desired` in 10° steps (preferring the smaller deflection)
-/// until we find a heading whose forward ray is clear.
+/// the full 360° in 10° steps for a clear forward ray. We prefer the
+/// smaller deflection from `desired`; on ties (or when no direction is
+/// fully clear at `lookahead_nm`), pick the heading with the **largest
+/// available clear distance** so the ship is always commanded a heading
+/// that lets it physically move.
 ///
-/// Two-tier fallback for tight waters: if no heading clears the full
-/// lookahead at any deflection up to ±90°, retry with a quarter of the
-/// lookahead. That lets the ship pick a viable short-tack heading (it will
-/// only make a fraction of normal progress, but it won't pin to zero).
-/// As a last resort returns the desired heading.
-fn deflect_for_land(
+/// This is the invariant a steering layer must enforce for the motion
+/// sweep to honour "ships don't run aground": every emitted heading is
+/// guaranteed to clear *some* distance in the chosen direction. Without
+/// that, ships pushed into concave coastal pockets (small ports, the
+/// Palisadoes spit at Port Royal, river-mouth bars) get clamped at
+/// 0.02 NM from the polygon boundary and pin to `speed = 0` forever.
+/// Tactical-steering helper used by `act_pursue` / `act_flee` /
+/// `act_board` (combat actions that compute a heading directly from
+/// target/threat geometry, bypassing `compute_steering`). Honours the
+/// same "no-aground" invariant by deflecting the desired heading to
+/// the nearest forward-clear ray when given terrain, and recomputing
+/// the wind-adjusted speed at whatever heading we actually end up on.
+pub fn tactical_steering(
+    pos: Position,
+    desired_heading: f32,
+    stats: &ShipStats,
+    wind: &WindVector,
+    terrain: Option<NavTerrain<'_>>,
+) -> Steering {
+    let heading = match terrain {
+        Some(t) => deflect_for_land(pos, desired_heading, t, DEFLECT_LOOKAHEAD_NM),
+        None => desired_heading,
+    };
+    let speed = speed_at_heading(heading, stats, wind);
+    Steering { heading, speed }
+}
+
+pub fn deflect_for_land(
     pos: Position,
     desired: f32,
     terrain: NavTerrain<'_>,
     lookahead_nm: f32,
 ) -> f32 {
-    if let Some(h) = sweep_clear(pos, desired, terrain, lookahead_nm) {
-        return h;
+    // Fast path: the desired heading is clear at full lookahead.
+    if heading_clear_distance(pos, desired, terrain, lookahead_nm) >= lookahead_nm {
+        return desired;
     }
-    // Tight-water fallback: shorter horizon, accept any direction that
-    // gives us at least a short clear ray.
-    if let Some(h) = sweep_clear(pos, desired, terrain, (lookahead_nm * 0.25).max(2.0)) {
-        return h;
-    }
-    desired
-}
-
-/// Sweep ±10°, ±20°, … ±90° around `desired`, returning the first heading
-/// whose forward `lookahead_nm` ray is clear of land. `desired` itself is
-/// tried first (offset 0).
-fn sweep_clear(
-    pos: Position,
-    desired: f32,
-    terrain: NavTerrain<'_>,
-    lookahead_nm: f32,
-) -> Option<f32> {
-    let probe = |h: f32| -> bool {
-        let rad = h.to_radians();
-        let end = pos + Position::new(rad.sin() * lookahead_nm, rad.cos() * lookahead_nm);
-        terrain.geom.line_is_clear(terrain.land, pos, end)
-    };
-    if probe(desired) {
-        return Some(desired);
-    }
-    for offset_i in 1..=9 {
-        let offset = offset_i as f32 * 10.0;
+    // Sweep 36 candidates (every 10°). Score each by clear distance,
+    // breaking ties in favour of the smaller absolute deflection from
+    // `desired`. Headings clear at full lookahead all tie at the top
+    // of the distance ranking, so the deflection tiebreaker selects
+    // the most-natural escape exactly when one exists.
+    let mut best_heading = desired;
+    let mut best_dist = heading_clear_distance(pos, desired, terrain, lookahead_nm);
+    let mut best_deflect = 0.0_f32;
+    for i in 1..18 {
+        let offset = i as f32 * 10.0;
         for &sign in &[1.0_f32, -1.0] {
             let candidate = normalize_angle(desired + offset * sign);
-            if probe(candidate) {
-                return Some(candidate);
+            let d = heading_clear_distance(pos, candidate, terrain, lookahead_nm);
+            let deflect = offset; // absolute angular distance
+            let better = d > best_dist + 0.01 || (d >= best_dist - 0.01 && deflect < best_deflect);
+            if better {
+                best_dist = d;
+                best_heading = candidate;
+                best_deflect = deflect;
             }
         }
     }
-    None
+    // 180° opposite (port and starboard sides converge here).
+    let opposite = normalize_angle(desired + 180.0);
+    let d = heading_clear_distance(pos, opposite, terrain, lookahead_nm);
+    if d > best_dist + 0.01 {
+        best_heading = opposite;
+    }
+    best_heading
+}
+
+/// Probe along `heading` from `pos` and return the distance to first
+/// land hit, capped at `lookahead_nm`. Returns `lookahead_nm` when the
+/// full forward ray is clear. Zero when even an infinitesimal step
+/// crosses land (only happens if `pos` is already inside polygon-land,
+/// which the motion sweep's `debug_assert` should have caught).
+fn heading_clear_distance(
+    pos: Position,
+    heading: f32,
+    terrain: NavTerrain<'_>,
+    lookahead_nm: f32,
+) -> f32 {
+    let rad = heading.to_radians();
+    let end = pos + Position::new(rad.sin() * lookahead_nm, rad.cos() * lookahead_nm);
+    if terrain.geom.line_is_clear(terrain.land, pos, end) {
+        return lookahead_nm;
+    }
+    match terrain.geom.first_land_hit(terrain.land, pos, end) {
+        Some(hit) => (hit - pos).length(),
+        None => lookahead_nm,
+    }
 }
 
 /// Velocity Made Good: component of speed toward the destination bearing.

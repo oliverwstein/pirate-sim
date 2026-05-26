@@ -154,15 +154,55 @@ pub fn find_path_to_harbor(
     }
 
     // Live A* on the tile mesh. Seed the goal tile set with the anchor
-    // tile and its immediate neighbours so the funnel has room to
-    // smooth into the harbor's mouth.
+    // tile and any immediate neighbour whose centroid is LOS-visible to
+    // the anchor (otherwise a route ending at that neighbour would have
+    // its final centroid→anchor leg cut through land — Port Royal at
+    // the tip of the Palisadoes spit only has one such neighbour).
     let anchor_tile = harbor.anchor_tile?;
     let mut goal_tiles: Vec<u32> = Vec::with_capacity(8);
     goal_tiles.push(anchor_tile);
     for e in &mesh.neighbors[anchor_tile as usize] {
-        goal_tiles.push(e.to);
+        let nc = mesh.tiles[e.to as usize].centroid;
+        if geom.line_is_clear(land, nc, harbor.anchor) {
+            goal_tiles.push(e.to);
+        }
     }
     tile_mesh_path(land, geom, mesh, start, harbor.anchor, Some(&goal_tiles))
+}
+
+/// Pick up to `TILE_ENTRY_MAX` tile-mesh entry candidates around
+/// `point`, preferring those whose centroid is polygon-LOS-visible
+/// from `point`. Falls back to the nearest unfiltered tiles if no
+/// visible candidate exists (a ship in a tight pocket may have no
+/// fully-clear centroid; better to plan from a "best effort" tile
+/// than to return None and trigger an exhausted-replan loop).
+fn nearest_visible_entry_tiles(
+    land: &LandMap,
+    geom: &CoastlineGeom,
+    mesh: &TileMesh,
+    point: Position,
+) -> Vec<u32> {
+    let cands = mesh.nearest_centroids(point, TILE_ENTRY_RADIUS_NM);
+    if cands.is_empty() {
+        return Vec::new();
+    }
+    let mut visible: Vec<u32> = Vec::with_capacity(TILE_ENTRY_MAX);
+    for &(t, _d) in &cands {
+        if visible.len() >= TILE_ENTRY_MAX {
+            break;
+        }
+        let c = mesh.tiles[t as usize].centroid;
+        if geom.line_is_clear(land, point, c) {
+            visible.push(t);
+        }
+    }
+    if !visible.is_empty() {
+        return visible;
+    }
+    // Safety net: no visible centroid (ship in a sliver). Use the
+    // nearest tiles unfiltered so we at least produce a path; the
+    // funnel + the path-stale check in `ai.rs` will sort it out.
+    cands.iter().take(TILE_ENTRY_MAX).map(|&(t, _)| t).collect()
 }
 
 /// Cached harbor path: look up a precomputed tile-id route from the
@@ -177,15 +217,10 @@ fn tile_mesh_cached_path(
     start: Position,
     harbor: &Harbor,
 ) -> Option<Vec<Position>> {
-    let start_candidates = mesh.nearest_centroids(start, TILE_ENTRY_RADIUS_NM);
-    if start_candidates.is_empty() {
+    let starts = nearest_visible_entry_tiles(land, geom, mesh, start);
+    if starts.is_empty() {
         return None;
     }
-    let starts: Vec<u32> = start_candidates
-        .iter()
-        .take(TILE_ENTRY_MAX)
-        .map(|&(i, _)| i)
-        .collect();
 
     let route = cache.route_from(&starts, harbor.port_index)?;
     Some(stitch_tile_route(
@@ -220,29 +255,19 @@ fn tile_mesh_path(
     terminal: Position,
     goal_tiles: Option<&[u32]>,
 ) -> Option<Vec<Position>> {
-    let start_candidates = mesh.nearest_centroids(start, TILE_ENTRY_RADIUS_NM);
-    if start_candidates.is_empty() {
+    let starts = nearest_visible_entry_tiles(land, geom, mesh, start);
+    if starts.is_empty() {
         return None;
     }
-    let starts: Vec<u32> = start_candidates
-        .iter()
-        .take(TILE_ENTRY_MAX)
-        .map(|&(i, _)| i)
-        .collect();
 
     let owned_goals: Vec<u32>;
     let goals: &[u32] = if let Some(g) = goal_tiles {
         g
     } else {
-        let goal_candidates = mesh.nearest_centroids(terminal, TILE_ENTRY_RADIUS_NM);
-        if goal_candidates.is_empty() {
+        owned_goals = nearest_visible_entry_tiles(land, geom, mesh, terminal);
+        if owned_goals.is_empty() {
             return None;
         }
-        owned_goals = goal_candidates
-            .iter()
-            .take(TILE_ENTRY_MAX)
-            .map(|&(i, _)| i)
-            .collect();
         &owned_goals
     };
 

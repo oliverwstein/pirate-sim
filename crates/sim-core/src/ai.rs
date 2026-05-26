@@ -23,8 +23,7 @@ use crate::nav::{self, NavGoal};
 use crate::pathfind::{self, PathfindContext};
 use crate::port::{Faction, Port};
 use crate::ship::{
-    angle_diff, normalize_angle, speed_at_heading, DockAction, Ship, ShipPolicy, ShipState,
-    ShipStats,
+    angle_diff, normalize_angle, DockAction, Ship, ShipPolicy, ShipState, ShipStats,
 };
 use crate::sim_rng::SimRng;
 use crate::spatial::SpatialHash;
@@ -727,6 +726,25 @@ impl<'a> ShipBtContext<'a> {
         harbor.contains_pos(pf.land, pf.coastline_geom, self.ship.position)
     }
 
+    /// Tactical steer for combat actions (pursue/flee/board). Routes
+    /// the desired heading through `nav::deflect_for_land` so the
+    /// combat ship honours the same no-aground invariant as
+    /// trade-routing. Returns the (heading, speed) pair to emit.
+    fn tactical_steer(&self, desired_heading: f32) -> (f32, f32) {
+        let terrain = self.pathfind.map(|c| crate::nav::NavTerrain {
+            geom: c.coastline_geom,
+            land: c.land,
+        });
+        let s = crate::nav::tactical_steering(
+            self.ship.position,
+            desired_heading,
+            self.stats,
+            self.wind,
+            terrain,
+        );
+        (s.heading, s.speed)
+    }
+
     // ───────── BT action implementations ─────────
     //
     // One method per `ACT_*` id, dispatched from `execute_action`
@@ -885,13 +903,13 @@ impl<'a> ShipBtContext<'a> {
         // marks valid paths as "blocked" and re-plans every tick.
         if let (Some(pf), Some(target)) = (self.pathfind, self.ship.nav.waypoints.first().copied())
         {
-            if !pf.land.corridor_is_clear(pos_truth, target, 0.0) {
+            if !pf.coastline_geom.line_is_clear(pf.land, pos_truth, target) {
                 // Step 1: skip-ahead probe over queued waypoints.
                 let mut skip_to: Option<usize> = None;
                 let probe_end = self.ship.nav.waypoints.len().min(SKIP_AHEAD_PROBE_LIMIT);
                 for i in 1..probe_end {
                     let wp = self.ship.nav.waypoints[i];
-                    if pf.land.corridor_is_clear(pos_truth, wp, 0.0) {
+                    if pf.coastline_geom.line_is_clear(pf.land, pos_truth, wp) {
                         skip_to = Some(i);
                         break;
                     }
@@ -946,13 +964,74 @@ impl<'a> ShipBtContext<'a> {
         {
             // We "arrived" at the path's last waypoint (the harbor
             // anchor) but the ship's actual position is just outside
-            // the harbor cell set. Replan from here so the new path
-            // ends with the ship inside the harbor zone, rather than
-            // false-docking in open water (which is the canonical
-            // way ships used to get stuck near small-harbor ports
-            // like Amsterdam/Nantes).
+            // the harbor zone. Two things must happen here, and
+            // omitting EITHER will pin the ship to land:
+            //
+            // 1. Replan toward the harbor (cooldown-gated against the
+            //    Port Royal-style every-tick storm), then if we just
+            //    populated fresh waypoints, immediately re-run
+            //    `compute_steering` so this tick's motion sweep uses
+            //    a heading derived from the new path. Without the
+            //    immediate re-steer, the new path doesn't take effect
+            //    until next tick — meaning at minimum one tick of
+            //    motion with stale heading, and during the entire
+            //    cooldown nothing updates `ship.heading` at all.
+            //
+            // 2. If we have no path to steer along (cooldown active
+            //    OR replan didn't yield one), explicitly emit
+            //    `Steer { ship.heading, 0.0 }` to HALT the ship.
+            //    Without this, `ship.heading` and `ship.speed` are
+            //    left as set on a previous tick — typically pointing
+            //    at the last waypoint, which was the harbor anchor on
+            //    the wrong side of a peninsula — and the motion sweep
+            //    keeps sailing the ship into the coast every tick.
+            //    This is exactly how ships ended up "stuck facing
+            //    land" at Port Royal: pinned at 0.02 NM from the
+            //    Palisadoes spit with a stale heading aimed at the
+            //    spit, no command refreshing it for 30 ticks at a
+            //    time.
+            let mut commanded = false;
             if let Some(idx) = self.goal.dest_port {
-                self.replan_to_port(idx);
+                if *self.replan_cooldown_ticks > 0 {
+                    self.diag.replans_suppressed_cooldown =
+                        self.diag.replans_suppressed_cooldown.saturating_add(1);
+                } else {
+                    self.replan_to_port(idx);
+                    *self.replan_cooldown_ticks = REPLAN_COOLDOWN_TICKS;
+                    // Immediate re-steer using the freshly populated path.
+                    let pos_estimate2 = self.estimated_position();
+                    let pos_truth2 = self.ship.position;
+                    let steering2 = self.ship.nav.compute_steering(
+                        self.goal,
+                        pos_estimate2,
+                        pos_truth2,
+                        self.stats,
+                        self.wind,
+                        terrain,
+                    );
+                    if let Some(s) = steering2 {
+                        self.commands.push((
+                            self.me,
+                            ShipCommand::Steer {
+                                heading: s.heading,
+                                speed: s.speed,
+                            },
+                        ));
+                        commanded = true;
+                    }
+                }
+            }
+            if !commanded {
+                // Safety halt: do not let the ship drift into land on
+                // a stale heading while we wait for the next chance to
+                // plan. The captain has lost the plot — strike sail.
+                self.commands.push((
+                    self.me,
+                    ShipCommand::Steer {
+                        heading: self.ship.heading,
+                        speed: 0.0,
+                    },
+                ));
             }
             Status::Running
         } else {
@@ -1487,10 +1566,7 @@ impl<'a> ShipBtContext<'a> {
         let dx = target.position.x - from.x;
         let dy = target.position.y - from.y;
         let heading = normalize_angle(dx.atan2(dy).to_degrees());
-        // Use the wind-adjusted top speed on this bearing so the
-        // emitted command matches what the physics step will actually
-        // deliver — no "commanded 12 kt, made good 4 kt" mismatch.
-        let speed = speed_at_heading(heading, self.stats, self.wind);
+        let (heading, speed) = self.tactical_steer(heading);
         self.commands
             .push((self.me, ShipCommand::Steer { heading, speed }));
         // Step 7/8: emit broadside + boarding intents using the velocity
@@ -1577,7 +1653,7 @@ impl<'a> ShipBtContext<'a> {
         } else {
             heading
         };
-        let speed = speed_at_heading(heading, self.stats, self.wind);
+        let (heading, speed) = self.tactical_steer(heading);
         self.commands
             .push((self.me, ShipCommand::Steer { heading, speed }));
         // Step 7: fleeing merchants may still bark back if the pirate
@@ -1898,7 +1974,7 @@ impl<'a> ShipBtContext<'a> {
         let dx = target.position.x - from.x;
         let dy = target.position.y - from.y;
         let heading = normalize_angle(dx.atan2(dy).to_degrees());
-        let speed = speed_at_heading(heading, self.stats, self.wind);
+        let (heading, speed) = self.tactical_steer(heading);
         self.commands
             .push((self.me, ShipCommand::Steer { heading, speed }));
         let attacker_vel = velocity_from(heading, speed);

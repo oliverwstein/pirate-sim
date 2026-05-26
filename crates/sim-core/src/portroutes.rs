@@ -20,7 +20,9 @@
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 
+use crate::coastline_geom::CoastlineGeom;
 use crate::harbor::HarborMap;
+use crate::map::land::LandMap;
 use crate::tile_mesh::TileMesh;
 
 /// SSSP table for one port destination: the shortest distance and
@@ -42,7 +44,21 @@ impl PortRouteCache {
     /// Build SSSP tables for every harbor in `harbors`. The result is
     /// indexed by `port_index`; ports without an `anchor_tile` yield
     /// `None`.
-    pub fn build(tile_mesh: &TileMesh, harbors: &HarborMap) -> Self {
+    ///
+    /// The Dijkstra source set per harbor is `anchor_tile` plus any
+    /// immediate neighbour whose centroid has clear polygon LOS to
+    /// the anchor. The LOS filter matters in tight harbors (Port
+    /// Royal sits at the tip of the Palisadoes spit — N/E/W neighbours
+    /// are obstructed by land even though they share a mesh edge with
+    /// the anchor tile). Without it, `route_from` can pick a neighbour
+    /// source whose centroid → anchor segment crosses land, producing
+    /// a path whose last leg sails through the spit.
+    pub fn build(
+        tile_mesh: &TileMesh,
+        harbors: &HarborMap,
+        land: &LandMap,
+        geom: &CoastlineGeom,
+    ) -> Self {
         let max_port_idx = harbors
             .harbors
             .iter()
@@ -57,13 +73,16 @@ impl PortRouteCache {
             let Some(anchor_tile) = harbor.anchor_tile else {
                 continue;
             };
-            // Sources = anchor tile + immediate neighbours. Matches the
-            // live planner's harbor goal set (`pathfind::find_path_to_harbor`),
-            // giving the funnel room to smooth into the harbor mouth.
+            // Sources = anchor tile + neighbours whose centroid is
+            // visible to the anchor. Matches the live planner's
+            // harbor goal set (`pathfind::find_path_to_harbor`).
             let mut sources: Vec<u32> = Vec::with_capacity(8);
             sources.push(anchor_tile);
             for e in &tile_mesh.neighbors[anchor_tile as usize] {
-                sources.push(e.to);
+                let nc = tile_mesh.tiles[e.to as usize].centroid;
+                if geom.line_is_clear(land, nc, harbor.anchor) {
+                    sources.push(e.to);
+                }
             }
             let routes = dijkstra_from_sources(tile_mesh, n_tiles, &sources);
             entries[harbor.port_index] = Some(routes);

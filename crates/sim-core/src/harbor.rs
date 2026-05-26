@@ -61,6 +61,17 @@ const ANCHOR_SEARCH_RADIUS_NM: f32 = 80.0;
 /// is treated as genuinely unreachable.
 const ANCHOR_FALLBACK_MAX_RADIUS_NM: f32 = 5120.0;
 
+/// If the ship's truth position is within this distance of the harbor
+/// anchor, `contains_pos` short-circuits to `true` regardless of the
+/// polygon-LOS clause. Sized to match `nav::ARRIVAL_NM` so that the
+/// steering-arrival annulus (the band where `compute_steering`
+/// declares the ship "arrived" and stops issuing commands) is always
+/// also "docked" by harbor semantics. If proximity were smaller than
+/// `ARRIVAL_NM`, ships could land 6–12 NM from the anchor with no
+/// steering yet not docked → `act_sail` would replan every tick,
+/// producing the Port Royal-style oscillation.
+const ANCHOR_PROXIMITY_NM: f32 = 12.0;
+
 /// One port's harbor zone.
 pub struct Harbor {
     pub port_index: usize,
@@ -92,6 +103,16 @@ impl Harbor {
     /// wrong side of a peninsula from being declared "docked" purely
     /// because it is within the radius.
     pub fn contains_pos(&self, land: &LandMap, geom: &CoastlineGeom, pos: Position) -> bool {
+        // Anchor-proximity short-circuit: the hull is physically at
+        // the anchor, no LOS check needed. Done before the bbox reject
+        // because anchors can sit well outside the port-disk bbox
+        // (e.g. Philadelphia's anchor is at Cape Henlopen, ~50 NM
+        // downstream of the city).
+        let dx_a = pos.x - self.anchor.x;
+        let dy_a = pos.y - self.anchor.y;
+        if dx_a * dx_a + dy_a * dy_a <= ANCHOR_PROXIMITY_NM * ANCHOR_PROXIMITY_NM {
+            return true;
+        }
         let (mn, mx) = self.bbox;
         if pos.x < mn.x || pos.x > mx.x || pos.y < mn.y || pos.y > mx.y {
             return false;

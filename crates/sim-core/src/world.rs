@@ -245,7 +245,12 @@ impl World {
         // tile mesh. Per-tick voyage planning becomes a lookup + the
         // shared funnel-stitch instead of a live A*. Must be built
         // after `harbors` and `tile_mesh`; a few ms per port.
-        let port_routes = crate::portroutes::PortRouteCache::build(&tile_mesh, &harbors);
+        let port_routes = crate::portroutes::PortRouteCache::build(
+            &tile_mesh,
+            &harbors,
+            &map.land,
+            &coastline_geom,
+        );
 
         Self {
             map,
