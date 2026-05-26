@@ -2484,3 +2484,74 @@ runtime just loads it. Matches the existing `coastline.bin` /
 legacy `Navmesh::build(land)` raster build (already exists),
 preserving existing unit-test behavior.
 
+
+---
+
+## 2026-05-26 — NavMesh Preprocessing Overhaul (Phase 1: Python + Visuals)
+
+**Context.** The previous `preprocess_navmesh.py` had two bugs and a performance problem:
+1. *Projection flaw*: shore buffer was applied in flat lat/lon degrees; at 60°N a 1 NM buffer was only ~0.5 NM wide east-west (cosine shrinkage).
+2. *Centroid LOS Fallacy*: no portal coordinates stored; the Rust pathfinder was routing centroid-to-centroid, which clips land on Hertel–Mehlhorn "L-shaped" merged tiles.
+3. *Steiner performance*: ~13k individual Shapely `contains()` calls per grid generation.
+
+**Decisions:**
+
+1. **Buffer distance: 0.25 NM (not 1 NM).** User requested small default to keep narrow channels (Delaware, Maracaibo) navigable. Can be increased per-run if more coastal clearance is needed.
+
+2. **Projection: EPSG:3857 via pyproj.** All buffering and simplification now performed in Web Mercator meters. Buffer is isotropic at each latitude (conformal projection). Ships no longer scrape east/west-facing coasts at high latitudes.
+
+3. **Binary format v2 (portals).** Each neighbor entry now carries `(u32 tile_index, f32 portal_x, f32 portal_y)` — the exact midpoint of the shared polygon edge. Rust pathfinder will route `Centroid_A → Portal_AB → Centroid_B`, guaranteeing no land crossing on merged tiles.
+
+4. **Steiner optimization: MultiPoint intersection.** Replaced O(N) per-point `contains()` loop with a single `sea.intersection(MultiPoint(...))` call. Shapely 2.0 vectorises this internally.
+
+5. **`visualize_navmesh.py` overhauled.** Now supports:
+   - `--shp` for land background
+   - `--shore-margin-nm` to show the buffer contour (uses same EPSG:3857 pipeline)
+   - `--portals` to show portal midpoints as orange dots
+   - `--input` now optional (can render land+buffer without navmesh.bin)
+
+**Results.** 39,079 tiles, 1 connected component, 2.96 MB. Three images written to `planning/`:
+  - `buffer-contour-025nm.png` — full map with 0.25 NM buffer contour
+  - `navmesh-full.png` — full map with tiles + buffer + portals
+  - `navmesh-caribbean.png` — Caribbean zoom with tiles + buffer + portals
+
+**Pending (separate step):** Update Rust `navmesh.rs` / `world.rs` to load from `navmesh.bin` instead of building programmatically from `LandMap`. Narrow-waterway handling to be reviewed after visual inspection.
+
+---
+
+## 2026-05-26 — NavMesh Visualization & Design Exploration
+
+**Context.** Following the Python overhaul (preprocess_navmesh.py, visualize_navmesh.py), we spent a session exploring the navmesh design space before committing to Rust alignment.
+
+**Buffer tuning (0.25 → 0.5 → 0.3 → 0.1 NM):**
+- 0.25 NM: 39,079 tiles, 213 components. Too many tiles, too many orphans.
+- 0.5 NM: 32,078 tiles, 603 components. Closed too many narrow passages.
+- 0.3 NM: 35,363 tiles, 299 components.
+- 0.1 NM (chosen): 42,807 tiles, only 28 components. Best connectivity; 0.1 NM (185 m) buffer is enough to smooth coastal staircasing without closing Delaware Bay or similar passages. Harbor anchors in ports.ron already handle river-mouth ports (Philadelphia at bay mouth, 30 NM harbor radius).
+
+**Skeleton / Voronoi exploration:**
+- Tested a Voronoi-based topological skeleton (`visualize_skeleton.py`) as an alternative to convex tiles.
+- Problem: Voronoi of discretized coastline samples produces a zigzag pattern in narrow channels rather than a clean centerline. This is a known limitation; the correct solution (straight skeleton via CGAL/scikit-geometry) was not installed.
+- Decision: stay with convex-tile approach. Tile centroids are guaranteed-safe routing nodes; portal routing (Centroid_A → Portal_AB → Centroid_B) eliminates land crossings.
+
+**Shortcut edges (added to visualizer, not yet baked into navmesh.bin):**
+- Identified pairs within N NM where the convex-tile graph path is > 2× the direct water distance.
+- Implemented `--shortcuts-nm` in visualize_navmesh.py using KD-tree + Shapely water check + scipy Dijkstra.
+- Results: 5,041 shortcuts at 12 NM, 6,405 at 15 NM, 11,083 at 24 NM, 22,228 at 50 NM.
+- **Not yet baked into navmesh.bin** — deferred pending Rust alignment and architecture decisions about tactical vs. strategic routing.
+
+**Visualizer upgrades added this session:**
+- `--mst`: MST of centroid adjacency (green backbone)
+- `--full-graph`: all 50,053 tile-adjacency edges
+- `--shortcuts-nm`: orange shortcut edges
+- `--ports-ron`: port markers from ports.ron
+- `--no-tiles`: suppress tile polygons (centroids + lines only)
+- Reader updated to use `struct.unpack_from("<Iff", ...)` for neighbor records (byte-alignment safe)
+- Portal dots (`--portals`) verified drawing correctly
+
+**Architecture questions deferred to next session:**
+1. Shortcut edges: bake into navmesh.bin or compute at Rust load time?
+2. Point-location: given a ship's Position, how to find its tile in O(log n)?
+3. Tactical vs. strategic routing: SSSP pre-baked for port-pair routes; online A* for flee/pursue/guard. Open question: is 50 NM Steiner spacing fine enough for tactical decisions (ship moves ~12 NM/hr)?
+
+**Next action:** Rust alignment — update navmesh.rs / world.rs to load navmesh.bin (portal-aware format) instead of building from LandMap.
