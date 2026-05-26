@@ -2645,3 +2645,58 @@ lookups elsewhere). No big-bang removal.
 **Out of scope this pass.** Migrating ports to tile-ids; removing the
 raster fast-path inside `coastline_geom`; baking shortcut edges from
 the visualizer experiments; per-ship cached current-tile tracking.
+
+---
+
+## 2026-05-27 — Ship navigation Phase B: tile-anchored harbors
+
+**Phase A** (committed `1872691`) landed the portal-aware `TileMesh`
+loader for `data/grids/navmesh.bin`. **Phase B** (committed `d2058fb`)
+swaps the `Harbor` representation off the 1 NM raster cell-set and
+onto a tile-centroid anchor:
+
+- `Harbor` drops `cells: HashSet<(u32,u32)>` and gains `port_pos`,
+  `harbor_radius_nm`, `anchor: Position` (a tile centroid),
+  `anchor_tile: Option<u32>` (`TileMesh` index), and `bbox`.
+- `HarborMap::build(land, tile_mesh, ports)` picks the
+  geometric-nearest tile centroid per port via the `TileMesh`
+  centroid hash, with an expanding-shell fallback for ports outside
+  the initial 80 NM scan.
+- `Harbor::contains_pos(land, pos)` keeps the raster LOS clause
+  between the **ship's** position and the anchor (still meaningful;
+  ships are in water by invariant). Phase E will swap it for
+  polygon-truth `coastline_geom::line_is_clear`.
+- `World` now loads `TileMesh` from disk and stores it alongside the
+  legacy `Navmesh` (which Phase C will retire from the path planner).
+
+**Reversal from the plan**: the original Phase B spec had a two-stage
+anchor search — nearest LOS-visible centroid, then tile-graph BFS
+fallback for river-mouth ports. In practice it skipped 23 of 38
+ports because the `ports.ron` coordinates are fudged onto land (the
+authoritative coords are still being researched by the background
+agent). With no `port_pos` LOS line possible, the BFS exhausted with
+nothing to return. We replaced both stages with a flat
+geometric-nearest-centroid lookup: the navmesh preprocessor already
+guarantees the centroid is in clean water (largest connected ocean
+component, 0.1 NM shore margin), so it's always a safe planner
+target even when the city itself is on land. The LOS clause remains
+in `contains_pos` where it actually matters.
+
+**Status of the legacy raster path planner under tile anchors.**
+`bench_pathfind` now attempts all 1406 routes (was 555, because half
+the harbors had previously been skipped). 1056 succeed; 350 return
+no-path. Cause: the legacy `find_path_to_harbor` still uses the old
+`Navmesh` (raster-derived graph) and `LandMap::corridor_is_clear` to
+plan paths, and requires the anchor be visible-from at least one
+old-Navmesh node via a zero-margin raster corridor. Tile centroids
+are derived from the polygon coastline (different discretization);
+for a chunk of ports the centroid lands in a raster cell that's
+classified as land, so the planner can't connect to it. Phase C
+fixes this by routing on `TileMesh` directly, eliminating the
+anchor-source vs planner-source mismatch.
+
+**Phase C blocker carried forward.** SSFA needs `(left, right)`
+portal edge endpoints, but `navmesh.bin` v2 stores only the portal
+**midpoint** per edge. We will reconstruct the endpoints by
+intersecting adjacent tiles' vertex lists during corridor stitching
+(the vertices are present per tile). Confirm before implementing.
