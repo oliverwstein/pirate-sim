@@ -149,7 +149,10 @@ fn main() {
     let avg = |v: &[u128]| v.iter().sum::<u128>() as f64 / v.len() as f64;
 
     println!();
-    println!("N segments: {} (max length {} NM)", N_SEGMENTS, MAX_SEGMENT_NM);
+    println!(
+        "N segments: {} (max length {} NM)",
+        N_SEGMENTS, MAX_SEGMENT_NM
+    );
     println!("sink={} (anti-DCE)", sink);
     println!();
     println!(
