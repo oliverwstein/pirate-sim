@@ -2435,3 +2435,52 @@ empty), so tests don't need polygon scaffolding.
 are worth cherry-picking when ready; the steering tweaks become
 unnecessary once Phase 3 lands.
 
+
+---
+
+## 2024-xx (post-Phase-1): pivot to convex-tile navmesh
+
+**Context.** After Phase 1 of the nav overhaul landed
+(`coastline_geom` bilevel LOS primitive, commit a150e72), the next
+question was how to *place* waypoints so coverage is guaranteed.
+
+**Alternatives considered.**
+1. *Offset-coastline ring + open-water grid* — sample a 5 NM offset
+   from each coastline polyline, lay nodes every 5 NM along it. Pro:
+   simple. Con: offset direction is ambiguous on isolated polylines;
+   self-intersections in concave bays; no guarantee that every sea
+   point has LOS to a waypoint.
+2. *Coverage-driven deficit repair* — start with open-water grid,
+   scan sea cells, add waypoints wherever no existing waypoint is
+   LOS-clear. Pro: guarantees LOS coverage at the scan stride. Con:
+   the new waypoints can be in isolated concave pockets with no edges
+   to the main graph; needs a separate connectivity-repair pass.
+3. *Convex partition of the navigable sea polygon (CHOSEN).* Treat
+   the sea as a polygon-with-holes (world bounds minus union of land
+   polygons). Convex-partition it (Hertel–Mehlhorn or Keil). Tile
+   centroids become the navmesh nodes; adjacency becomes the edge set.
+
+**Why (3) wins.** Two structural properties fall out for free:
+
+- T convex ⇒ every point in T has LOS to centroid(T).
+- A, B adjacent convex tiles sharing edge e ⇒ segment
+  centroid(A)→centroid(B) crosses e and lies in A∪B, which is all sea.
+  So centroid-to-neighbor-centroid LOS is *guaranteed by construction*.
+
+No coverage scan, no offset distance to tune, no isolated-pocket
+handling. Path planning becomes a clean tile-graph A*; ship
+localization becomes O(log n) point location.
+
+**Implementation split.** Polygon Boolean union + CDT + convex merge
+is hard to do robustly. Shapely + Shewchuk's `triangle` in Python are
+mature; the equivalent Rust stack (`geo`/`i_overlay` + `spade` +
+hand-rolled merge) is doable but a lot of code. Decision: build the
+navmesh *offline* via a new Python script
+(`tools/preprocess/preprocess_navmesh.py`), ship `data/grids/navmesh.bin`,
+runtime just loads it. Matches the existing `coastline.bin` /
+`land_polys.bin` pattern; runtime stays minimal.
+
+**Fallback.** Test worlds without polygon data fall back to the
+legacy `Navmesh::build(land)` raster build (already exists),
+preserving existing unit-test behavior.
+
