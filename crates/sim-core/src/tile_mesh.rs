@@ -86,6 +86,42 @@ pub struct TileMesh {
     /// Spatial hash of centroids in `BUCKET_NM`-sized cells. The key
     /// is `(floor(x / BUCKET_NM), floor(y / BUCKET_NM))`.
     centroid_buckets: HashMap<(i32, i32), Vec<u32>>,
+    /// Per-tile distance (NM) from the centroid to the nearest
+    /// coastline edge, capped at [`CLEARANCE_MAX_NM`]. Empty after
+    /// [`TileMesh::load`]; filled by [`TileMesh::set_clearance`] once
+    /// `CoastlineGeom` is available. All zeros means "no clearance
+    /// information" (planner falls back to pure distance cost).
+    clearance_nm: Vec<f32>,
+}
+
+/// Cap on the clearance-from-land lookup. Beyond this, every tile is
+/// considered "fully clear" and pays no penalty. 1 NM is the soft
+/// preferred buffer (see `clearance_penalty`); the cap is set a bit
+/// higher so the penalty curve has headroom and the bucket scan is
+/// bounded.
+pub const CLEARANCE_MAX_NM: f32 = 2.0;
+
+/// Soft preferred clearance (NM). Tiles with centroid clearance ≥ this
+/// value incur no routing penalty. Tiles closer to land are penalised
+/// quadratically up to a maximum cost multiplier of
+/// `1.0 + CLEARANCE_PENALTY_K`, applied at clearance = 0.
+pub const PREFERRED_CLEARANCE_NM: f32 = 1.0;
+
+/// Maximum extra cost multiplier when clearance = 0. A value of 9.0
+/// means a hard-against-coast edge costs 10× its true length, so a
+/// detour of up to ~10× the straight-line distance will be chosen if
+/// it stays in open water — but if the only route hugs the coast, the
+/// planner still takes it (cost stays finite).
+pub const CLEARANCE_PENALTY_K: f32 = 9.0;
+
+/// Edge-cost penalty multiplier for two tiles with the given pairwise
+/// clearance (the *minimum* of the two endpoint clearances). Returns
+/// 1.0 when `clearance ≥ PREFERRED_CLEARANCE_NM`, ramps quadratically
+/// up to `1.0 + CLEARANCE_PENALTY_K` at `clearance = 0`.
+#[inline]
+pub fn clearance_penalty(clearance: f32) -> f32 {
+    let deficit = (PREFERRED_CLEARANCE_NM - clearance).max(0.0) / PREFERRED_CLEARANCE_NM;
+    1.0 + CLEARANCE_PENALTY_K * deficit * deficit
 }
 
 impl TileMesh {
@@ -96,6 +132,7 @@ impl TileMesh {
             tiles: Vec::new(),
             neighbors: Vec::new(),
             centroid_buckets: HashMap::new(),
+            clearance_nm: Vec::new(),
         }
     }
 
@@ -198,6 +235,7 @@ impl TileMesh {
             tiles,
             neighbors,
             centroid_buckets,
+            clearance_nm: Vec::new(),
         })
     }
 
@@ -210,6 +248,36 @@ impl TileMesh {
     /// meshes; the loader rejects empty real files.
     pub fn is_empty(&self) -> bool {
         self.tiles.is_empty()
+    }
+
+    /// Install per-tile clearance values. `clearance.len()` must equal
+    /// `self.tiles.len()`. Each entry is the distance (NM, capped at
+    /// [`CLEARANCE_MAX_NM`]) from the tile centroid to the nearest
+    /// coastline edge. Called by `World::load` after both the mesh
+    /// and the `CoastlineGeom` have been built.
+    pub fn set_clearance(&mut self, clearance: Vec<f32>) {
+        debug_assert_eq!(clearance.len(), self.tiles.len());
+        self.clearance_nm = clearance;
+    }
+
+    /// True iff clearance data has been installed. When false, the
+    /// router falls back to pure distance cost (penalty multiplier 1).
+    #[inline]
+    pub fn has_clearance(&self) -> bool {
+        !self.clearance_nm.is_empty()
+    }
+
+    /// Effective routing cost for the directed edge `from → e.to`,
+    /// blending raw distance with the clearance penalty. Returns
+    /// `e.dist_nm` unchanged when no clearance data is installed.
+    #[inline]
+    pub fn edge_cost(&self, from: u32, e: &TileEdge) -> f32 {
+        if self.clearance_nm.is_empty() {
+            return e.dist_nm;
+        }
+        let ca = self.clearance_nm[from as usize];
+        let cb = self.clearance_nm[e.to as usize];
+        e.dist_nm * clearance_penalty(ca.min(cb))
     }
 
     /// Indices of tiles whose centroid is within `radius_nm` of `pos`,
@@ -312,7 +380,7 @@ impl TileMesh {
                 }
                 let cur_g = scratch.g_score[cur_us];
                 for e in &self.neighbors[cur_us] {
-                    let tentative = cur_g + e.dist_nm;
+                    let tentative = cur_g + self.edge_cost(cur, e);
                     let to_us = e.to as usize;
                     let prev = scratch.g_score[to_us];
                     if tentative < prev {
@@ -677,6 +745,7 @@ mod tests {
             tiles,
             neighbors,
             centroid_buckets,
+            clearance_nm: Vec::new(),
         }
     }
 

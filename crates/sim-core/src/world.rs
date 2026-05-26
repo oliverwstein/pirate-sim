@@ -177,7 +177,7 @@ impl World {
         let weather = WeatherSystem::load(data_dir);
         let ship_types = ShipTypeRegistry::starter();
         let ports = all_ports(&ship_types);
-        let tile_mesh = TileMesh::load(&data_dir.join("grids/navmesh.bin"))
+        let mut tile_mesh = TileMesh::load(&data_dir.join("grids/navmesh.bin"))
             .expect("load data/grids/navmesh.bin (run tools/preprocess/preprocess_navmesh.py)");
         let harbors = HarborMap::build(&map.land, &tile_mesh, &ports);
         let coastline =
@@ -185,6 +185,20 @@ impl World {
         let land_mesh = LandMesh::load(&data_dir.join("grids/land_polys.bin")).unwrap_or_default();
         let coastline_geom =
             crate::coastline_geom::CoastlineGeom::build(&map.land, &coastline, &land_mesh);
+        // Per-tile land clearance for the routing cost. Capped at
+        // CLEARANCE_MAX_NM so the per-centroid bucket scan stays small
+        // (~few buckets). Drives the soft "stay >= 1 NM offshore"
+        // preference in TileMesh::route and PortRouteCache.
+        {
+            let clearance: Vec<f32> = tile_mesh
+                .tiles
+                .iter()
+                .map(|t| {
+                    coastline_geom.clearance_nm(t.centroid, crate::tile_mesh::CLEARANCE_MAX_NM)
+                })
+                .collect();
+            tile_mesh.set_clearance(clearance);
+        }
         let goods = GoodsRegistry::starter();
         let port_specs: Vec<PortSpec<'_>> = ports
             .iter()

@@ -278,6 +278,53 @@ impl CoastlineGeom {
         a + along * t
     }
 
+    /// Distance (NM) from `pos` to the nearest coastline edge, capped
+    /// at `max_radius_nm`. If no edge lies within that radius, returns
+    /// `max_radius_nm`. When the geom has no polyline data, returns
+    /// `max_radius_nm` (everywhere is "far from land" — the raster
+    /// fast-path is not used here because callers want a quantitative
+    /// distance, not a boolean).
+    ///
+    /// Used by the planner to score "how close does this tile sit to
+    /// land" so routes can prefer to stay >= 1 NM offshore.
+    pub fn clearance_nm(&self, pos: Position, max_radius_nm: f32) -> f32 {
+        if !self.has_polylines || max_radius_nm <= 0.0 {
+            return max_radius_nm.max(0.0);
+        }
+        let r = max_radius_nm;
+        let r2 = r * r;
+        let r_buckets = (r / BUCKET_NM).ceil() as i32;
+        let cols = self.coast.cols as i32;
+        let rows = self.coast.rows as i32;
+        let (col0, row0) =
+            match pos_to_bucket_in_bounds(pos, self.coast.origin, self.coast.cols, self.coast.rows)
+            {
+                Some((c, r)) => (c as i32, r as i32),
+                None => return r, // pos outside indexed area
+            };
+        let mut best2 = r2;
+        for dr in -r_buckets..=r_buckets {
+            let r_idx = row0 + dr;
+            if r_idx < 0 || r_idx >= rows {
+                continue;
+            }
+            for dc in -r_buckets..=r_buckets {
+                let c_idx = col0 + dc;
+                if c_idx < 0 || c_idx >= cols {
+                    continue;
+                }
+                let bucket_idx = (r_idx as u32 * self.coast.cols + c_idx as u32) as usize;
+                for e in &self.coast.buckets[bucket_idx] {
+                    let d2 = point_segment_dist_sq(pos, e.a, e.b);
+                    if d2 < best2 {
+                        best2 = d2;
+                    }
+                }
+            }
+        }
+        best2.sqrt()
+    }
+
     // Test accessors.
     #[doc(hidden)]
     pub fn coast_edge_count(&self) -> usize {
@@ -555,6 +602,21 @@ fn point_in_triangle(p: Position, a: Position, b: Position, c: Position) -> bool
     let has_neg = d1 < 0.0 || d2 < 0.0 || d3 < 0.0;
     let has_pos = d1 > 0.0 || d2 > 0.0 || d3 > 0.0;
     !(has_neg && has_pos)
+}
+
+/// Squared distance from point `p` to the segment `(a, b)`.
+fn point_segment_dist_sq(p: Position, a: Position, b: Position) -> f32 {
+    let ab = b - a;
+    let len2 = ab.x * ab.x + ab.y * ab.y;
+    if len2 <= 1e-12 {
+        let d = p - a;
+        return d.x * d.x + d.y * d.y;
+    }
+    let ap = p - a;
+    let t = ((ap.x * ab.x + ap.y * ab.y) / len2).clamp(0.0, 1.0);
+    let proj = a + ab * t;
+    let d = p - proj;
+    d.x * d.x + d.y * d.y
 }
 
 /// Raster-only first-hit walk; used when polygons are unavailable.

@@ -156,7 +156,7 @@ fn dijkstra_from_sources(mesh: &TileMesh, n_tiles: usize, sources: &[u32]) -> Po
             continue;
         }
         for e in &mesh.neighbors[cur_us] {
-            let nd = d + e.dist_nm;
+            let nd = d + mesh.edge_cost(cur, e);
             let to_us = e.to as usize;
             if nd < dist[to_us] {
                 dist[to_us] = nd;

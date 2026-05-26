@@ -3059,3 +3059,48 @@ heading, the motion fails the short-probe, deflection on the next
 tick picks the opposite escape, motion fails again — repeat.
 
 **Validation.** 237 tests pass; clippy clean; `bench_pathfind` 1332/1332.
+
+---
+
+## 2025 — Route preference: stay >= 1 NM from land
+
+**Symptom.** SSSP-cached harbor routes hug the coast — Dijkstra over
+the tile-centroid graph with raw `dist_nm` edge cost picks the
+straightest path, which often means tiles whose centroids sit a
+fraction of a nautical mile from the polygon coastline. Combined
+with the unresolved f32 robustness bug in `coastline_geom`, ships
+along those routes frequently end up grazing land and oscillating.
+
+**Fix.** Soft "stay offshore" preference baked into both the cached
+SSSP and the live A*, sharing a single per-tile clearance vector.
+
+- `CoastlineGeom::clearance_nm(pos, max_radius_nm)` — bucket scan
+  returning the minimum point-to-segment distance to any indexed
+  coastline edge, capped at `max_radius_nm` (with new
+  `point_segment_dist_sq` helper).
+- `TileMesh::clearance_nm: Vec<f32>` — one entry per tile, populated
+  once at `World::load` by sampling `CoastlineGeom::clearance_nm` at
+  each centroid (cap `CLEARANCE_MAX_NM = 2.0`).
+- `TileMesh::edge_cost(from, e) = e.dist_nm * clearance_penalty(min(c_a, c_b))`
+  with `clearance_penalty(c) = 1 + 9 * max(0, (1 - c/1.0))^2`.
+  Quadratic ramp from 1× at c >= 1 NM up to 10× at c = 0. A path
+  forced against the coast still wins over a >10× detour, but a
+  straight near-coast cut loses to an open-water sweep when the two
+  are similar in length. A* heuristic stays admissible (penalty >= 1).
+- `dijkstra_from_sources` (in `portroutes.rs`) and `TileMesh::route`
+  both go through `mesh.edge_cost`, so the cached SSSP and the live
+  fallback agree on what "good route" means.
+
+**Smoothing.** A runtime LOS string-pull post-pass was prototyped in
+`stitch_tile_route` but immediately reverted: visually the funnel
+output is still jagged because the centroid+portal corridor itself
+zigzags through small open-water tiles, and the per-query relax did
+not solve it. The agreed direction is to do route simplification at
+build time (either in `PortRouteCache::build` or in the navmesh
+preprocessor) rather than per-query — deferred to a later pass.
+
+**Validation.** `cargo test --workspace` green; `clippy -D warnings`
+clean; `bench_pathfind` 1332/1332 (0.02 ms avg, 0.34 ms max — small
+overhead vs prior). `bench_trade` 60-day run completes; no new
+calibration regressions.
+
