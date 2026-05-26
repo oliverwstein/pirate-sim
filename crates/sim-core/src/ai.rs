@@ -1164,6 +1164,21 @@ impl<'a> ShipBtContext<'a> {
             // included re-rigging as a normal item, not a separate
             // refit. Silver-or-debt.
             self.ship.top_off_rigging(self.stats);
+            // Step out to the harbor anchor (a tile centroid LOS-clear
+            // from the port). Ports are positioned on the coast itself,
+            // so a freshly-undocking ship at `port.position` is hard
+            // against land; sailing from there leaves no room for the
+            // deflection probe and the first sail leg routinely grounds.
+            // Modelling the pilot-out / warping-out leg as an
+            // instantaneous teleport to the anchor matches how a 17th-c.
+            // ship actually left harbor (kedge / pilot to clear water,
+            // then make sail) and keeps the motion sweep on safe water
+            // from tick 1.
+            if let Some(port_idx) = self.ship.nav.docked_at_port {
+                if let Some(harbor) = self.harbors.for_port(port_idx) {
+                    self.ship.position = harbor.anchor;
+                }
+            }
             self.ship.undock();
             self.ship.nav.docked_at_port = None;
             self.ship.dock_action = DockAction::Idle;
