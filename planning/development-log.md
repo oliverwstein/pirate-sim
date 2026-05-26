@@ -3172,3 +3172,154 @@ no longer used but is still in the preprocessor source for now;
 delete it in a follow-up. The runtime "deep-water heading averaging"
 (`deep_water_target` in `nav.rs`) was tried and rejected in favour
 of the substrate fix; no surviving runtime smoothing layer.
+
+---
+
+## 2026-?? — Stuck-ship rescue attempts: all failed
+
+**Context.** After landing the portal-aware tile-route refactor
+(`PlannedPath { waypoints, tile_route }` plumbed through NavTrack;
+`compute_steering` falls back to `mesh.portal_between` when LOS to the
+next waypoint is blocked; `deflect_for_land` removed from the normal
+steering path), ships in the Delaware River and around New York Harbor
+still get **wedged at `speed = 0`** indefinitely. Hull is pinned
+against a polygon edge inside a narrow channel; the motion sweep keeps
+zeroing speed every tick. The portal-aware steering helps in open
+water and most coastal approaches but does not rescue ships already
+pressed against a coastline.
+
+**Failed approaches (all uncommitted, reverted).**
+
+1. **Stuck-tick replan.** Added `stuck_ticks: u16` on `ShipAI`,
+   `STUCK_SPEED_KT = 0.01`, `STUCK_REPLAN_TICKS = 2`. When stuck for
+   2 ticks with a destination set, force `replan_to_port` from truth
+   (snap `estimated_position` to `ship.position` first). Bypasses the
+   30-tick cooldown but only runs once per cooldown cycle so it can't
+   thrash. *Result:* ships still stuck; the new plan from the same
+   pinned position immediately re-encounters the same condition.
+
+2. **Hop to next waypoint (LOS-gated).** Before replanning, if
+   `waypoints[0]` is within 0.25 → 0.5 → 1.0 NM and polygon LOS-clear,
+   teleport hull to it, pop, reorient. *Result:* still stuck. Tried
+   each threshold; visualizer showed no improvement.
+
+3. **Hop to nearest waypoint with successor preference.** Find
+   `argmin_i dist(pos, waypoints[i])`, prefer `waypoints[i+1]` (in
+   case nearest is one we've drifted past), require LOS-clear. Discard
+   everything up to and including the hopped-to waypoint. *Result:*
+   still stuck.
+
+4. **Hop to nearest waypoint, no LOS check, within 1 NM.** User's
+   suggestion: just teleport unconditionally to the nearest queued
+   waypoint within 1 NM, drop the LOS gate entirely. *Result:* still
+   stuck.
+
+**Reverted.** All four attempts (`stuck_ticks` field, constants,
+rescue blocks, ai.rs threading) discarded via `git checkout`. Branch
+`ai-expansion` left at the portal-aware steering refactor with no
+stuck-rescue layered on top.
+
+**Hypothesis on why nothing worked.** Either (a) the failing ships
+have no waypoint within 1 NM of their pinned position (the planner's
+SSFA pulls waypoints tight against pivot corners; a hull drifted
+laterally into a different shoreline may be > 1 NM from any of
+them), or (b) something *upstream* of the AI tick is keeping the
+ships pinned — the motion sweep's `coastline_geom::farthest_clear_point`
+may be returning the current position when the desired heading has
+*any* lateral component into the polygon, and the AI never gets to
+revise the heading because it sees `speed == 0` and replans → same
+plan → same heading → stuck. The teleport even moved the hull
+to a known-good waypoint and the *next* tick still showed `speed = 0`,
+which strongly suggests the motion sweep itself is the culprit, not
+the AI plan.
+
+**Next.** Background research agent to design an elegant
+get-unstuck-and-navigate-narrow-channels algorithm with a hard
+guarantee that no ship can remain `speed = 0` against the coast
+indefinitely. See agent task launched concurrently.
+
+---
+
+## 2026-?? — Sliding motion sweep + remove `deflect_for_land`: also failed
+
+**Context.** Following the failed teleport-rescue attempts (previous
+entry), a research agent produced `planning/research/narrow-channel-navigation.md`
+which recommended a layered fix. The top recommendation (Priority 1)
+was to replace the motion sweep's hard-stop on land contact with a
+Quake-style *sliding response*: project the remaining velocity onto
+the contact edge's tangent so a hull grazing the bank keeps tangential
+motion instead of going to `speed = 0`.
+
+**What was tried.**
+
+1. **`CoastlineGeom::slide_move`** — Quake/Source-style sliding move
+   for 2-D. Up to 4 bumps per tick; on each land hit, find the
+   contact edge, compute its outward normal, zero the into-surface
+   component of remaining velocity, multiply by `FRICTION = 0.85`,
+   continue. Required a new query `first_land_hit_with_edge` that
+   returns both the hit point and the polyline edge that produced it.
+   Wired into `world.rs` motion sweep, replacing
+   `farthest_clear_point`.
+
+2. **Removed `deflect_for_land` from `compute_steering`.** With the
+   sliding sweep handling marginal grazes at the physics layer, the
+   36-ray reactive deflection in steering was redundant and was the
+   suspected source of tick-to-tick oscillation (different "best"
+   heading each tick as ship position shifts → wobble). Combat
+   steering (`tactical_steering`) still uses `deflect_for_land`.
+
+**Results.**
+
+- *First viz check* (sliding sweep only, `deflect_for_land` still in):
+  "Delaware still doesn't work, oscillating in the water. **Nothing
+  gets stuck though, it's only oscillation.**" — User. This was a
+  partial win: hulls no longer pinned at zero speed.
+
+- *Second viz check* (sliding sweep + `deflect_for_land` removed from
+  normal steering): "Ships still get stuck in the delaware." — User.
+  Regression: removing `deflect_for_land` reintroduced the stuck
+  condition. The sliding sweep alone does not provide enough
+  emergent wall-following to keep ships moving through the Delaware's
+  geometry.
+
+**Reverted.** The `coastline_geom.rs` slide_move, the `world.rs`
+wire-up, the `nav.rs` deflect-removal, the `tile_mesh.rs` scaffolding
+(`tile_contains`, `find_tile_containing`, `walk_to_tile`), and the
+incidental `harbor.rs` whitespace drift all discarded via
+`git checkout`. Branch `ai-expansion` left at the post-hex-lattice
+state with no nav modifications.
+
+**What this tells us.** Sliding response is necessary but not
+sufficient. The Delaware failure mode is more subtle than "hull
+pinned at speed = 0":
+
+- With `deflect_for_land` present and `farthest_clear_point` physics:
+  ship oscillates because the deflector picks a different heading
+  each tick.
+- With sliding physics and `deflect_for_land` present: ship still
+  oscillates (sliding lets it move, deflector still flip-flops).
+- With sliding physics and `deflect_for_land` removed: ship gets
+  stuck again — the bearing-to-waypoint heading has too much
+  into-coast component for sliding alone to extract useful tangential
+  motion, OR the waypoint itself sits in a position where any direct
+  approach grazes land.
+
+**Likely root cause.** The SSFA waypoints are *pulled tight* against
+the convex pivots of the funnel, which in a narrow twisty channel
+means waypoints sit right at the inside corners. A direct heading
+toward such a waypoint from upstream often grazes the *opposite*
+bank before reaching the pivot. The corridor is fine; the discrete
+target points within it are not.
+
+**Suggested next direction.** Priority 2 (`current_tile` tracking)
++ Priority 3 (portal-gate steering) from the research doc, treating
+the planner output as a chain of *gates* (portals) rather than
+discrete waypoints. The steering target each tick is the next gate's
+midpoint (provably safe by tile convexity), not a corner-pulled
+waypoint. This is the substrate the previous "portal-aware steering
+on tile-route" refactor was building toward; it needs the `current_tile`
+piece to robustly identify which gate is "next" even after off-route
+drift.
+
+Research document committed alongside this entry:
+`planning/research/narrow-channel-navigation.md`.
