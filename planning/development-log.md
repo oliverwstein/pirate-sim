@@ -2555,3 +2555,93 @@ preserving existing unit-test behavior.
 3. Tactical vs. strategic routing: SSSP pre-baked for port-pair routes; online A* for flee/pursue/guard. Open question: is 50 NM Steiner spacing fine enough for tactical decisions (ship moves ~12 NM/hr)?
 
 **Next action:** Rust alignment — update navmesh.rs / world.rs to load navmesh.bin (portal-aware format) instead of building from LandMap.
+
+---
+
+## 2026-05-26 — Ship navigation: substrate swap (plan agreed)
+
+**Context.** The convex-tile portal navmesh is now produced offline by
+`preprocess_navmesh.py` (`data/grids/navmesh.bin`, ~43k tiles at 0.1 NM
+shore margin). Polygon-aware LOS exists as `coastline_geom` (Phase 1
+of the older overhaul, no production callers yet). Ship movement and
+pathing still run on the 1 NM `LandMap` raster — the substrate that
+caused the stairstep wedging in concave bays.
+
+**Decision.** Switch ship navigation off the raster in a piecemeal
+pass. Keep `LandMap` loaded as `coastline_geom`'s positive-filter
+speedup and for unchanged callers (shipyard, weather, harbor cell
+lookups elsewhere). No big-bang removal.
+
+**Design choices (this session):**
+
+1. **Path planning** — string-pulling (Simple Stupid Funnel) through
+   the portal corridor produced by A* on tile centroids. Portal
+   midpoints are guaranteed safe by construction; the funnel produces
+   near-shortest polylines inside the tile chain. Each output segment
+   is LOS-validated by `coastline_geom::line_is_clear` as a safety net.
+
+2. **Tile lookup** — uniform-grid hash on tile **centroids only**.
+   Queries are always "nearest few LOS-visible centroids from `pos`",
+   never point-in-tile. Tiles can be sharp shards without consequence
+   because we don't ask which one we're in. The navmesh is for
+   navigation, not for any "is this point in water" authority.
+
+3. **No `is_land` check on ship positions.** Ships cannot legitimately
+   be on land (docking/careening abstract the ship as just off-coast),
+   so being in water is invariant, not a runtime check. The motion
+   sweep needs `first_land_hit(ray)` for look-ahead deflection; the
+   pathing needs `line_is_clear(a, b)` for visibility / smoothing.
+   Both already exist on `coastline_geom`.
+
+4. **Harbor zone** — drop `Harbor.cells: HashSet<(u32,u32)>`. New
+   contract: `dist(pos, port.position) ≤ harbor_radius_nm` AND
+   `line_is_clear(pos, anchor)`. Each port gets an `anchor_tile`
+   derived at world-load: nearest LOS-visible centroid to
+   `port.position`, with a tile-graph BFS fallback for river-mouth
+   ports (Philadelphia etc.) whose coordinate sits on land at the
+   coastline polygon's resolution.
+
+5. **Substrate scope today** — replace the raster only in:
+   - `pathfind.rs` (LOS short-circuit + smoothing)
+   - `portroutes.rs` (entry-tile derivation)
+   - `nav.rs::deflect_for_land` (forward probe)
+   - `world.rs` motion sweep (`farthest_clear_point` → `first_land_hit`)
+   - `harbor.rs` (anchor + contains)
+   Everything else keeps using `LandMap` until later passes render it
+   obsolete.
+
+**Rejected alternatives.**
+- *Portal-midpoint waypoints only* (no funnel): cheaper but the paths
+  zig-zag visibly through every portal, hurting both visual quality and
+  effective speed. The funnel pass is ~150 LOC and well-understood.
+- *KD-tree / R-tree / Delaunay-walk for point location*: overkill once
+  we realised we never need point-in-tile, only nearest-centroid +
+  LOS filter.
+- *Polygon harbor zones* (union of tiles within radius): symmetric
+  but adds offline build-time complexity for no observable behavior
+  change vs. the distance + LOS predicate.
+- *Big-bang LandMap removal*: too much surface in one pass, and
+  `coastline_geom` already wants the raster as its positive-filter
+  speedup.
+
+**Phases (each independently committable).**
+- **A** Load `navmesh.bin` into a portal-aware `TileMesh` (no behavior
+  change yet).
+- **B** New `Harbor` (anchor + anchor_tile), drop cell BFS.
+- **C** Rewrite `pathfind.rs` — A* on tiles → portal corridor → funnel
+  smoothing → LOS-validated waypoints.
+- **D** `PortRouteCache` SSSP on the tile graph; same `route_from`
+  contract.
+- **E** `nav.rs::deflect_for_land` and `world.rs` motion sweep use
+  `coastline_geom::first_land_hit`.
+- **F** Wire `CoastlineGeom` into `World::load`; validate via
+  `bench_pathfind`, `bench_trade --days 60`, and visualizer
+  spot-check (expectation: stuck/slow incident count drops to near
+  zero).
+- **G** Cleanup — delete `Navmesh::build(&LandMap)`, `bfs_zone`, and
+  the raster anchor snap. `LandMap` stays loaded for unchanged
+  callers.
+
+**Out of scope this pass.** Migrating ports to tile-ids; removing the
+raster fast-path inside `coastline_geom`; baking shortcut edges from
+the visualizer experiments; per-ship cached current-tile tracking.
