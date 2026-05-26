@@ -260,6 +260,7 @@ mod tests {
         // Use `from_bytes` so we don't need to expose private fields:
         // serialise the tile to the binary format and parse it back.
         let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(&crate::tile_mesh::NAVMESH_MAGIC.to_le_bytes());
         buf.extend_from_slice(&1u32.to_le_bytes()); // num_tiles
         buf.extend_from_slice(&(tile.vertices.len() as u32).to_le_bytes());
         for v in &tile.vertices {
@@ -268,6 +269,7 @@ mod tests {
         }
         buf.extend_from_slice(&tile.centroid.x.to_le_bytes());
         buf.extend_from_slice(&tile.centroid.y.to_le_bytes());
+        buf.extend_from_slice(&0.0f32.to_le_bytes()); // clearance_nm
         buf.extend_from_slice(&0u32.to_le_bytes()); // num_neighbors
         TileMesh::from_bytes(&buf).expect("synthetic single-tile mesh parses")
     }
@@ -278,6 +280,7 @@ mod tests {
     /// 0 to 1.
     fn two_tile_mesh(c0: Position, c1: Position) -> TileMesh {
         let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(&crate::tile_mesh::NAVMESH_MAGIC.to_le_bytes());
         buf.extend_from_slice(&2u32.to_le_bytes()); // num_tiles
         for (i, c) in [(0u32, c0), (1u32, c1)] {
             // 3-vertex synthetic tile (a triangle); vertex coords are
@@ -290,6 +293,7 @@ mod tests {
             }
             buf.extend_from_slice(&c.x.to_le_bytes());
             buf.extend_from_slice(&c.y.to_le_bytes());
+            buf.extend_from_slice(&0.0f32.to_le_bytes()); // clearance_nm
             // One neighbour: the other tile, with portal at the midpoint
             // (any finite Position works for this test).
             buf.extend_from_slice(&1u32.to_le_bytes());

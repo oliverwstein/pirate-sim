@@ -3104,3 +3104,71 @@ clean; `bench_pathfind` 1332/1332 (0.02 ms avg, 0.34 ms max — small
 overhead vs prior). `bench_trade` 60-day run completes; no new
 calibration regressions.
 
+
+---
+
+## 2025-05-26 — Navmesh substrate: hex lattice + coastal CDT (preprocessor v2)
+
+**Problem.** Open-ocean routes through the old square-Steiner-grid
+navmesh (50 NM spacing, all-CDT tiling) produced visibly jagged
+heading commands. Ship paths from e.g. Cartagena to the English
+Channel zigzagged even far offshore because adjacent centroids did
+not line up on a regular lattice — every 1-2 minutes of sail the
+funnel handed steering a slightly different bearing. Two earlier
+attempts (route-build deep-water collapse, runtime 3-waypoint
+heading averaging) were rejected by the user on the grounds that the
+problem is the *substrate*, not the smoothing layer on top of it.
+
+**Decision.** Regenerate the navmesh with two distinct zones:
+1. **Deep water:** a flat-top **hex lattice at 12 NM pitch** (centre-
+   to-centre). Each hex is kept iff it is fully contained in the sea
+   polygon eroded by **1 NM**, guaranteeing a uniform offshore safety
+   margin. Centroids are exactly on the hex lattice, so a straight
+   open-ocean route hits a sequence of nearly-collinear centroids and
+   the funnel output stays straight.
+2. **Coastal annulus:** the existing CDT + Hertel–Mehlhorn pipeline,
+   run on `sea − ∪ hexes` with hex boundaries injected as constraint
+   segments and hex interiors as PSLG holes. Vertex indices are
+   shared with the hex set so adjacency stitches across the boundary
+   with no extra work.
+
+**Binary format bumped to v2.** Header is now `u32 NAVMESH_MAGIC`
+("NMV2", `0x32564D4E`) + `u32 num_tiles`, and every tile carries an
+`f32 clearance_nm` (distance from centroid to nearest land, capped at
+**30 NM**) directly in the file. The Rust loader rejects any file
+without the magic. `World::load` no longer recomputes clearance when
+the mesh already has it baked in.
+
+**Constants reshuffled.** `tile_mesh.rs`:
+- `NAVMESH_MAGIC = 0x32564D4E`
+- `DEEP_WATER_NM = 12.0` (one tile of clearance ≈ open water)
+- `CLEARANCE_MAX_NM` bumped 2.0 → 30.0 to match the preprocessor cap.
+  The clearance-penalty ramp only uses the 0-1 NM range, so the cap
+  is purely an upper bound on what the file is allowed to ship.
+
+**Pipeline outputs (current Caribbean+Atlantic dataset).**
+- Hex lattice candidates: 199,447; kept: 124,866.
+- Coastal CDT: 95,539 merged convex tiles.
+- Largest connected component: **200,826 tiles** total.
+- `navmesh.bin`: 22.9 MB (was ~7 MB; ~3× larger due to denser deep-
+  water tiling, but well inside acceptable for an offline preprocess
+  output, especially since `clearance_nm` is in-file now).
+
+**Validation.** `cargo fmt`, `clippy -D warnings`, `cargo test
+--workspace` (237 tests) all green. `bench_pathfind` 1332/1332 ok,
+26.5 ms total (avg 0.02 ms, max 0.39 ms). `bench_trade` 60-day run
+completes; no bankruptcies. Visualizer-inspected by user — approved.
+
+**Defaults landed on.**
+- `--hex-pitch-nm = 12.0`
+- `--hex-buffer-nm = 1.0`
+- `--coastal-segment-nm = 8.0` (max densified segment along sea
+  boundary rings in the CDT)
+- `--max-tile-diameter-nm = 24.0` (so coastal H–M merges produce
+  tiles roughly hex-sized)
+
+**Deferred.** The old `cdt_sea` and `--steiner-spacing-nm` path is
+no longer used but is still in the preprocessor source for now;
+delete it in a follow-up. The runtime "deep-water heading averaging"
+(`deep_water_target` in `nav.rs`) was tried and rejected in favour
+of the substrate fix; no surviving runtime smoothing layer.

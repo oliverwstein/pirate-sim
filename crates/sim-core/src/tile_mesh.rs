@@ -23,15 +23,19 @@
 //!   line-of-sight visible from `pos`" (Phase C will wire that to
 //!   `coastline_geom`).
 //!
-//! Binary format (matches `preprocess_navmesh.py::write_navmesh`,
+//! Binary format v2 (matches `preprocess_navmesh.py::write_navmesh`,
 //! little-endian):
 //!
 //! ```text
+//! u32  magic = 0x32564D4E ("NMV2")
 //! u32  num_tiles
 //! per tile:
 //!     u32  num_vertices
 //!     (f32 x, f32 y) × num_vertices     // CCW, NM-from-origin
 //!     f32  centroid_x, f32 centroid_y
+//!     f32  clearance_nm                 // distance to nearest land,
+//!                                          capped at the preprocessor's
+//!                                          CLEARANCE_REPORT_CAP_NM (30 NM).
 //!     u32  num_neighbors
 //!     (u32 tile_index, f32 portal_x, f32 portal_y) × num_neighbors
 //! ```
@@ -99,7 +103,14 @@ pub struct TileMesh {
 /// preferred buffer (see `clearance_penalty`); the cap is set a bit
 /// higher so the penalty curve has headroom and the bucket scan is
 /// bounded.
-pub const CLEARANCE_MAX_NM: f32 = 2.0;
+/// Hard upper bound on the per-tile clearance value carried in
+/// `clearance_nm`. The preprocessor caps at 30 NM (well past
+/// [`DEEP_WATER_NM`]); the Rust side uses the value for two purposes:
+/// (a) the [`clearance_penalty`] ramp (only the 0..1 NM range
+/// matters there) and (b) the steering layer's "am I in deep water?"
+/// gate (compares against `DEEP_WATER_NM`). Anything above the cap
+/// is informationally equivalent for both.
+pub const CLEARANCE_MAX_NM: f32 = 30.0;
 
 /// Soft preferred clearance (NM). Tiles with centroid clearance ≥ this
 /// value incur no routing penalty. Tiles closer to land are penalised
@@ -113,6 +124,19 @@ pub const PREFERRED_CLEARANCE_NM: f32 = 1.0;
 /// it stays in open water — but if the only route hugs the coast, the
 /// planner still takes it (cost stays finite).
 pub const CLEARANCE_PENALTY_K: f32 = 9.0;
+
+/// Open-water threshold (NM). Tiles whose centroid clearance reaches
+/// this value are considered "in deep water". The Python preprocessor
+/// places regular hex tiles wherever the sea (eroded by a small
+/// buffer) fully contains a hex of pitch ≥ this value, so deep-water
+/// tiles naturally satisfy `clearance ≥ DEEP_WATER_NM`.
+pub const DEEP_WATER_NM: f32 = 12.0;
+
+/// Magic header for navmesh.bin format v2 (little-endian "NMV2").
+/// The Python preprocessor writes this as the first 4 bytes of the
+/// file; the Rust loader rejects any file that doesn't start with it
+/// so we fail loudly instead of misreading an older format.
+pub const NAVMESH_MAGIC: u32 = 0x32564D4E;
 
 /// Edge-cost penalty multiplier for two tiles with the given pairwise
 /// clearance (the *minimum* of the two endpoint clearances). Returns
@@ -145,15 +169,24 @@ impl TileMesh {
     }
 
     /// Parse a navmesh from a byte buffer (`navmesh.bin` contents).
+    /// Expects the v2 format documented at the top of this module.
     pub fn from_bytes(buf: &[u8]) -> io::Result<Self> {
         let mut cur = 0usize;
+        let magic = read_u32(buf, &mut cur)?;
+        if magic != NAVMESH_MAGIC {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "navmesh magic mismatch: got 0x{magic:08X}, expected 0x{NAVMESH_MAGIC:08X} \
+                     (regenerate with tools/preprocess/preprocess_navmesh.py)"
+                ),
+            ));
+        }
         let num_tiles = read_u32(buf, &mut cur)? as usize;
 
         let mut tiles: Vec<Tile> = Vec::with_capacity(num_tiles);
         let mut neighbors: Vec<Vec<TileEdge>> = Vec::with_capacity(num_tiles);
-        // First pass: read vertices + centroid + raw neighbor records.
-        // Centroid-to-centroid distance for each edge is filled in a
-        // second pass once every tile's centroid is known.
+        let mut clearance_nm: Vec<f32> = Vec::with_capacity(num_tiles);
         let mut raw_neighbors: Vec<Vec<(u32, Position)>> = Vec::with_capacity(num_tiles);
 
         for tile_idx in 0..num_tiles {
@@ -174,6 +207,7 @@ impl TileMesh {
             let cx = read_f32(buf, &mut cur)?;
             let cy = read_f32(buf, &mut cur)?;
             let centroid = Position::new(cx, cy);
+            let clr = read_f32(buf, &mut cur)?;
 
             let n_nbrs = read_u32(buf, &mut cur)? as usize;
             let mut nbrs = Vec::with_capacity(n_nbrs);
@@ -199,6 +233,7 @@ impl TileMesh {
                 bbox_min,
                 bbox_max,
             });
+            clearance_nm.push(clr);
             raw_neighbors.push(nbrs);
         }
 
@@ -235,7 +270,7 @@ impl TileMesh {
             tiles,
             neighbors,
             centroid_buckets,
-            clearance_nm: Vec::new(),
+            clearance_nm,
         })
     }
 

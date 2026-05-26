@@ -185,11 +185,14 @@ impl World {
         let land_mesh = LandMesh::load(&data_dir.join("grids/land_polys.bin")).unwrap_or_default();
         let coastline_geom =
             crate::coastline_geom::CoastlineGeom::build(&map.land, &coastline, &land_mesh);
-        // Per-tile land clearance for the routing cost. Capped at
-        // CLEARANCE_MAX_NM so the per-centroid bucket scan stays small
-        // (~few buckets). Drives the soft "stay >= 1 NM offshore"
-        // preference in TileMesh::route and PortRouteCache.
-        {
+        // Per-tile land clearance for the routing cost. The v2
+        // navmesh.bin format carries `clearance_nm` per tile already
+        // (computed by the Python preprocessor against the same land
+        // polygons), so we only recompute it here as a fallback when
+        // the loader didn't populate it — e.g. when an older binary
+        // somehow slipped through. Drives the soft "stay >= 1 NM
+        // offshore" preference in TileMesh::route and PortRouteCache.
+        if !tile_mesh.has_clearance() {
             let clearance: Vec<f32> = tile_mesh
                 .tiles
                 .iter()

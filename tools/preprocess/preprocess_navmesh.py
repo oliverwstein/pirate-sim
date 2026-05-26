@@ -6,7 +6,9 @@ Produces a tiling of the sea (world bounds minus buffered land) where:
   * adjacent tiles are connected via a "portal" — the exact midpoint of
     their shared edge — so the Rust pathfinder routes
     Centroid_A → Portal_AB → Centroid_B, guaranteeing no land crossing
-    even on merged "L-shaped" tiles.
+    even on merged "L-shaped" tiles;
+  * each tile carries a precomputed `clearance_nm`: distance from its
+    centroid to the nearest coastline, capped at `CLEARANCE_REPORT_CAP_NM`.
 
 Pipeline:
     1. Load Natural Earth land polygons.
@@ -16,16 +18,28 @@ Pipeline:
     5. Project back to WGS-84 lon/lat.
     6. Sea polygon = world box − buffered land.
     7. Project sea to NM-from-origin coordinates.
-    8. Constrained Delaunay triangulation (with Steiner anchors).
-    9. Hertel–Mehlhorn convex merge.
-    10. Emit tiles + centroids + adjacency + portals.
+    8. Lay down a flat-top hex lattice (pitch `--hex-pitch-nm`); keep
+       every hex fully contained in the sea polygon eroded inward by
+       `--hex-buffer-nm`. These become regular open-ocean tiles with
+       centroids on the lattice.
+    9. CDT the coastal annulus (sea − ∪ kept hexes), treating hex
+       boundaries as constraint segments and hex interiors as PSLG
+       holes. Hex vertex indices are reused so coastal tiles share
+       vertices (and therefore edges) with the hexes.
+   10. Hertel–Mehlhorn convex merge of the coastal triangles only.
+   11. Combined tile set = hex tiles + merged coastal tiles.
+   12. Compute centroid + clearance + adjacency (with portals).
+   13. Emit v2 binary.
 
-Binary format (little-endian):
+Binary format v2 (little-endian):
+    u32 magic = 0x32564D4E  ("NMV2")
     u32 num_tiles
     for each tile:
         u32 num_vertices
         for each vertex: f32 x, f32 y    -- CCW, NM-from-origin
         f32 centroid_x, f32 centroid_y
+        f32 clearance_nm                 -- distance to nearest land,
+                                            capped at CLEARANCE_REPORT_CAP_NM
         u32 num_neighbors
         for each neighbor:
             u32 tile_index
@@ -487,6 +501,232 @@ def hertel_mehlhorn(
 
 
 # ---------------------------------------------------------------------------
+# Hex-lattice deep-water tiling
+# ---------------------------------------------------------------------------
+
+# Format-v2 magic + clearance cap, exposed for the Rust loader docs.
+NAVMESH_MAGIC = 0x32564D4E  # "NMV2" little-endian
+CLEARANCE_REPORT_CAP_NM = 30.0
+
+
+def hex_polygons(
+    bounds: tuple[float, float, float, float],
+    pitch_nm: float,
+) -> Iterable[tuple[tuple[float, float], list[tuple[float, float]]]]:
+    """Yield (center, CCW vertex list) for a flat-top hex lattice with
+    center-to-center spacing `pitch_nm`, covering the bbox with one
+    hex of slop on every side.
+
+    Flat-top: two edges horizontal. Side length s = pitch / √3 (so all
+    six neighbours sit at distance `pitch_nm`).
+    """
+    x_min, y_min, x_max, y_max = bounds
+    s = pitch_nm / math.sqrt(3.0)
+    col_spacing = 1.5 * s  # horizontal distance between adjacent columns
+    row_spacing = math.sqrt(3.0) * s  # = pitch
+    half_row = row_spacing / 2.0
+    col_start = math.floor((x_min - s) / col_spacing) - 1
+    col_end = math.ceil((x_max + s) / col_spacing) + 1
+    row_start = math.floor((y_min - row_spacing) / row_spacing) - 1
+    row_end = math.ceil((y_max + row_spacing) / row_spacing) + 1
+    # Flat-top vertex angles (degrees): 0, 60, 120, 180, 240, 300.
+    angles = [math.radians(a) for a in (0, 60, 120, 180, 240, 300)]
+    for col in range(col_start, col_end + 1):
+        cx = col * col_spacing
+        y_offset = half_row if col % 2 else 0.0
+        for row in range(row_start, row_end + 1):
+            cy = row * row_spacing + y_offset
+            if not (x_min - 2 * s <= cx <= x_max + 2 * s):
+                continue
+            if not (y_min - 2 * s <= cy <= y_max + 2 * s):
+                continue
+            verts = [(cx + s * math.cos(a), cy + s * math.sin(a)) for a in angles]
+            yield (cx, cy), verts
+
+
+def _densify(coords: list[tuple[float, float]], max_seg: float) -> list[tuple[float, float]]:
+    """Insert extra vertices along a polygon ring so no segment exceeds
+    `max_seg`. Used to keep CDT triangles bounded on long coastline
+    runs.
+    """
+    if max_seg <= 0.0:
+        return coords
+    n = len(coords)
+    out: list[tuple[float, float]] = []
+    for i in range(n):
+        a = coords[i]
+        b = coords[(i + 1) % n]
+        out.append(a)
+        dx = b[0] - a[0]
+        dy = b[1] - a[1]
+        seg_len = math.hypot(dx, dy)
+        if seg_len > max_seg:
+            steps = int(seg_len // max_seg)
+            for k in range(1, steps + 1):
+                t = k / (steps + 1)
+                out.append((a[0] + dx * t, a[1] + dy * t))
+    return out
+
+
+def build_tiles_hex_plus_coastal(
+    sea: Polygon | MultiPolygon,
+    hex_pitch_nm: float,
+    hex_buffer_nm: float,
+    coastal_segment_nm: float,
+    max_tile_diameter_nm: float,
+    no_merge: bool,
+) -> tuple[np.ndarray, list[list[int]], list[tuple[float, float]]]:
+    """Build the unified deep-water + coastal tile set.
+
+    Deep-water tiles are flat-top hexagons (pitch `hex_pitch_nm`) fully
+    contained in the sea polygon eroded inward by `hex_buffer_nm` —
+    this guarantees a safety margin between every hex edge and the
+    coast. The coastal annulus (sea minus the kept hexes) is filled
+    by a single Triangle CDT run that treats the hex boundary as a
+    constraint, then merged via Hertel–Mehlhorn. Vertex indices are
+    shared between hex tiles and CDT output so adjacency stitches
+    cleanly across the boundary.
+
+    Returns `(verts, tiles, centers_for_hexes)` — the third item is
+    the list of hex-centroid coordinates, useful for diagnostics and
+    used directly as the PSLG hole list (one interior point per hex
+    tells the CDT not to triangulate the hex interior).
+    """
+    DEDUP_SCALE = 10000.0
+    vert_index: dict[tuple[int, int], int] = {}
+    verts: list[tuple[float, float]] = []
+
+    def add_vertex(p: tuple[float, float]) -> int:
+        key = (round(p[0] * DEDUP_SCALE), round(p[1] * DEDUP_SCALE))
+        if key in vert_index:
+            return vert_index[key]
+        vert_index[key] = len(verts)
+        verts.append((float(p[0]), float(p[1])))
+        return vert_index[key]
+
+    # 1. Hex lattice + containment filter.
+    print(f"  Generating hex lattice (pitch {hex_pitch_nm} NM, buffer {hex_buffer_nm} NM)...")
+    sea_inner = sea.buffer(-hex_buffer_nm) if hex_buffer_nm > 0.0 else sea
+    bounds = sea.bounds
+    hex_tiles: list[list[int]] = []
+    hex_centers: list[tuple[float, float]] = []
+    candidates = 0
+    for center, hex_verts in hex_polygons(bounds, hex_pitch_nm):
+        candidates += 1
+        hex_poly = Polygon(hex_verts)
+        if not sea_inner.contains(hex_poly):
+            continue
+        idxs = [add_vertex(p) for p in hex_verts]
+        hex_tiles.append(idxs)
+        hex_centers.append(center)
+    print(f"  Hex lattice: kept {len(hex_tiles)} of {candidates} candidates")
+
+    # 2. Build PSLG for the coastal CDT.
+    #    - Vertices: hex corners (already added) + sea outer/inner
+    #      ring vertices, densified to `coastal_segment_nm`.
+    #    - Segments: sea outer/inner ring edges + every hex boundary
+    #      edge (so the CDT respects the hex/coastal interface).
+    #    - Holes: one point inside each kept hex (skip its interior)
+    #      plus one point inside each land hole (skip the land).
+    segs: list[tuple[int, int]] = []
+    holes: list[tuple[float, float]] = list(hex_centers)
+
+    pieces: list[Polygon] = [sea] if isinstance(sea, Polygon) else list(sea.geoms)
+
+    def add_ring_as_constraints(coords: list[tuple[float, float]]) -> None:
+        if len(coords) > 1 and coords[0] == coords[-1]:
+            coords = coords[:-1]
+        if len(coords) < 3:
+            return
+        coords = _densify(coords, max(coastal_segment_nm, 1.0))
+        idxs = [add_vertex(p) for p in coords]
+        n = len(idxs)
+        for i in range(n):
+            a, b = idxs[i], idxs[(i + 1) % n]
+            if a != b:
+                segs.append((a, b))
+
+    for piece in pieces:
+        add_ring_as_constraints(list(piece.exterior.coords))
+        for ring in piece.interiors:
+            add_ring_as_constraints(list(ring.coords))
+            hole_poly = Polygon(list(ring.coords))
+            rp = hole_poly.representative_point()
+            holes.append((float(rp.x), float(rp.y)))
+
+    # Hex boundary edges as constraints (using indices we already
+    # assigned above when adding hex vertices).
+    for tile_idxs in hex_tiles:
+        n = len(tile_idxs)
+        for i in range(n):
+            a, b = tile_idxs[i], tile_idxs[(i + 1) % n]
+            segs.append((a, b))
+
+    print(
+        f"  CDT input (coastal annulus): {len(verts)} verts, "
+        f"{len(segs)} segments, {len(holes)} holes"
+    )
+
+    pslg: dict = {
+        "vertices": np.asarray(verts, dtype=np.float64),
+        "segments": np.asarray(segs, dtype=np.int32),
+    }
+    if holes:
+        pslg["holes"] = np.asarray(holes, dtype=np.float64)
+
+    # `p` = triangulate a PSLG without Steiner refinement, preserving
+    # the input vertex order. We rely on that ordering so hex tiles
+    # (built before the CDT call) share indices with the CDT output.
+    out = tr.triangulate(pslg, "p")
+    out_verts = np.asarray(out["vertices"], dtype=np.float64)
+    out_tris = np.asarray(out["triangles"], dtype=np.int32)
+    if len(out_verts) != len(verts):
+        raise RuntimeError(
+            f"CDT added {len(out_verts) - len(verts)} Steiner points; "
+            "vertex indices no longer match hex tiles. Investigate."
+        )
+    print(f"  CDT output: {len(out_verts)} verts, {len(out_tris)} coastal triangles")
+    out_tris = ensure_ccw(out_verts, out_tris)
+
+    # 3. Hertel–Mehlhorn the coastal triangles only. Hex tiles stay
+    #    untouched (and are already convex).
+    if no_merge or len(out_tris) == 0:
+        coastal_tiles = [list(t) for t in out_tris]
+    else:
+        print(
+            f"  Hertel–Mehlhorn on coastal triangles "
+            f"(max tile diameter {max_tile_diameter_nm} NM)..."
+        )
+        coastal_tiles = hertel_mehlhorn(out_verts, out_tris, max_tile_diameter_nm)
+
+    all_tiles: list[list[int]] = hex_tiles + coastal_tiles
+    print(f"  Combined: {len(hex_tiles)} hex + {len(coastal_tiles)} coastal = {len(all_tiles)} tiles")
+
+    return out_verts, all_tiles, hex_centers
+
+
+def compute_clearances(
+    land: Polygon | MultiPolygon,
+    centroids: list[tuple[float, float]],
+    cap_nm: float,
+) -> list[float]:
+    """Distance from each centroid to the nearest land geometry, in NM,
+    capped at `cap_nm`. The world bbox edges are explicitly *not* land
+    — passing only the projected land polygon ensures centroids near
+    the edge of the world (deep open ocean) get the cap, not a false
+    "close to land" reading. Capping bounds runtime and keeps the
+    value in f32 precision range.
+    """
+    out: list[float] = []
+    if land.is_empty:
+        return [float(cap_nm)] * len(centroids)
+    for cx, cy in centroids:
+        d = Point(cx, cy).distance(land)
+        out.append(float(min(d, cap_nm)))
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Centroid + adjacency (with portals)
 # ---------------------------------------------------------------------------
 
@@ -607,27 +847,22 @@ def write_navmesh(
     verts: np.ndarray,
     tiles: list[list[int]],
     centroids: list[tuple[float, float]],
+    clearances: list[float],
     neighbors: list[list[Neighbor]],
 ) -> None:
-    """Write navmesh.bin in the portal-aware format.
-
-    Format (little-endian):
-        u32  num_tiles
-        per tile:
-            u32  num_vertices
-            (f32 x, f32 y) × num_vertices     -- CCW, NM-from-origin
-            f32  centroid_x, f32 centroid_y
-            u32  num_neighbors
-            (u32 tile_index, f32 portal_x, f32 portal_y) × num_neighbors
+    """Write navmesh.bin in the portal-aware v2 format (see module
+    docstring for the byte layout).
     """
     with open(out_path, "wb") as f:
-        f.write(struct.pack("<I", len(tiles)))
-        for tile, (cx, cy), nbrs in zip(tiles, centroids, neighbors, strict=True):
+        f.write(struct.pack("<II", NAVMESH_MAGIC, len(tiles)))
+        for tile, (cx, cy), clr, nbrs in zip(
+            tiles, centroids, clearances, neighbors, strict=True
+        ):
             f.write(struct.pack("<I", len(tile)))
             for vi in tile:
                 x, y = verts[vi]
                 f.write(struct.pack("<ff", float(x), float(y)))
-            f.write(struct.pack("<ff", float(cx), float(cy)))
+            f.write(struct.pack("<fff", float(cx), float(cy), float(clr)))
             f.write(struct.pack("<I", len(nbrs)))
             for nb_idx, px, py in nbrs:
                 f.write(struct.pack("<Iff", nb_idx, float(px), float(py)))
@@ -694,19 +929,36 @@ def main() -> int:
     ap.add_argument(
         "--no-merge",
         action="store_true",
-        help="Skip Hertel-Mehlhorn (debug; output is raw CDT triangles)",
+        help="Skip Hertel-Mehlhorn on coastal triangles (debug; hex tiles unaffected)",
     )
     ap.add_argument(
-        "--steiner-spacing-nm",
+        "--hex-pitch-nm",
         type=float,
-        default=50.0,
-        help="Steiner anchor grid spacing (NM). Bounds open-ocean tile size. Default 50.",
+        default=12.0,
+        help="Center-to-center spacing of the deep-water hex lattice (NM). "
+        "All six neighbour hex centres sit at exactly this distance. Default 12.",
+    )
+    ap.add_argument(
+        "--hex-buffer-nm",
+        type=float,
+        default=1.0,
+        help="Erode the sea polygon inward by this distance before testing "
+        "hex containment. Acts as a safety margin between every hex edge "
+        "and the coast. Default 1.0.",
+    )
+    ap.add_argument(
+        "--coastal-segment-nm",
+        type=float,
+        default=8.0,
+        help="Maximum CDT segment length along sea boundary rings. Caps the "
+        "size of coastal triangles. Default 8.",
     )
     ap.add_argument(
         "--max-tile-diameter-nm",
         type=float,
-        default=50.0,
-        help="Reject merges that would yield a tile diameter > this (NM). Default 50.",
+        default=24.0,
+        help="Reject coastal merges that would yield a tile diameter > this (NM). "
+        "Default 24 — keeps coastal tiles roughly hex-sized.",
     )
     ap.add_argument(
         "--keep-all-components",
@@ -738,18 +990,16 @@ def main() -> int:
         simplify_nm=args.simplify_nm,
         shore_margin_nm=args.shore_margin_nm,
     )
-    print("Triangulating sea (CDT)...")
-    verts, tris = cdt_sea(sea, args.steiner_spacing_nm)
 
-    if args.no_merge:
-        print("(--no-merge) skipping convex partition; emitting raw CDT")
-        tiles = [list(t) for t in tris]
-    else:
-        print(
-            f"Running Hertel–Mehlhorn convex partition "
-            f"(max tile diameter {args.max_tile_diameter_nm} NM)..."
-        )
-        tiles = hertel_mehlhorn(verts, tris, args.max_tile_diameter_nm)
+    print("Building hex + coastal tile set...")
+    verts, tiles, _hex_centers = build_tiles_hex_plus_coastal(
+        sea,
+        hex_pitch_nm=args.hex_pitch_nm,
+        hex_buffer_nm=args.hex_buffer_nm,
+        coastal_segment_nm=args.coastal_segment_nm,
+        max_tile_diameter_nm=args.max_tile_diameter_nm,
+        no_merge=args.no_merge,
+    )
 
     print("Computing centroids + adjacency (with portals)...")
     centroids = [compute_centroid(verts, t) for t in tiles]
@@ -769,10 +1019,26 @@ def main() -> int:
     else:
         print("(--keep-all-components) skipping largest-component filter")
 
+    # Compute per-centroid clearance against the land polygon
+    # (land = world_box − sea, in NM coords). Capping bounds runtime
+    # and keeps the value in f32 precision range.
+    x_min, y_min = latlon_to_nm(LAT_MIN, LON_MIN)
+    x_max, y_max = latlon_to_nm(LAT_MAX, LON_MAX)
+    world_box_nm = box(x_min, y_min, x_max, y_max)
+    print(f"Computing per-centroid clearance (cap {CLEARANCE_REPORT_CAP_NM} NM)...")
+    land_nm = world_box_nm.difference(sea)
+    clearances = compute_clearances(land_nm, centroids, CLEARANCE_REPORT_CAP_NM)
+    clr_arr = np.asarray(clearances, dtype=np.float32)
+    print(
+        f"  clearance NM: min={clr_arr.min():.2f} avg={clr_arr.mean():.2f} "
+        f"max={clr_arr.max():.2f} "
+        f"(≥{CLEARANCE_REPORT_CAP_NM:.0f}: {int((clr_arr >= CLEARANCE_REPORT_CAP_NM).sum())} tiles)"
+    )
+
     print(f"Writing {out_path}...")
-    write_navmesh(out_path, verts, tiles, centroids, neighbors)
+    write_navmesh(out_path, verts, tiles, centroids, clearances, neighbors)
     size = out_path.stat().st_size
-    print(f"  wrote {size:,} bytes")
+    print(f"  wrote {size:,} bytes (format v2, magic 0x{NAVMESH_MAGIC:08X})")
     return 0
 
 
