@@ -17,6 +17,8 @@ const SHIP_SIGHT_RANGE_NM: f32 = SPATIAL_CELL_NM;
 const SIGHT_LINE_COLOR: Color = Color::new(0.85, 0.85, 0.9, 0.18);
 const WIND_COLOR: Color = Color::new(0.5, 0.7, 1.0, 0.6);
 const PATH_COLOR: Color = Color::new(1.0, 0.9, 0.2, 0.15);
+/// Stroke for the all-routes overlay (toggle with `P`).
+const ROUTE_COLOR: Color = Color::new(1.0, 0.55, 0.1, 0.35);
 /// Stroke for navmesh node dots. White with low alpha so dense coverage
 /// blends visually instead of washing the map out.
 const NAVMESH_NODE_COLOR: Color = Color::new(1.0, 1.0, 1.0, 0.55);
@@ -259,6 +261,62 @@ fn draw_tile_centroids(world: &World, camera: &Camera) {
             continue;
         }
         draw_circle(p.x, p.y, radius, NAVMESH_NODE_COLOR);
+    }
+}
+
+/// Overlay every cached port-to-port route in the world. For each
+/// ordered pair (port_a, port_b) where both have anchor tiles, walks
+/// `PortRouteCache::route_from` (which already applies the deep-water
+/// simplification) and renders the resulting tile-centroid polyline.
+/// Drawn before ports/ships so it sits under them. Each segment is
+/// stroked at a fixed thin width regardless of zoom — fine at any
+/// scale and keeps the cost bounded.
+fn draw_all_routes(world: &World, camera: &Camera) {
+    let n = world.harbors.harbors.len();
+    let sw = screen_width();
+    let sh = screen_height();
+    for i in 0..n {
+        let ha = &world.harbors.harbors[i];
+        let Some(anchor_tile) = ha.anchor_tile else {
+            continue;
+        };
+        let starts = [anchor_tile];
+        for j in 0..n {
+            if i == j {
+                continue;
+            }
+            let hb = &world.harbors.harbors[j];
+            let Some(route) = world.port_routes.route_from(&starts, hb.port_index) else {
+                continue;
+            };
+            if route.len() < 2 {
+                continue;
+            }
+            // Convert tile ids to centroids; tack on the destination
+            // anchor so the final segment terminates at the port's
+            // actual anchor (matches what `stitch_tile_route` does for
+            // the live planner).
+            let mut prev = world.tile_mesh.tiles[route[0] as usize].centroid;
+            for &t in &route[1..] {
+                let next = world.tile_mesh.tiles[t as usize].centroid;
+                let a = camera.world_to_screen(prev);
+                let b = camera.world_to_screen(next);
+                // Cheap on-screen reject — both endpoints far off the
+                // viewport ⇒ skip the stroke.
+                let off = (a.x < 0.0 && b.x < 0.0)
+                    || (a.x > sw && b.x > sw)
+                    || (a.y < 0.0 && b.y < 0.0)
+                    || (a.y > sh && b.y > sh);
+                if !off {
+                    draw_line(a.x, a.y, b.x, b.y, 1.0, ROUTE_COLOR);
+                }
+                prev = next;
+            }
+            // Tail to the harbor anchor itself.
+            let a = camera.world_to_screen(prev);
+            let b = camera.world_to_screen(hb.anchor);
+            draw_line(a.x, a.y, b.x, b.y, 1.0, ROUTE_COLOR);
+        }
     }
 }
 
@@ -642,6 +700,7 @@ async fn main() {
     let mut ticks_per_frame: u32 = 1;
     let mut selected_port: Option<usize> = None;
     let mut selected_ship: Option<ShipId> = None;
+    let mut show_routes = false;
 
     loop {
         // Input
@@ -655,6 +714,9 @@ async fn main() {
         }
         if is_key_pressed(KeyCode::Minus) {
             ticks_per_frame = (ticks_per_frame / 2).max(1);
+        }
+        if is_key_pressed(KeyCode::P) {
+            show_routes = !show_routes;
         }
         if is_key_pressed(KeyCode::R) {
             world = World::load(Path::new("data/"));
@@ -704,6 +766,9 @@ async fn main() {
         draw_coastline(&world, &camera);
         draw_wind_arrows(&world, &camera);
         draw_tile_centroids(&world, &camera);
+        if show_routes {
+            draw_all_routes(&world, &camera);
+        }
         draw_ports(&world, &camera);
         draw_ships(&world, &camera, selected_ship);
         draw_hud(&world, &camera, paused, ticks_per_frame);
