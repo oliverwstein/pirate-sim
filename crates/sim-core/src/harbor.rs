@@ -44,6 +44,7 @@
 //! the legacy `HarborMap`-side BFS that no longer exists. Phase F
 //! tests confirm no current production code reaches for it.
 
+use crate::coastline_geom::CoastlineGeom;
 use crate::map::land::LandMap;
 use crate::port::Port;
 use crate::tile_mesh::TileMesh;
@@ -86,11 +87,11 @@ impl Harbor {
     /// Is `pos` inside this harbor zone?
     ///
     /// True iff `dist(pos, port_pos) <= harbor_radius_nm` AND the
-    /// straight line from `pos` to `anchor` is clear of land. The
-    /// second clause stops a ship sitting on the wrong side of a
-    /// peninsula from being declared "docked" purely because it is
-    /// within the radius.
-    pub fn contains_pos(&self, land: &LandMap, pos: Position) -> bool {
+    /// straight line from `pos` to `anchor` is clear of land
+    /// (polygon truth). The second clause stops a ship sitting on the
+    /// wrong side of a peninsula from being declared "docked" purely
+    /// because it is within the radius.
+    pub fn contains_pos(&self, land: &LandMap, geom: &CoastlineGeom, pos: Position) -> bool {
         let (mn, mx) = self.bbox;
         if pos.x < mn.x || pos.x > mx.x || pos.y < mn.y || pos.y > mx.y {
             return false;
@@ -100,7 +101,7 @@ impl Harbor {
         if dx * dx + dy * dy > self.harbor_radius_nm * self.harbor_radius_nm {
             return false;
         }
-        land.line_is_clear(pos, self.anchor)
+        geom.line_is_clear(land, pos, self.anchor)
     }
 }
 
@@ -310,9 +311,10 @@ mod tests {
         let h = &map.harbors[0];
         assert_eq!(h.anchor, Position::new(27.0, 27.0));
         assert_eq!(h.anchor_tile, Some(0));
-        assert!(h.contains_pos(&land, port.position));
+        let geom = CoastlineGeom::empty(&land);
+        assert!(h.contains_pos(&land, &geom, port.position));
         // 30 NM east of the port is well outside the 10 NM radius.
-        assert!(!h.contains_pos(&land, Position::new(55.0, 25.0)));
+        assert!(!h.contains_pos(&land, &geom, Position::new(55.0, 25.0)));
     }
 
     #[test]
@@ -334,9 +336,10 @@ mod tests {
         let harbor = &map.harbors[0];
 
         // West side, within radius, LOS-clear: in harbor.
-        assert!(harbor.contains_pos(&land, Position::new(15.0, 25.0)));
+        let geom = CoastlineGeom::empty(&land);
+        assert!(harbor.contains_pos(&land, &geom, Position::new(15.0, 25.0)));
         // East side, within radius, but the wall blocks LOS: not in harbor.
-        assert!(!harbor.contains_pos(&land, Position::new(35.0, 25.0)));
+        assert!(!harbor.contains_pos(&land, &geom, Position::new(35.0, 25.0)));
     }
 
     #[test]

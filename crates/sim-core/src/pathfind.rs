@@ -136,7 +136,7 @@ pub fn find_path_to_harbor(
     let geom = ctx.coastline_geom;
 
     // If we're already inside the harbor zone, no movement needed.
-    if harbor.contains_pos(land, start) {
+    if harbor.contains_pos(land, geom, start) {
         return Some(vec![start]);
     }
 

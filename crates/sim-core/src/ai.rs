@@ -724,7 +724,7 @@ impl<'a> ShipBtContext<'a> {
         // there (instant docking → instant profit settlement → new
         // voyage starts while truth still mid-ocean). The pilot/lookout
         // recognizes the harbor on physical entry.
-        harbor.contains_pos(pf.land, self.ship.position)
+        harbor.contains_pos(pf.land, pf.coastline_geom, self.ship.position)
     }
 
     // ───────── BT action implementations ─────────

@@ -2950,3 +2950,30 @@ fallback inside `CoastlineGeom::corridor_is_clear`. The raster is
 still used by `CoastlineGeom`'s bilevel queries (open-water
 fast-path inside `line_is_clear` / `first_land_hit`) and by
 non-movement callers.
+
+---
+
+## 2025 — harbor: polygon-truth LOS in `contains_pos`
+
+**Context.** With the planner on polygon LOS, the only remaining
+raster-LOS call in the movement path was `Harbor::contains_pos`'s
+`land.line_is_clear(pos, anchor)` check that rejects "in radius
+but on the wrong side of a peninsula" memberships.
+
+**Change.** `contains_pos` now takes `&CoastlineGeom` alongside
+`&LandMap` and dispatches to `geom.line_is_clear(land, pos,
+anchor)`. Callers (`ai.rs::Heart::find_path_to_harbor` and
+`pathfind::find_path_to_harbor`) pass `pf.coastline_geom`
+through. Unit tests build a `CoastlineGeom::empty(&land)` which
+correctly falls back to the raster path inside `line_is_clear`
+when `has_polylines == false`.
+
+**Validation.** 237 tests pass, clippy clean. `bench_pathfind`
+unchanged (1406/1406 ok, max 0.32 ms). No behavioral change
+expected — `line_is_clear` returns identical verdicts to the
+raster on this fixture's clear cases, and the polygon path
+correctly catches the peninsula-blocked case.
+
+**Status.** No raster LOS calls remain on the ship-movement
+path. `LandMap` is still loaded for `CoastlineGeom`'s bilevel
+pre-filter and for non-movement callers.
