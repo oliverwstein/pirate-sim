@@ -114,10 +114,6 @@ pub fn find_path_to_harbor(
 ) -> Option<Vec<Position>> {
     let land = ctx.land;
 
-    if harbor.cells.is_empty() {
-        return None;
-    }
-
     // If we're already inside the harbor zone, no movement needed.
     if harbor.contains_pos(land, start) {
         return Some(vec![start]);

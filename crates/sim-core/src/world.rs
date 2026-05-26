@@ -19,6 +19,7 @@ use crate::shiptype::{self, ShipTypeRegistry};
 use crate::shipyard::{self, BuildOutcome};
 use crate::sim_rng::SimRng;
 use crate::spatial::SpatialHash;
+use crate::tile_mesh::TileMesh;
 use crate::types::{ShipId, SimDate};
 use crate::weather::WeatherSystem;
 
@@ -42,6 +43,12 @@ pub struct World {
     pub ports: Vec<Port>,
     pub harbors: HarborMap,
     pub navmesh: Navmesh,
+    /// Phase A: portal-aware convex-tile navmesh loaded offline by
+    /// `tools/preprocess/preprocess_navmesh.py`. Anchored to data at
+    /// `data/grids/navmesh.bin`. Phase B uses it to derive each
+    /// port's anchor tile; Phases C–E migrate path planning and
+    /// motion onto it.
+    pub tile_mesh: TileMesh,
     pub coastline: CoastlineMap,
     pub land_mesh: LandMesh,
     pub goods: GoodsRegistry,
@@ -167,7 +174,9 @@ impl World {
         let weather = WeatherSystem::load(data_dir);
         let ship_types = ShipTypeRegistry::starter();
         let ports = all_ports(&ship_types);
-        let harbors = HarborMap::build(&map.land, &ports);
+        let tile_mesh = TileMesh::load(&data_dir.join("grids/navmesh.bin"))
+            .expect("load data/grids/navmesh.bin (run tools/preprocess/preprocess_navmesh.py)");
+        let harbors = HarborMap::build(&map.land, &tile_mesh, &ports);
         let navmesh = Navmesh::build(&map.land);
         let coastline =
             CoastlineMap::load(&data_dir.join("grids/coastline.bin")).unwrap_or_default();
@@ -240,6 +249,7 @@ impl World {
             ports,
             harbors,
             navmesh,
+            tile_mesh,
             coastline,
             land_mesh,
             goods,

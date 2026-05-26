@@ -43,21 +43,18 @@ fn main() {
         match find_path_to_harbor(&pf, pa, harbor) {
             Some(path) => {
                 println!(
-                    "{} -> {}: {} waypoints, last={:?}, anchor={:?}, zone_cells={}",
+                    "{} -> {}: {} waypoints, last={:?}, anchor={:?}, anchor_tile={:?}",
                     a,
                     b,
                     path.len(),
                     path.last(),
                     harbor.anchor,
-                    harbor.cells.len()
+                    harbor.anchor_tile,
                 );
             }
             None => println!(
-                "{} -> {}: NO PATH FOUND  (anchor={:?}, zone_cells={})",
-                a,
-                b,
-                harbor.anchor,
-                harbor.cells.len()
+                "{} -> {}: NO PATH FOUND  (anchor={:?}, anchor_tile={:?})",
+                a, b, harbor.anchor, harbor.anchor_tile,
             ),
         }
     }
