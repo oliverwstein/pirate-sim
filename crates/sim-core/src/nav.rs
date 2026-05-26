@@ -11,10 +11,21 @@
 
 use arrayvec::ArrayVec;
 
+use crate::coastline_geom::CoastlineGeom;
 use crate::map::land::LandMap;
 use crate::ship::{angle_diff, normalize_angle, speed_at_heading, ShipStats};
 use crate::sim_rng::SimRng;
 use crate::types::{Position, ShipId, WindVector};
+
+/// Bundle of land-truth queries the steering layer uses for reactive
+/// deflection. The polygon-truth [`CoastlineGeom`] is the oracle;
+/// [`LandMap`] is its raster pre-filter (`CoastlineGeom` queries take
+/// it as a parameter — see `coastline_geom.rs` for the bilevel design).
+#[derive(Clone, Copy)]
+pub struct NavTerrain<'a> {
+    pub geom: &'a CoastlineGeom,
+    pub land: &'a LandMap,
+}
 
 /// Maximum number of intermediate waypoints a planned path may hold.
 /// Pathfind benchmark (1406 ordered port pairs) tops out at 37 with the old
@@ -267,9 +278,11 @@ impl NavTrack {
     /// arrival; the lookout shouts "land ho!" when truth reaches port.
     /// The landmark fix is what then collapses estimate onto truth.)
     ///
-    /// `land` is optional; when provided, the heading is reactively deflected
-    /// to clear nearby coastline (a safety net for when wind / drift pushes
-    /// the ship close to land between planner waypoints).
+    /// `terrain` is optional; when provided, the heading is reactively
+    /// deflected to clear nearby coastline (a safety net for when wind
+    /// / drift pushes the ship close to land between planner waypoints).
+    /// Phase E: now consults polygon-truth `CoastlineGeom` instead of
+    /// the raster `LandMap` directly.
     #[allow(clippy::too_many_arguments)]
     pub fn compute_steering(
         &mut self,
@@ -278,7 +291,7 @@ impl NavTrack {
         pos_truth: Position,
         stats: &ShipStats,
         wind: &WindVector,
-        land: Option<&LandMap>,
+        terrain: Option<NavTerrain<'_>>,
     ) -> Option<Steering> {
         // Advance through waypoints we've already reached (per the
         // captain's belief — he checks them off as he passes them).
@@ -340,10 +353,8 @@ impl NavTrack {
         // breakers ahead of the actual hull. Without this, DR error could
         // put the captain's mental ship safely offshore while the real hull
         // grounds on a reef the lookouts could plainly see.
-        let heading = match land {
-            Some(land) => {
-                deflect_for_land(pos_truth, bearing_to_target, land, DEFLECT_LOOKAHEAD_NM)
-            }
+        let heading = match terrain {
+            Some(t) => deflect_for_land(pos_truth, bearing_to_target, t, DEFLECT_LOOKAHEAD_NM),
             None => bearing_to_target,
         };
 
@@ -360,13 +371,18 @@ impl NavTrack {
 /// lookahead. That lets the ship pick a viable short-tack heading (it will
 /// only make a fraction of normal progress, but it won't pin to zero).
 /// As a last resort returns the desired heading.
-fn deflect_for_land(pos: Position, desired: f32, land: &LandMap, lookahead_nm: f32) -> f32 {
-    if let Some(h) = sweep_clear(pos, desired, land, lookahead_nm) {
+fn deflect_for_land(
+    pos: Position,
+    desired: f32,
+    terrain: NavTerrain<'_>,
+    lookahead_nm: f32,
+) -> f32 {
+    if let Some(h) = sweep_clear(pos, desired, terrain, lookahead_nm) {
         return h;
     }
     // Tight-water fallback: shorter horizon, accept any direction that
     // gives us at least a short clear ray.
-    if let Some(h) = sweep_clear(pos, desired, land, (lookahead_nm * 0.25).max(2.0)) {
+    if let Some(h) = sweep_clear(pos, desired, terrain, (lookahead_nm * 0.25).max(2.0)) {
         return h;
     }
     desired
@@ -375,11 +391,16 @@ fn deflect_for_land(pos: Position, desired: f32, land: &LandMap, lookahead_nm: f
 /// Sweep ±10°, ±20°, … ±90° around `desired`, returning the first heading
 /// whose forward `lookahead_nm` ray is clear of land. `desired` itself is
 /// tried first (offset 0).
-fn sweep_clear(pos: Position, desired: f32, land: &LandMap, lookahead_nm: f32) -> Option<f32> {
+fn sweep_clear(
+    pos: Position,
+    desired: f32,
+    terrain: NavTerrain<'_>,
+    lookahead_nm: f32,
+) -> Option<f32> {
     let probe = |h: f32| -> bool {
         let rad = h.to_radians();
         let end = pos + Position::new(rad.sin() * lookahead_nm, rad.cos() * lookahead_nm);
-        land.line_is_clear(pos, end)
+        terrain.geom.line_is_clear(terrain.land, pos, end)
     };
     if probe(desired) {
         return Some(desired);

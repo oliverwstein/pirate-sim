@@ -51,6 +51,11 @@ pub struct World {
     pub tile_mesh: TileMesh,
     pub coastline: CoastlineMap,
     pub land_mesh: LandMesh,
+    /// Phase E: polygon-truth coastline geometry. Owns the spatial
+    /// indices for `line_is_clear` / `first_land_hit` / polygon
+    /// `is_land`. Queries take `&LandMap` as a raster pre-filter.
+    /// Used by the motion sweep and `nav::deflect_for_land`.
+    pub coastline_geom: crate::coastline_geom::CoastlineGeom,
     pub goods: GoodsRegistry,
     /// Catalog of ship designs. A `Ship` indexes in via its
     /// `ship_type` field to fetch per-tick stats and (for shipyard
@@ -181,6 +186,8 @@ impl World {
         let coastline =
             CoastlineMap::load(&data_dir.join("grids/coastline.bin")).unwrap_or_default();
         let land_mesh = LandMesh::load(&data_dir.join("grids/land_polys.bin")).unwrap_or_default();
+        let coastline_geom =
+            crate::coastline_geom::CoastlineGeom::build(&map.land, &coastline, &land_mesh);
         let goods = GoodsRegistry::starter();
         let port_specs: Vec<PortSpec<'_>> = ports
             .iter()
@@ -252,6 +259,7 @@ impl World {
             tile_mesh,
             coastline,
             land_mesh,
+            coastline_geom,
             goods,
             ship_types,
             markets,
@@ -658,7 +666,8 @@ impl World {
             &self.navmesh,
         )
         .with_port_routes(&self.port_routes)
-        .with_tile_mesh(&self.tile_mesh);
+        .with_tile_mesh(&self.tile_mesh)
+        .with_coastline_geom(&self.coastline_geom);
 
         // Rebuild the spatial index over Sailing ships before any AI
         // decisions are made this tick. Cheap (single pass, BTreeMap
@@ -1120,25 +1129,29 @@ impl World {
                 continue;
             }
 
-            // Physics: compute movement, swept against land so a single
-            // tick never tunnels through a coastline.
+            // Physics: compute movement, swept against polygon-truth
+            // coastline so a single tick never tunnels through land.
             //
-            // Rescue: a ship may legitimately be inside a land cell — e.g.,
-            // it just undocked from a port whose literal coordinates fall
-            // on land at our 1 NM/cell resolution. From inside land,
-            // `farthest_clear_point` would otherwise refuse all motion and
-            // strand the ship. Snap to the nearest sea cell first.
-            if self.map.land.is_land(ship.position) {
-                if let Some(cell) = self.map.land.pos_to_cell(ship.position) {
-                    if let Some(sea) = self.map.land.nearest_sea_cell(cell.0, cell.1, 32) {
-                        ship.position = self.map.land.cell_to_pos(sea.0, sea.1);
-                    }
-                }
-            }
+            // Phase E: the previous raster-based rescue (snap-to-sea
+            // when `is_land(ship.position)`) is gone. Port coordinates
+            // now sit at true offshore anchorages (Phase B + the
+            // historical-coordinate update), and `CoastlineGeom`'s
+            // bilevel `is_land` won't misclassify a sea position as
+            // land. A ship found inside polygon-land would indicate
+            // a real bug elsewhere — assert in debug rather than
+            // silently paper over it.
+            debug_assert!(
+                !self.coastline_geom.is_land(&self.map.land, ship.position),
+                "ship {:?} at {:?} is inside polygon-land before motion sweep",
+                id,
+                ship.position,
+            );
 
             let new_pos = ship.compute_next_position(&ship_stats, &wind, 1.0);
             let old_pos = ship.position;
-            let safe_pos = self.map.land.farthest_clear_point(old_pos, new_pos);
+            let safe_pos =
+                self.coastline_geom
+                    .farthest_clear_point(&self.map.land, old_pos, new_pos);
 
             if safe_pos.distance(old_pos) > 0.05 {
                 ship.position = safe_pos;

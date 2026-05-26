@@ -851,7 +851,10 @@ impl<'a> ShipBtContext<'a> {
             }
         }
 
-        let land = self.pathfind.map(|c| c.land);
+        let terrain = self.pathfind.and_then(|c| {
+            c.coastline_geom
+                .map(|geom| crate::nav::NavTerrain { geom, land: c.land })
+        });
         let pos_estimate = self.estimated_position();
         let pos_truth = self.ship.position;
 
@@ -926,7 +929,7 @@ impl<'a> ShipBtContext<'a> {
             pos_truth,
             self.stats,
             self.wind,
-            land,
+            terrain,
         );
         if let Some(s) = steering {
             self.commands.push((

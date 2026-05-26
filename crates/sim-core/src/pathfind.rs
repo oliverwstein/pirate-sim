@@ -26,6 +26,7 @@
 
 use std::collections::HashSet;
 
+use crate::coastline_geom::CoastlineGeom;
 use crate::harbor::Harbor;
 use crate::map::land::LandMap;
 use crate::navmesh::Navmesh;
@@ -50,6 +51,13 @@ pub struct PathfindContext<'a> {
     /// uses it instead of running A* every call. Tests and small
     /// fixtures may pass `None` to skip the precomputation step.
     pub port_routes: Option<&'a PortRouteCache>,
+    /// Phase E: polygon-truth coastline geometry. Used downstream by
+    /// the AI to construct a `NavTerrain` for `compute_steering`'s
+    /// reactive deflection. The planner itself doesn't currently
+    /// consult it (the raster `LandMap` is still the corridor oracle
+    /// inside `tile_mesh_path`), but plumbing it through here keeps
+    /// the AI's terrain bundle in one place.
+    pub coastline_geom: Option<&'a CoastlineGeom>,
 }
 
 impl<'a> PathfindContext<'a> {
@@ -68,6 +76,7 @@ impl<'a> PathfindContext<'a> {
             navmesh,
             tile_mesh: None,
             port_routes: None,
+            coastline_geom: None,
         }
     }
 
@@ -80,6 +89,13 @@ impl<'a> PathfindContext<'a> {
     /// Attach a [`TileMesh`] to enable Phase C tile-based planning.
     pub fn with_tile_mesh(mut self, tile_mesh: &'a TileMesh) -> Self {
         self.tile_mesh = Some(tile_mesh);
+        self
+    }
+
+    /// Attach a [`CoastlineGeom`] so the AI can build a `NavTerrain`
+    /// for reactive deflection (Phase E).
+    pub fn with_coastline_geom(mut self, geom: &'a CoastlineGeom) -> Self {
+        self.coastline_geom = Some(geom);
         self
     }
 }

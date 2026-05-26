@@ -2801,3 +2801,62 @@ load — far below the legacy `Navmesh` cache's ~1 s.
 `Navmesh::build(&LandMap)` is still loaded and remains the backstop
 inside `PathfindContext`; Phase G will remove it once the motion
 sweep migration (Phase E) lands and no caller is left.
+
+---
+
+## 2026-05-28 — Ship navigation Phase E (motion sweep + deflection on polygon truth)
+
+**Context.** Phases A–D moved the planner and harbors off the raster
+`LandMap` substrate but the per-tick motion sweep was still using
+`LandMap::farthest_clear_point` and the reactive deflection in
+`nav.rs` was still probing `LandMap::line_is_clear`. Phase E pulls
+both onto the polygon-truth `CoastlineGeom`.
+
+**Refactor of `CoastlineGeom`.** Was `CoastlineGeom<'a>` borrowing
+`&'a LandMap`; now it's an owned struct (no lifetime) so it can sit
+on `World` for the duration of a run. Bilevel queries take `&LandMap`
+as a parameter — the polygon mesh is truth, the raster is a
+positive pre-filter the caller supplies. Public methods affected:
+`is_land`, `line_is_clear`, `first_land_hit`, plus a new
+`farthest_clear_point(land, a, b)` that wraps `first_land_hit` and
+pulls back by 0.02 NM (~37 m) so the result sits cleanly off the
+polygon edge instead of grazing it.
+
+**Motion sweep rewrite (`world.rs`).** The old raster-rescue clause
+(snap-to-nearest-sea-cell when `is_land(ship.position)`) is **gone**.
+Port coordinates now sit at true offshore anchorages (Phase B +
+historical-coordinate update), and the polygon `is_land` won't
+misclassify a sea position as land. The rescue's only justification
+was the 1-NM raster staircasing the coastline. Replaced with a
+`debug_assert!` that surfaces real bugs instead of papering over
+them. The motion sweep itself now calls
+`coastline_geom.farthest_clear_point(&land, old, new)`.
+
+**Deflection (`nav.rs`).** Introduced `NavTerrain { geom, land }`
+to bundle the two references `compute_steering` needs. Signature
+changed from `Option<&LandMap>` to `Option<NavTerrain<'_>>`;
+`deflect_for_land` and `sweep_clear` likewise. The probe is
+`terrain.geom.line_is_clear(terrain.land, pos, end)` — polygon
+truth with the raster as its fast pre-filter. Tests pass `None`
+unchanged.
+
+**Wiring.** `PathfindContext` gained `coastline_geom:
+Option<&'a CoastlineGeom>` + a `.with_coastline_geom()` builder.
+`World::tick_hourly_ai_and_physics` attaches it. The AI then
+materialises `NavTerrain` from the context for each
+`compute_steering` call.
+
+**Validation.** 238 tests pass, clippy clean. `bench_pathfind`:
+1406/1406 ok, avg 0.32 ms, max 2.01 ms (was 2.44 ms). `bench_trade
+60 days × 503 ships`: 23 ships in the red (vs 25 at the Phase D
+baseline — unrelated economic drift, not a Phase E regression).
+Crucially, the polygon-truth `is_land` debug_assert NEVER fired
+across the full 60-day run — confirming the raster rescue is no
+longer needed.
+
+**Status.** `LandMap` is still loaded; it backs the bilevel
+pre-filter inside `CoastlineGeom` queries and is used by the
+remaining raster-based callers (`pathfind::tile_mesh_path`'s
+`corridor_is_clear` validate step, weather, shipyard, etc.).
+Phase G can now drop `Navmesh::build(&LandMap)` (no movement
+caller left), but `LandMap` itself stays.

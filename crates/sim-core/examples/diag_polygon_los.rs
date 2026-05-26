@@ -95,7 +95,7 @@ fn main() {
         if world.map.land.line_is_clear(a, b) {
             sink = sink.wrapping_add(1);
         }
-        if geom.line_is_clear(a, b) {
+        if geom.line_is_clear(&world.map.land, a, b) {
             sink = sink.wrapping_add(1);
         }
     }
@@ -117,7 +117,7 @@ fn main() {
     let mut poly_clear = 0usize;
     for &(a, b) in &segs {
         let t0 = Instant::now();
-        let r = geom.line_is_clear(a, b);
+        let r = geom.line_is_clear(&world.map.land, a, b);
         poly_us.push(t0.elapsed().as_nanos());
         if r {
             poly_clear += 1;
@@ -130,7 +130,7 @@ fn main() {
     let mut raster_clear_poly_blocked = 0usize;
     for (i, &(a, b)) in segs.iter().enumerate() {
         let r = world.map.land.line_is_clear(a, b);
-        let p = geom.line_is_clear(a, b);
+        let p = geom.line_is_clear(&world.map.land, a, b);
         if r == p {
             agree += 1;
         } else if !r && p {

@@ -91,14 +91,14 @@ pub struct LandTriangleIndex {
     buckets: Vec<Vec<LandTriangle>>,
 }
 
-/// Bundle: raster fast-filter + coastline edge index + land triangle
-/// index. The primary entry point for the new polygon-aware nav stack.
+/// Bundle: coastline edge index + land triangle index. The primary
+/// entry point for the polygon-aware nav stack.
 ///
-/// Lifetime: borrows the [`LandMap`] (already owned by `World`) for the
-/// raster filter; the polygon indices are built from `CoastlineMap` /
-/// `LandMesh` at construction time and held by value.
-pub struct CoastlineGeom<'a> {
-    land: &'a LandMap,
+/// **Ownership.** This struct is fully owned (no borrows) so it can
+/// live on `World` for the duration of a run. The bilevel queries
+/// take a `&LandMap` parameter for the raster pre-filter — keeping
+/// the raster fast-path without forcing a self-referential lifetime.
+pub struct CoastlineGeom {
     coast: CoastlineEdgeIndex,
     polys: LandTriangleIndex,
     /// True iff the coastline polyline source provided any edges.
@@ -110,24 +110,32 @@ pub struct CoastlineGeom<'a> {
     has_triangles: bool,
 }
 
-impl<'a> CoastlineGeom<'a> {
+impl CoastlineGeom {
     /// Build the geometry bundle. `coastline` provides the polyline
     /// edges for LOS tests; `mesh` provides the triangles for
     /// point-in-polygon tests. Either may be empty independently;
     /// each query degrades to raster-only when *its* polygon source
     /// is missing.
-    pub fn build(land: &'a LandMap, coastline: &CoastlineMap, mesh: &LandMesh) -> Self {
+    ///
+    /// `land` is used at build time to fix the index origin/extent
+    /// and is not retained. Queries take `&LandMap` directly.
+    pub fn build(land: &LandMap, coastline: &CoastlineMap, mesh: &LandMesh) -> Self {
         let coast = CoastlineEdgeIndex::build(land, coastline);
         let polys = LandTriangleIndex::build(land, mesh);
         let has_polylines = !coastline.lines.is_empty();
         let has_triangles = !mesh.vertices.is_empty() && !mesh.indices.is_empty();
         Self {
-            land,
             coast,
             polys,
             has_polylines,
             has_triangles,
         }
+    }
+
+    /// Empty geometry — convenience for tests that want a no-op
+    /// `CoastlineGeom`. All polygon queries degrade to raster-only.
+    pub fn empty(land: &LandMap) -> Self {
+        Self::build(land, &CoastlineMap::default(), &LandMesh::default())
     }
 
     /// True iff `pos` is land. Bilevel:
@@ -140,8 +148,8 @@ impl<'a> CoastlineGeom<'a> {
     ///   coastline staircasing).
     /// - Raster says land + no triangles loaded → fall through to the
     ///   raster verdict.
-    pub fn is_land(&self, pos: Position) -> bool {
-        if !self.land.is_land(pos) {
+    pub fn is_land(&self, land: &LandMap, pos: Position) -> bool {
+        if !land.is_land(pos) {
             return false;
         }
         if !self.has_triangles {
@@ -158,8 +166,8 @@ impl<'a> CoastlineGeom<'a> {
     ///   segment-vs-coastline-edges test over just the buckets the
     ///   segment passes through. No polylines → mirror the raster
     ///   verdict.
-    pub fn line_is_clear(&self, a: Position, b: Position) -> bool {
-        if !self.raster_corridor_touches_land(a, b) {
+    pub fn line_is_clear(&self, land: &LandMap, a: Position, b: Position) -> bool {
+        if !raster_corridor_touches_land(land, a, b) {
             return true;
         }
         if !self.has_polylines {
@@ -181,12 +189,12 @@ impl<'a> CoastlineGeom<'a> {
     /// If the segment `a → b` crosses land, return the polygon-precise
     /// hit point closest to `a`. Returns `None` if the segment is
     /// entirely clear (i.e. `line_is_clear(a, b) == true`).
-    pub fn first_land_hit(&self, a: Position, b: Position) -> Option<Position> {
-        if !self.raster_corridor_touches_land(a, b) {
+    pub fn first_land_hit(&self, land: &LandMap, a: Position, b: Position) -> Option<Position> {
+        if !raster_corridor_touches_land(land, a, b) {
             return None;
         }
         if !self.has_polylines {
-            return raster_first_land_hit(self.land, a, b);
+            return raster_first_land_hit(land, a, b);
         }
         let mut best: Option<(f32, Position)> = None;
         self.coast.for_each_bucket_along(a, b, |edges| {
@@ -202,27 +210,27 @@ impl<'a> CoastlineGeom<'a> {
         best.map(|(_, p)| p)
     }
 
-    /// Internal: cheap raster pre-filter for the bilevel LOS / first-hit
-    /// queries. Walks the segment at half-cell intervals (matching the
-    /// existing `LandMap::line_is_clear` sample rate) and returns
-    /// `true` the moment a land cell is touched. False ⇒ segment is
-    /// open-water for sure.
-    fn raster_corridor_touches_land(&self, a: Position, b: Position) -> bool {
+    /// Polygon-truth replacement for `LandMap::farthest_clear_point`:
+    /// the farthest point along `a → b` that stays in water. If the
+    /// segment is fully clear, returns `b`. Otherwise returns the
+    /// first land hit, pulled back by `PULLBACK_NM` along the
+    /// segment direction so the result sits a few metres clear of the
+    /// polygon edge (avoids floating-point edge-grazing on the next
+    /// tick).
+    pub fn farthest_clear_point(&self, land: &LandMap, a: Position, b: Position) -> Position {
+        const PULLBACK_NM: f32 = 0.02;
+        let Some(hit) = self.first_land_hit(land, a, b) else {
+            return b;
+        };
         let delta = b - a;
-        let dist = delta.length();
-        if dist <= 0.0 {
-            return self.land.is_land(a);
+        let len = delta.length();
+        if len <= 1e-6 {
+            return a;
         }
-        let step = (self.land.cell_size_nm * 0.5).max(0.1);
-        let steps = (dist / step).ceil() as u32;
-        for i in 0..=steps {
-            let t = i as f32 / steps as f32;
-            let p = a + delta * t;
-            if self.land.is_land(p) {
-                return true;
-            }
-        }
-        false
+        let along = delta * (1.0 / len);
+        let hit_t = (hit - a).length();
+        let t = (hit_t - PULLBACK_NM).max(0.0);
+        a + along * t
     }
 
     // Test accessors.
@@ -242,6 +250,27 @@ impl<'a> CoastlineGeom<'a> {
     pub fn has_triangles(&self) -> bool {
         self.has_triangles
     }
+}
+
+/// Free-function version of the raster pre-filter (was a method on
+/// the borrowed-LandMap variant). Walks the segment at half-cell
+/// intervals and returns `true` the moment a land cell is touched.
+fn raster_corridor_touches_land(land: &LandMap, a: Position, b: Position) -> bool {
+    let delta = b - a;
+    let dist = delta.length();
+    if dist <= 0.0 {
+        return land.is_land(a);
+    }
+    let step = (land.cell_size_nm * 0.5).max(0.1);
+    let steps = (dist / step).ceil() as u32;
+    for i in 0..=steps {
+        let t = i as f32 / steps as f32;
+        let p = a + delta * t;
+        if land.is_land(p) {
+            return true;
+        }
+    }
+    false
 }
 
 // ──────────────────────── CoastlineEdgeIndex ────────────────────────
@@ -528,11 +557,11 @@ mod tests {
 
         // Sea point.
         let sea = Position::new(2.0, 18.0);
-        assert!(!geom.is_land(sea));
+        assert!(!geom.is_land(&land, sea));
         // Land point (in the 15..20, 15..20 block; world y of row 15
         // is origin.y - 15.5 = 20 - 15.5 = 4.5).
         let land_pt = Position::new(17.5, 4.5);
-        assert!(geom.is_land(land_pt));
+        assert!(geom.is_land(&land, land_pt));
     }
 
     #[test]
@@ -541,8 +570,8 @@ mod tests {
         let geom = CoastlineGeom::build(&land, &CoastlineMap::default(), &LandMesh::default());
         let a = Position::new(2.0, 18.0);
         let b = Position::new(8.0, 18.0);
-        assert!(geom.line_is_clear(a, b));
-        assert!(geom.first_land_hit(a, b).is_none());
+        assert!(geom.line_is_clear(&land, a, b));
+        assert!(geom.first_land_hit(&land, a, b).is_none());
     }
 
     #[test]
@@ -552,8 +581,8 @@ mod tests {
         // Segment from sea into the land block.
         let a = Position::new(2.0, 4.5);
         let b = Position::new(18.0, 4.5);
-        assert!(!geom.line_is_clear(a, b));
-        let hit = geom.first_land_hit(a, b).expect("hit");
+        assert!(!geom.line_is_clear(&land, a, b));
+        let hit = geom.first_land_hit(&land, a, b).expect("hit");
         // First land cell is x≈15; hit should be near there.
         assert!(hit.x > 12.0 && hit.x < 18.0, "hit.x = {}", hit.x);
     }
@@ -590,6 +619,6 @@ mod tests {
         assert!(land.is_land(raster_says_land));
         // Polygon contains no triangle covering this point → bilevel
         // is_land says SEA, refining the raster verdict.
-        assert!(!geom.is_land(raster_says_land));
+        assert!(!geom.is_land(&land, raster_says_land));
     }
 }
