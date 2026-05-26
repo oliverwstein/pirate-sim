@@ -17,6 +17,9 @@ const SHIP_SIGHT_RANGE_NM: f32 = SPATIAL_CELL_NM;
 const SIGHT_LINE_COLOR: Color = Color::new(0.85, 0.85, 0.9, 0.18);
 const WIND_COLOR: Color = Color::new(0.5, 0.7, 1.0, 0.6);
 const PATH_COLOR: Color = Color::new(1.0, 0.9, 0.2, 0.15);
+/// Stroke for navmesh node dots. White with low alpha so dense coverage
+/// blends visually instead of washing the map out.
+const NAVMESH_NODE_COLOR: Color = Color::new(1.0, 1.0, 1.0, 0.55);
 const SELECT_COLOR: Color = Color::new(0.4, 0.9, 1.0, 1.0);
 
 /// Discrete level-of-detail zoom steps in pixels-per-NM. Mouse wheel
@@ -240,6 +243,24 @@ fn draw_wind_arrows(world: &World, camera: &Camera) {
     }
 }
 
+/// Render every navmesh node as a small white dot. Used to visually
+/// audit waypoint coverage — concave coastlines that lack a nearby
+/// node show up as bare patches where ships can plausibly get stuck.
+/// Off-screen culling keeps the per-frame cost proportional to the
+/// visible area regardless of total node count.
+fn draw_navmesh_nodes(world: &World, camera: &Camera) {
+    let sw = screen_width();
+    let sh = screen_height();
+    let radius = (camera.zoom() * 0.6).clamp(0.6, 2.0);
+    for node in &world.navmesh.nodes {
+        let p = camera.world_to_screen(node.pos);
+        if p.x < 0.0 || p.y < 0.0 || p.x > sw || p.y > sh {
+            continue;
+        }
+        draw_circle(p.x, p.y, radius, NAVMESH_NODE_COLOR);
+    }
+}
+
 fn draw_ports(world: &World, camera: &Camera) {
     for port in &world.ports {
         let sp = camera.world_to_screen(port.position);
@@ -267,23 +288,12 @@ fn draw_ports(world: &World, camera: &Camera) {
 }
 
 fn draw_ships(world: &World, camera: &Camera, selected_ship: Option<ShipId>) {
-    // Planned paths first, so ship triangles draw on top.
-    for (id, ship) in &world.ships {
-        let nav = &ship.nav;
-        if world.ship_ais.get(id).is_none() {
-            continue;
-        }
-        if nav.waypoints.is_empty() {
-            continue;
-        }
-        let mut prev = camera.world_to_screen(ship.position);
-        for wp in nav.waypoints.iter() {
-            let p = camera.world_to_screen(*wp);
-            draw_line(prev.x, prev.y, p.x, p.y, 1.5, PATH_COLOR);
-            draw_circle(p.x, p.y, 2.0, PATH_COLOR);
-            prev = p;
-        }
-    }
+    // Planned-path overlay intentionally disabled: while debugging
+    // navmesh coverage we render every navmesh node as a white dot
+    // (see `draw_navmesh_nodes`) so the ship-by-ship yellow chains
+    // would just clutter the view. Re-enable by drawing
+    // `ship.nav.waypoints` here if you need per-ship route inspection.
+    let _ = PATH_COLOR;
 
     // Inter-faction sight lines: for each Sailing ship, draw a faint
     // line to any *Sailing* neighbor of a different faction within
@@ -692,6 +702,7 @@ async fn main() {
         draw_land(&world, &camera);
         draw_coastline(&world, &camera);
         draw_wind_arrows(&world, &camera);
+        draw_navmesh_nodes(&world, &camera);
         draw_ports(&world, &camera);
         draw_ships(&world, &camera, selected_ship);
         draw_hud(&world, &camera, paused, ticks_per_frame);
