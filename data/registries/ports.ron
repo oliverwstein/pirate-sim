@@ -58,7 +58,7 @@
     (name: "New York",        coord: (40.6833, -74.0167),  faction: England, harbor_radius_nm: 60.0, shipyard: None, category: SmallColonial),
     // Philadelphia: outer Delaware Bay off Cape Henlopen (~38.9°N).
     // Founded 1682 — historically borderline for 1680; see §4.3.
-    (name: "Philadelphia",    coord: (38.9000, -75.1000), faction: England, harbor_radius_nm: 30.0, shipyard: Some(["sloop", "brigantine"]), category: SmallColonial),
+    (name: "Philadelphia",    coord: (38.9000, -75.1000), faction: England, harbor_radius_nm: 10.0, shipyard: Some(["sloop", "brigantine"]), category: SmallColonial),
     // Bermuda: cedar-built sloops were the quintessential Caribbean trader.
     (name: "Bermuda",         coord: (32.3817, -64.6767),   faction: England, harbor_radius_nm: 8.0,  shipyard: Some(["sloop"]), category: SmallColonial),
     (name: "Belize",          coord: (17.4983, -88.1883),   faction: England, harbor_radius_nm: 30.0, shipyard: None, category: SmallColonial),
