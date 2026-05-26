@@ -89,6 +89,16 @@ pub struct TileMesh {
 }
 
 impl TileMesh {
+    /// An empty tile mesh — for tests that don't exercise the planner's
+    /// tile-routing path.
+    pub fn empty() -> Self {
+        Self {
+            tiles: Vec::new(),
+            neighbors: Vec::new(),
+            centroid_buckets: HashMap::new(),
+        }
+    }
+
     /// Load a navmesh from the binary produced by
     /// `preprocess_navmesh.py`. Returns an error on truncation or
     /// any inconsistency; panics are reserved for the caller.

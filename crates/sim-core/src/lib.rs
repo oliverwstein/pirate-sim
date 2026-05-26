@@ -14,7 +14,6 @@ pub mod market_clearer;
 pub mod market_curve;
 pub mod money;
 pub mod nav;
-pub mod navmesh;
 pub mod pathfind;
 pub mod policy;
 pub mod pop;

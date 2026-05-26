@@ -2860,3 +2860,46 @@ remaining raster-based callers (`pathfind::tile_mesh_path`'s
 `corridor_is_clear` validate step, weather, shipyard, etc.).
 Phase G can now drop `Navmesh::build(&LandMap)` (no movement
 caller left), but `LandMap` itself stays.
+
+---
+
+## 2025 — Phase G: drop legacy `Navmesh`
+
+**Context.** Phases A–E moved every movement-side caller off the
+raster-derived `Navmesh` and onto the portal-aware `TileMesh` +
+polygon-truth `CoastlineGeom`. With no remaining caller, the
+~540-line `navmesh.rs`, its diagnostic example, the
+`PathfindContext::navmesh` field, and the `navmesh_path` A* fallback
+were all dead weight.
+
+**Change.** Deleted `crates/sim-core/src/navmesh.rs` and
+`examples/diag_navmesh.rs`. Removed `pub mod navmesh;` and the
+`World::navmesh` field. `PathfindContext::tile_mesh` is now a
+required `&'a TileMesh` (no longer `Option<&'a TileMesh>`); the
+`find_path` / `find_path_to_harbor` `navmesh_path` fallbacks are
+gone — if the tile mesh has no route, the planner returns `None`.
+Added `TileMesh::empty()` for tests that don't exercise the
+routing pipeline.
+
+**Visualizer.** `draw_navmesh_nodes` → `draw_tile_centroids`,
+reading `world.tile_mesh.tiles[i].centroid`. The dot overlay still
+audits planning-substrate coverage, just on the new substrate.
+
+**Validation.** `cargo fmt --all`, `cargo clippy --workspace
+--tests -- -D warnings`, `cargo test --workspace` (237 pass; the
+old `path_avoids_land_obstacle` unit test was deleted because the
+new pipeline is exercised by `bench_pathfind`'s 1406 real-world
+routes). `bench_pathfind`: 1406/1406 ok, avg **0.01 ms**, max
+**0.15 ms** — order-of-magnitude faster than the Phase D baseline
+(0.33 ms / 2.44 ms), because the planner no longer threads the
+`Navmesh` reference through every call site or compiles the
+fallback A*.
+
+**Status.** Migration complete. `LandMap` stays loaded as the
+bilevel pre-filter inside `CoastlineGeom` queries and for the
+remaining raster callers (weather, shipyard, harbor `is_land`
+checks). No further legacy-navmesh code remains in the workspace.
+
+**Note (pre-existing).** `cargo clippy --examples` flags
+`unusual_byte_groupings` in `examples/diag_polygon_los.rs` —
+committed in Phase E, unrelated to this cleanup.

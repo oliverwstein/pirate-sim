@@ -10,7 +10,6 @@ use crate::harbor::HarborMap;
 use crate::map::MapSystem;
 use crate::market::{archetype_for, seed_balance_from_equilibrium, PortMarket};
 use crate::money::Pesos;
-use crate::navmesh::Navmesh;
 use crate::pathfind::PathfindContext;
 use crate::pop::{self, PortDemographics};
 use crate::port::{all_ports, Port};
@@ -42,12 +41,11 @@ pub struct World {
     pub weather: WeatherSystem,
     pub ports: Vec<Port>,
     pub harbors: HarborMap,
-    pub navmesh: Navmesh,
-    /// Phase A: portal-aware convex-tile navmesh loaded offline by
-    /// `tools/preprocess/preprocess_navmesh.py`. Anchored to data at
-    /// `data/grids/navmesh.bin`. Phase B uses it to derive each
-    /// port's anchor tile; Phases C–E migrate path planning and
-    /// motion onto it.
+    /// Portal-aware convex-tile navmesh loaded offline by
+    /// `tools/preprocess/preprocess_navmesh.py` from `data/grids/navmesh.bin`.
+    /// The single navigation substrate: path planning, harbors, and
+    /// the per-tick motion sweep all run on it (with polygon-truth
+    /// `coastline_geom` for the collision check).
     pub tile_mesh: TileMesh,
     pub coastline: CoastlineMap,
     pub land_mesh: LandMesh,
@@ -182,7 +180,6 @@ impl World {
         let tile_mesh = TileMesh::load(&data_dir.join("grids/navmesh.bin"))
             .expect("load data/grids/navmesh.bin (run tools/preprocess/preprocess_navmesh.py)");
         let harbors = HarborMap::build(&map.land, &tile_mesh, &ports);
-        let navmesh = Navmesh::build(&map.land);
         let coastline =
             CoastlineMap::load(&data_dir.join("grids/coastline.bin")).unwrap_or_default();
         let land_mesh = LandMesh::load(&data_dir.join("grids/land_polys.bin")).unwrap_or_default();
@@ -255,7 +252,6 @@ impl World {
             weather,
             ports,
             harbors,
-            navmesh,
             tile_mesh,
             coastline,
             land_mesh,
@@ -444,11 +440,11 @@ impl World {
     pub fn tick(&mut self) {
         let month = self.date.month();
         // PathfindContext uses a single "representative" stats — the
-        // sloop's profile — because the navmesh is shared and the
+        // sloop's profile — because the tile mesh is shared and the
         // wind-routed cost is the same shape for every merchant rig
         // we currently model. A future refinement could maintain a
         // per-type PathfindContext (or a per-type ship_stats lookup
-        // inside the planner) without changing the navmesh.
+        // inside the planner) without changing the mesh.
         let pathfind_stats = self.ship_types.get(shiptype::ids::SLOOP).stats.clone();
 
         self.tick_monthly(month);
@@ -663,10 +659,9 @@ impl World {
             &self.weather.wind,
             pathfind_stats,
             month,
-            &self.navmesh,
+            &self.tile_mesh,
         )
         .with_port_routes(&self.port_routes)
-        .with_tile_mesh(&self.tile_mesh)
         .with_coastline_geom(&self.coastline_geom);
 
         // Rebuild the spatial index over Sailing ships before any AI

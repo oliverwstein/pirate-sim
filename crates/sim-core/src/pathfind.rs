@@ -1,18 +1,14 @@
-//! Navmesh-based ship path planning.
+//! Tile-mesh ship path planning.
 //!
-//! **Phase C migration in progress.** Production callers now use the
-//! [`TileMesh`] portal-aware convex-tile mesh (loaded from
-//! `data/grids/navmesh.bin`) plus a Simple Stupid Funnel pass through
-//! the corridor of shared edges. The legacy raster-derived [`Navmesh`]
-//! is still loaded and retained on [`PathfindContext`] for tests and
-//! as a backstop, but [`find_path`] and [`find_path_to_harbor`] no
-//! longer consult it when a tile mesh is attached.
+//! Production path planning runs on the [`TileMesh`] portal-aware
+//! convex-tile mesh (loaded from `data/grids/navmesh.bin`) plus a
+//! Simple Stupid Funnel pass through the corridor of shared edges.
 //!
 //! Pipeline:
 //!
 //! 1. Trivial line-of-sight check from start to goal — if the raster
-//!    corridor is clear, return a single waypoint. (Phase E replaces
-//!    raster LOS with polygon-truth `coastline_geom`.)
+//!    corridor is clear, return a single waypoint. (A future pass can
+//!    replace raster LOS with polygon-truth `coastline_geom`.)
 //! 2. Locate nearest tile-mesh centroids around start and goal.
 //! 3. A* on tile centroids → tile-id sequence.
 //! 4. Reconstruct `(left, right)` shared-edge endpoints between
@@ -24,12 +20,9 @@
 //!    (guaranteed safe because each centroid lies inside a convex
 //!    tile).
 
-use std::collections::HashSet;
-
 use crate::coastline_geom::CoastlineGeom;
 use crate::harbor::Harbor;
 use crate::map::land::LandMap;
-use crate::navmesh::Navmesh;
 use crate::portroutes::PortRouteCache;
 use crate::ship::ShipStats;
 use crate::tile_mesh::{self, TileMesh};
@@ -42,21 +35,18 @@ pub struct PathfindContext<'a> {
     pub wind: &'a WindGrid,
     pub stats: &'a ShipStats,
     pub month: u8,
-    pub navmesh: &'a Navmesh,
-    /// Phase C: portal-aware convex-tile mesh. When `Some`, the planner
-    /// uses it; when `None` (tests that haven't yet been migrated) it
-    /// falls back to the legacy [`Navmesh`] path.
-    pub tile_mesh: Option<&'a TileMesh>,
+    /// Portal-aware convex-tile mesh — the sole planning substrate.
+    pub tile_mesh: &'a TileMesh,
     /// Optional per-port SSSP cache. When present, `find_path_to_harbor`
     /// uses it instead of running A* every call. Tests and small
     /// fixtures may pass `None` to skip the precomputation step.
     pub port_routes: Option<&'a PortRouteCache>,
-    /// Phase E: polygon-truth coastline geometry. Used downstream by
-    /// the AI to construct a `NavTerrain` for `compute_steering`'s
-    /// reactive deflection. The planner itself doesn't currently
-    /// consult it (the raster `LandMap` is still the corridor oracle
-    /// inside `tile_mesh_path`), but plumbing it through here keeps
-    /// the AI's terrain bundle in one place.
+    /// Polygon-truth coastline geometry. Used downstream by the AI to
+    /// construct a `NavTerrain` for `compute_steering`'s reactive
+    /// deflection. The planner itself doesn't currently consult it (the
+    /// raster `LandMap` is still the corridor oracle inside
+    /// `tile_mesh_path`), but plumbing it through here keeps the AI's
+    /// terrain bundle in one place.
     pub coastline_geom: Option<&'a CoastlineGeom>,
 }
 
@@ -66,15 +56,14 @@ impl<'a> PathfindContext<'a> {
         wind: &'a WindGrid,
         stats: &'a ShipStats,
         month: u8,
-        navmesh: &'a Navmesh,
+        tile_mesh: &'a TileMesh,
     ) -> Self {
         Self {
             land,
             wind,
             stats,
             month,
-            navmesh,
-            tile_mesh: None,
+            tile_mesh,
             port_routes: None,
             coastline_geom: None,
         }
@@ -86,14 +75,8 @@ impl<'a> PathfindContext<'a> {
         self
     }
 
-    /// Attach a [`TileMesh`] to enable Phase C tile-based planning.
-    pub fn with_tile_mesh(mut self, tile_mesh: &'a TileMesh) -> Self {
-        self.tile_mesh = Some(tile_mesh);
-        self
-    }
-
     /// Attach a [`CoastlineGeom`] so the AI can build a `NavTerrain`
-    /// for reactive deflection (Phase E).
+    /// for reactive deflection.
     pub fn with_coastline_geom(mut self, geom: &'a CoastlineGeom) -> Self {
         self.coastline_geom = Some(geom);
         self
@@ -105,25 +88,9 @@ impl<'a> PathfindContext<'a> {
 /// along the segment. At 1 NM/cell this is a 2-cell buffer.
 const SMOOTH_MARGIN_NM: f32 = 2.0;
 
-/// Search radius (NM) for finding visible navmesh entry/exit nodes from a
-/// non-mesh start/goal point (a harbor anchor, a ship's current position).
-const ENTRY_RADIUS_NM: f32 = 200.0;
-
-/// Cap on the number of mesh entry/exit nodes considered. The mesh has very
-/// high local connectivity (avg degree 30+), so a handful of nearby nodes
-/// already covers all reasonable graph entries.
-const ENTRY_CANDIDATES: usize = 16;
-
-/// Margin (NM) used when probing line-of-sight from a coastal start/anchor
-/// point to a mesh node. Zero (line-of-sight only) is correct here: harbor
-/// anchors are placed adjacent to coastlines so any non-zero margin would
-/// reject every candidate.
-const ENTRY_MARGIN_NM: f32 = 0.0;
-
 /// Search radius (NM) for finding the tile-mesh entry tiles from a
-/// non-mesh start/goal point. Smaller than the legacy `ENTRY_RADIUS_NM`
-/// because tile centroids are denser (~43k tiles vs ~thousands of
-/// navmesh nodes) and we only need a handful of nearby candidates.
+/// non-mesh start/goal point. Tile centroids are dense (~43k tiles),
+/// so we only need a handful of nearby candidates.
 const TILE_ENTRY_RADIUS_NM: f32 = 50.0;
 
 /// Hard cap on tile-entry candidates the planner considers. Pure-A*
@@ -146,29 +113,25 @@ pub fn find_path(
     if ctx.land.corridor_is_clear(start, goal, SMOOTH_MARGIN_NM) {
         return Some(vec![goal]);
     }
-    if let Some(mesh) = ctx.tile_mesh {
-        if let Some(path) = tile_mesh_path(ctx.land, mesh, start, goal, None) {
-            return Some(path);
-        }
-    }
-    navmesh_path(ctx.land, ctx.navmesh, start, &[goal], goal)
+    tile_mesh_path(ctx.land, ctx.tile_mesh, start, goal, None)
 }
 
 /// Plan a path from `start` to any cell of `harbor`'s zone, ending at the
-/// harbor anchor. Returns `None` if the navmesh has no route between any
-/// node visible from `start` and any node visible from the anchor.
+/// harbor anchor. Returns `None` if no route exists between any tile
+/// visible from `start` and any tile visible from the anchor.
 ///
 /// When `ctx.port_routes` is set (the production world configuration),
 /// the per-port SSSP cache is consulted first — for any voyage to a
 /// well-connected harbor, this turns A* into a constant-time lookup
 /// plus a predecessor walk. Cache misses (start has no path to the
-/// port's entry set) silently fall back to live A* via `navmesh_path`.
+/// port's entry set) silently fall back to live A* via `tile_mesh_path`.
 pub fn find_path_to_harbor(
     ctx: &PathfindContext<'_>,
     start: Position,
     harbor: &Harbor,
 ) -> Option<Vec<Position>> {
     let land = ctx.land;
+    let mesh = ctx.tile_mesh;
 
     // If we're already inside the harbor zone, no movement needed.
     if harbor.contains_pos(land, start) {
@@ -180,39 +143,30 @@ pub fn find_path_to_harbor(
         return Some(vec![harbor.anchor]);
     }
 
-    // Phase D: prefer the SSSP cache when both the tile mesh and the
-    // cache are attached. Cache miss (port has no entry or no reachable
-    // start) silently falls through to live A* via `tile_mesh_path`.
-    if let (Some(mesh), Some(cache)) = (ctx.tile_mesh, ctx.port_routes) {
+    // Prefer the SSSP cache when available. Cache miss (port has no
+    // entry or no reachable start) silently falls through to live A*.
+    if let Some(cache) = ctx.port_routes {
         if let Some(path) = tile_mesh_cached_path(land, mesh, cache, start, harbor) {
             return Some(path);
         }
     }
 
-    // Phase C: live A* on the tile mesh. Seed the goal tile set with
-    // the anchor tile and its immediate neighbours so the funnel has
-    // room to smooth into the harbor's mouth.
-    if let Some(mesh) = ctx.tile_mesh {
-        if let Some(anchor_tile) = harbor.anchor_tile {
-            let mut goal_tiles: Vec<u32> = Vec::with_capacity(8);
-            goal_tiles.push(anchor_tile);
-            for e in &mesh.neighbors[anchor_tile as usize] {
-                goal_tiles.push(e.to);
-            }
-            if let Some(path) = tile_mesh_path(land, mesh, start, harbor.anchor, Some(&goal_tiles))
-            {
-                return Some(path);
-            }
-        }
+    // Live A* on the tile mesh. Seed the goal tile set with the anchor
+    // tile and its immediate neighbours so the funnel has room to
+    // smooth into the harbor's mouth.
+    let anchor_tile = harbor.anchor_tile?;
+    let mut goal_tiles: Vec<u32> = Vec::with_capacity(8);
+    goal_tiles.push(anchor_tile);
+    for e in &mesh.neighbors[anchor_tile as usize] {
+        goal_tiles.push(e.to);
     }
-
-    navmesh_path(land, ctx.navmesh, start, &[harbor.anchor], harbor.anchor)
+    tile_mesh_path(land, mesh, start, harbor.anchor, Some(&goal_tiles))
 }
 
-/// Phase D cached harbor path: look up a precomputed tile-id route from
-/// the per-port SSSP cache, then stitch it into a polyline using the
-/// same shared-edge → SSFA pipeline as the live planner. Returns
-/// `None` on cache miss so the caller can fall back to live A*.
+/// Cached harbor path: look up a precomputed tile-id route from the
+/// per-port SSSP cache, then stitch it into a polyline using the same
+/// shared-edge → SSFA pipeline as the live planner. Returns `None` on
+/// cache miss so the caller can fall back to live A*.
 fn tile_mesh_cached_path(
     land: &LandMap,
     mesh: &TileMesh,
@@ -232,54 +186,6 @@ fn tile_mesh_cached_path(
 
     let route = cache.route_from(&starts, harbor.port_index)?;
     Some(stitch_tile_route(land, mesh, start, harbor.anchor, &route))
-}
-
-/// Plan a path through the navmesh from `start` to any of the goal anchors,
-/// returning waypoint positions ending at `terminal`. The boundary legs
-/// (start → first mesh node, last mesh node → terminal) bypass the mesh
-/// and rely on line-of-sight checks.
-fn navmesh_path(
-    land: &LandMap,
-    nm: &Navmesh,
-    start: Position,
-    goal_anchors: &[Position],
-    terminal: Position,
-) -> Option<Vec<Position>> {
-    let starts = nm.visible_from(
-        land,
-        start,
-        ENTRY_RADIUS_NM,
-        ENTRY_CANDIDATES,
-        ENTRY_MARGIN_NM,
-    );
-    if starts.is_empty() {
-        return None;
-    }
-
-    let mut goal_seen: HashSet<u32> = HashSet::new();
-    let mut goals: Vec<u32> = Vec::new();
-    for &ga in goal_anchors {
-        for n in nm.visible_from(land, ga, ENTRY_RADIUS_NM, ENTRY_CANDIDATES, ENTRY_MARGIN_NM) {
-            if goal_seen.insert(n) {
-                goals.push(n);
-            }
-        }
-    }
-    if goals.is_empty() {
-        return None;
-    }
-
-    let route = nm.route(&starts, &goals)?;
-
-    let mut points: Vec<Position> = Vec::with_capacity(route.len() + 2);
-    points.push(start);
-    for idx in &route {
-        points.push(nm.nodes[*idx as usize].pos);
-    }
-    points.push(terminal);
-
-    let smoothed = smooth_boundaries(land, &points);
-    Some(smoothed.into_iter().skip(1).collect())
 }
 
 /// Plan a path through the [`TileMesh`] from `start` to `terminal`.
@@ -343,9 +249,9 @@ fn tile_mesh_path(
 /// centroid lies inside a convex tile and each consecutive pair shares
 /// an edge.
 ///
-/// Shared between the Phase C live planner ([`tile_mesh_path`]) and the
-/// Phase D cached planner ([`tile_mesh_cached_path`]); both produce
-/// identical waypoint streams given identical tile routes.
+/// Shared between the live planner ([`tile_mesh_path`]) and the cached
+/// planner ([`tile_mesh_cached_path`]); both produce identical waypoint
+/// streams given identical tile routes.
 fn stitch_tile_route(
     land: &LandMap,
     mesh: &TileMesh,
@@ -397,80 +303,6 @@ fn centroid_chain_with_terminal(
     out
 }
 
-/// Corridor-aware line-of-sight smoothing restricted to the two boundary
-/// legs (`start → first mesh node` and `last mesh node → terminal`).
-///
-/// Interior mesh-to-mesh segments are kept verbatim. Consecutive nodes in
-/// a navmesh route are valid by construction (the mesh is built so its
-/// edges have line-of-sight with the mesh margin), so the only smoothing
-/// of practical value is collapsing leading and trailing nodes that the
-/// non-mesh endpoints can see past. This bounds LOS work to
-/// `prefix_len + suffix_len` calls (each bounded by `ENTRY_RADIUS_NM`)
-/// instead of `~N` calls across the full route.
-fn smooth_boundaries(land: &LandMap, points: &[Position]) -> Vec<Position> {
-    if points.len() <= 3 {
-        return smooth_path(land, points);
-    }
-    let n = points.len();
-
-    // Prefix: advance over leading interior nodes that `start` can see past.
-    // `prefix_end` is the index of the first interior waypoint we keep.
-    let mut prefix_end = 1usize;
-    while prefix_end + 1 < n - 1
-        && land.corridor_is_clear(points[0], points[prefix_end + 1], SMOOTH_MARGIN_NM)
-    {
-        prefix_end += 1;
-    }
-
-    // Suffix: walk `terminal` back over trailing interior nodes.
-    // `suffix_start` is the index of the last interior waypoint we keep.
-    let mut suffix_start = n - 2;
-    while suffix_start > prefix_end
-        && land.corridor_is_clear(points[suffix_start - 1], points[n - 1], SMOOTH_MARGIN_NM)
-    {
-        suffix_start -= 1;
-    }
-
-    let mut out = Vec::with_capacity(suffix_start - prefix_end + 3);
-    out.push(points[0]);
-    out.extend_from_slice(&points[prefix_end..=suffix_start]);
-    out.push(points[n - 1]);
-    out
-}
-
-/// Plan a path through the navmesh from `start` to any of the goal anchors,
-/// it would force a path through (or too close to) land. Walks forward
-/// greedily, jumping as far as the corridor with `SMOOTH_MARGIN_NM` clearance
-/// allows.
-fn smooth_path(land: &LandMap, points: &[Position]) -> Vec<Position> {
-    if points.len() <= 2 {
-        return points.to_vec();
-    }
-    let mut out = Vec::with_capacity(points.len());
-    out.push(points[0]);
-    let mut anchor = 0usize;
-    let mut probe = 1usize;
-    while probe < points.len() {
-        let next = probe + 1;
-        let ok = if next < points.len() {
-            land.corridor_is_clear(points[anchor], points[next], SMOOTH_MARGIN_NM)
-        } else {
-            false
-        };
-        if ok {
-            probe = next;
-        } else {
-            out.push(points[probe]);
-            anchor = probe;
-            probe += 1;
-        }
-    }
-    if *out.last().unwrap() != *points.last().unwrap() {
-        out.push(*points.last().unwrap());
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -494,13 +326,17 @@ mod tests {
         )
     }
 
+    fn empty_tile_mesh() -> TileMesh {
+        TileMesh::empty()
+    }
+
     #[test]
     fn open_sea_returns_direct_path() {
         let land = open_sea_land(20, 20);
         let wind = flat_wind_grid(20, 20, land.origin, land.cell_size_nm);
-        let nm = Navmesh::build(&land);
+        let mesh = empty_tile_mesh();
         let stats = ShipStats::sloop();
-        let ctx = PathfindContext::new(&land, &wind, &stats, 0, &nm);
+        let ctx = PathfindContext::new(&land, &wind, &stats, 0, &mesh);
 
         let start = Position::new(20.0, 20.0);
         let goal = Position::new(180.0, 180.0);
@@ -508,36 +344,5 @@ mod tests {
         // LOS short-circuit: single waypoint at the goal.
         assert_eq!(path.len(), 1);
         assert_eq!(path[0], goal);
-    }
-
-    #[test]
-    fn path_avoids_land_obstacle() {
-        // 20x20 grid, vertical wall at column 10 with a 2-row gap so a
-        // route exists.
-        let w = 20u32;
-        let h = 20u32;
-        let mut data = vec![0u8; (w * h) as usize];
-        for r in 0..h {
-            if r == 5 || r == 6 {
-                continue;
-            }
-            data[(r * w + 10) as usize] = 255;
-        }
-        let land = LandMap::from_raw(data, w, h, Position::new(0.0, h as f32 * 10.0), 10.0);
-        let wind = flat_wind_grid(w, h, land.origin, land.cell_size_nm);
-        let nm = Navmesh::build(&land);
-        let stats = ShipStats::sloop();
-        let ctx = PathfindContext::new(&land, &wind, &stats, 0, &nm);
-
-        let start = Position::new(20.0, land.origin.y - 55.0);
-        let goal = Position::new(180.0, land.origin.y - 55.0);
-        let path = find_path(&ctx, start, goal).expect("path around wall");
-
-        let mut prev = start;
-        for p in &path {
-            assert!(land.line_is_clear(prev, *p), "segment crosses land");
-            prev = *p;
-        }
-        assert_eq!(*path.last().unwrap(), goal);
     }
 }

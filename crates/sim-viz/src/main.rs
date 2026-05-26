@@ -243,17 +243,18 @@ fn draw_wind_arrows(world: &World, camera: &Camera) {
     }
 }
 
-/// Render every navmesh node as a small white dot. Used to visually
-/// audit waypoint coverage — concave coastlines that lack a nearby
-/// node show up as bare patches where ships can plausibly get stuck.
-/// Off-screen culling keeps the per-frame cost proportional to the
-/// visible area regardless of total node count.
-fn draw_navmesh_nodes(world: &World, camera: &Camera) {
+/// Render every tile-mesh centroid as a small white dot. Used to
+/// visually audit planning-substrate coverage — concave coastlines
+/// that lack a nearby centroid show up as bare patches where the A*
+/// search has nothing to lock onto. Off-screen culling keeps the
+/// per-frame cost proportional to the visible area regardless of
+/// total tile count.
+fn draw_tile_centroids(world: &World, camera: &Camera) {
     let sw = screen_width();
     let sh = screen_height();
     let radius = (camera.zoom() * 0.6).clamp(0.6, 2.0);
-    for node in &world.navmesh.nodes {
-        let p = camera.world_to_screen(node.pos);
+    for tile in &world.tile_mesh.tiles {
+        let p = camera.world_to_screen(tile.centroid);
         if p.x < 0.0 || p.y < 0.0 || p.x > sw || p.y > sh {
             continue;
         }
@@ -289,8 +290,8 @@ fn draw_ports(world: &World, camera: &Camera) {
 
 fn draw_ships(world: &World, camera: &Camera, selected_ship: Option<ShipId>) {
     // Planned-path overlay intentionally disabled: while debugging
-    // navmesh coverage we render every navmesh node as a white dot
-    // (see `draw_navmesh_nodes`) so the ship-by-ship yellow chains
+    // tile-mesh coverage we render every tile centroid as a white dot
+    // (see `draw_tile_centroids`) so the ship-by-ship yellow chains
     // would just clutter the view. Re-enable by drawing
     // `ship.nav.waypoints` here if you need per-ship route inspection.
     let _ = PATH_COLOR;
@@ -702,7 +703,7 @@ async fn main() {
         draw_land(&world, &camera);
         draw_coastline(&world, &camera);
         draw_wind_arrows(&world, &camera);
-        draw_navmesh_nodes(&world, &camera);
+        draw_tile_centroids(&world, &camera);
         draw_ports(&world, &camera);
         draw_ships(&world, &camera, selected_ship);
         draw_hud(&world, &camera, paused, ticks_per_frame);

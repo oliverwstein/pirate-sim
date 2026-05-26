@@ -18,9 +18,10 @@ fn main() {
         &world.weather.wind,
         &stats,
         0,
-        &world.navmesh,
+        &world.tile_mesh,
     )
-    .with_tile_mesh(&world.tile_mesh);
+    .with_port_routes(&world.port_routes)
+    .with_coastline_geom(&world.coastline_geom);
 
     let n = world.ports.len();
     println!(
