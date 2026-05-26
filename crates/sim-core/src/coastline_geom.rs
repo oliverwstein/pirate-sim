@@ -186,6 +186,51 @@ impl CoastlineGeom {
         !blocked
     }
 
+    /// True iff the rectangular corridor of half-width `margin_nm`
+    /// centered on the segment `a → b` does not cross any land. Three
+    /// parallel polygon-LOS rays (center plus ±perpendicular offsets)
+    /// — exact for any land polygon whose footprint reaches at least
+    /// one of the three rays, which covers every coastline feature in
+    /// the bundled mesh at the planner's 2 NM margin. Falls back to
+    /// the raster `LandMap::corridor_is_clear` when no polylines are
+    /// loaded (test fixtures, etc.).
+    pub fn corridor_is_clear(
+        &self,
+        land: &LandMap,
+        a: Position,
+        b: Position,
+        margin_nm: f32,
+    ) -> bool {
+        if !self.has_polylines {
+            return land.corridor_is_clear(a, b, margin_nm);
+        }
+        if !self.line_is_clear(land, a, b) {
+            return false;
+        }
+        if margin_nm <= 0.0 {
+            return true;
+        }
+        let delta = b - a;
+        let dist = delta.length();
+        if dist <= 0.0 {
+            // Degenerate segment: probe a small disc around the point.
+            for off in [
+                Position::new(margin_nm, 0.0),
+                Position::new(-margin_nm, 0.0),
+                Position::new(0.0, margin_nm),
+                Position::new(0.0, -margin_nm),
+            ] {
+                if self.is_land(land, a + off) {
+                    return false;
+                }
+            }
+            return true;
+        }
+        let dir = delta / dist;
+        let perp = Position::new(-dir.y, dir.x) * margin_nm;
+        self.line_is_clear(land, a + perp, b + perp) && self.line_is_clear(land, a - perp, b - perp)
+    }
+
     /// If the segment `a → b` crosses land, return the polygon-precise
     /// hit point closest to `a`. Returns `None` if the segment is
     /// entirely clear (i.e. `line_is_clear(a, b) == true`).

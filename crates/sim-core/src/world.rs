@@ -660,9 +660,9 @@ impl World {
             pathfind_stats,
             month,
             &self.tile_mesh,
+            &self.coastline_geom,
         )
-        .with_port_routes(&self.port_routes)
-        .with_coastline_geom(&self.coastline_geom);
+        .with_port_routes(&self.port_routes);
 
         // Rebuild the spatial index over Sailing ships before any AI
         // decisions are made this tick. Cheap (single pass, BTreeMap

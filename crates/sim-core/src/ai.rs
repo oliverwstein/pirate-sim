@@ -851,9 +851,9 @@ impl<'a> ShipBtContext<'a> {
             }
         }
 
-        let terrain = self.pathfind.and_then(|c| {
-            c.coastline_geom
-                .map(|geom| crate::nav::NavTerrain { geom, land: c.land })
+        let terrain = self.pathfind.map(|c| crate::nav::NavTerrain {
+            geom: c.coastline_geom,
+            land: c.land,
         });
         let pos_estimate = self.estimated_position();
         let pos_truth = self.ship.position;

@@ -37,17 +37,14 @@ pub struct PathfindContext<'a> {
     pub month: u8,
     /// Portal-aware convex-tile mesh — the sole planning substrate.
     pub tile_mesh: &'a TileMesh,
+    /// Polygon-truth coastline geometry — the sole LOS oracle for the
+    /// planner. Also used downstream by the AI to construct a
+    /// `NavTerrain` for `compute_steering`'s reactive deflection.
+    pub coastline_geom: &'a CoastlineGeom,
     /// Optional per-port SSSP cache. When present, `find_path_to_harbor`
     /// uses it instead of running A* every call. Tests and small
     /// fixtures may pass `None` to skip the precomputation step.
     pub port_routes: Option<&'a PortRouteCache>,
-    /// Polygon-truth coastline geometry. Used downstream by the AI to
-    /// construct a `NavTerrain` for `compute_steering`'s reactive
-    /// deflection. The planner itself doesn't currently consult it (the
-    /// raster `LandMap` is still the corridor oracle inside
-    /// `tile_mesh_path`), but plumbing it through here keeps the AI's
-    /// terrain bundle in one place.
-    pub coastline_geom: Option<&'a CoastlineGeom>,
 }
 
 impl<'a> PathfindContext<'a> {
@@ -57,6 +54,7 @@ impl<'a> PathfindContext<'a> {
         stats: &'a ShipStats,
         month: u8,
         tile_mesh: &'a TileMesh,
+        coastline_geom: &'a CoastlineGeom,
     ) -> Self {
         Self {
             land,
@@ -64,21 +62,14 @@ impl<'a> PathfindContext<'a> {
             stats,
             month,
             tile_mesh,
+            coastline_geom,
             port_routes: None,
-            coastline_geom: None,
         }
     }
 
     /// Attach a [`PortRouteCache`] to enable cached harbor pathing.
     pub fn with_port_routes(mut self, cache: &'a PortRouteCache) -> Self {
         self.port_routes = Some(cache);
-        self
-    }
-
-    /// Attach a [`CoastlineGeom`] so the AI can build a `NavTerrain`
-    /// for reactive deflection.
-    pub fn with_coastline_geom(mut self, geom: &'a CoastlineGeom) -> Self {
-        self.coastline_geom = Some(geom);
         self
     }
 }
@@ -110,10 +101,20 @@ pub fn find_path(
     start: Position,
     goal: Position,
 ) -> Option<Vec<Position>> {
-    if ctx.land.corridor_is_clear(start, goal, SMOOTH_MARGIN_NM) {
+    if ctx
+        .coastline_geom
+        .corridor_is_clear(ctx.land, start, goal, SMOOTH_MARGIN_NM)
+    {
         return Some(vec![goal]);
     }
-    tile_mesh_path(ctx.land, ctx.tile_mesh, start, goal, None)
+    tile_mesh_path(
+        ctx.land,
+        ctx.coastline_geom,
+        ctx.tile_mesh,
+        start,
+        goal,
+        None,
+    )
 }
 
 /// Plan a path from `start` to any cell of `harbor`'s zone, ending at the
@@ -132,6 +133,7 @@ pub fn find_path_to_harbor(
 ) -> Option<Vec<Position>> {
     let land = ctx.land;
     let mesh = ctx.tile_mesh;
+    let geom = ctx.coastline_geom;
 
     // If we're already inside the harbor zone, no movement needed.
     if harbor.contains_pos(land, start) {
@@ -139,14 +141,14 @@ pub fn find_path_to_harbor(
     }
 
     // Line-of-sight to the harbor anchor.
-    if land.corridor_is_clear(start, harbor.anchor, SMOOTH_MARGIN_NM) {
+    if geom.corridor_is_clear(land, start, harbor.anchor, SMOOTH_MARGIN_NM) {
         return Some(vec![harbor.anchor]);
     }
 
     // Prefer the SSSP cache when available. Cache miss (port has no
     // entry or no reachable start) silently falls through to live A*.
     if let Some(cache) = ctx.port_routes {
-        if let Some(path) = tile_mesh_cached_path(land, mesh, cache, start, harbor) {
+        if let Some(path) = tile_mesh_cached_path(land, geom, mesh, cache, start, harbor) {
             return Some(path);
         }
     }
@@ -160,7 +162,7 @@ pub fn find_path_to_harbor(
     for e in &mesh.neighbors[anchor_tile as usize] {
         goal_tiles.push(e.to);
     }
-    tile_mesh_path(land, mesh, start, harbor.anchor, Some(&goal_tiles))
+    tile_mesh_path(land, geom, mesh, start, harbor.anchor, Some(&goal_tiles))
 }
 
 /// Cached harbor path: look up a precomputed tile-id route from the
@@ -169,6 +171,7 @@ pub fn find_path_to_harbor(
 /// cache miss so the caller can fall back to live A*.
 fn tile_mesh_cached_path(
     land: &LandMap,
+    geom: &CoastlineGeom,
     mesh: &TileMesh,
     cache: &PortRouteCache,
     start: Position,
@@ -185,7 +188,14 @@ fn tile_mesh_cached_path(
         .collect();
 
     let route = cache.route_from(&starts, harbor.port_index)?;
-    Some(stitch_tile_route(land, mesh, start, harbor.anchor, &route))
+    Some(stitch_tile_route(
+        land,
+        geom,
+        mesh,
+        start,
+        harbor.anchor,
+        &route,
+    ))
 }
 
 /// Plan a path through the [`TileMesh`] from `start` to `terminal`.
@@ -197,13 +207,14 @@ fn tile_mesh_cached_path(
 ///
 /// Pipeline: nearest-centroids → A* → shared-edge `(left, right)`
 /// reconstruction → SSFA → segment-LOS validation. On any SSFA segment
-/// that fails raster LOS (rare; only when the smoothed path tries to
+/// that fails polygon LOS (rare; only when the smoothed path tries to
 /// cut across a sliver outside the convex tile chain), we fall back to
 /// the raw centroid sequence, which is provably safe because each
 /// centroid lies inside a convex tile and each consecutive pair shares
 /// an edge.
 fn tile_mesh_path(
     land: &LandMap,
+    geom: &CoastlineGeom,
     mesh: &TileMesh,
     start: Position,
     terminal: Position,
@@ -236,7 +247,7 @@ fn tile_mesh_path(
     };
 
     let route = mesh.route(&starts, goals)?;
-    Some(stitch_tile_route(land, mesh, start, terminal, &route))
+    Some(stitch_tile_route(land, geom, mesh, start, terminal, &route))
 }
 
 /// Stitch a tile-id `route` into a polyline of waypoints from `start`
@@ -254,6 +265,7 @@ fn tile_mesh_path(
 /// streams given identical tile routes.
 fn stitch_tile_route(
     land: &LandMap,
+    geom: &CoastlineGeom,
     mesh: &TileMesh,
     start: Position,
     terminal: Position,
@@ -270,11 +282,11 @@ fn stitch_tile_route(
 
     let smoothed = tile_mesh::funnel(start, terminal, &portals);
 
-    // Validate every smoothed segment against the raster. Any failure
-    // → fall back to the centroid chain (guaranteed safe).
+    // Validate every smoothed segment against polygon truth. Any
+    // failure → fall back to the centroid chain (guaranteed safe).
     let mut prev = start;
     for &p in &smoothed {
-        if !land.corridor_is_clear(prev, p, SMOOTH_MARGIN_NM) {
+        if !geom.corridor_is_clear(land, prev, p, SMOOTH_MARGIN_NM) {
             return centroid_chain_with_terminal(mesh, route, terminal);
         }
         prev = p;
@@ -335,8 +347,9 @@ mod tests {
         let land = open_sea_land(20, 20);
         let wind = flat_wind_grid(20, 20, land.origin, land.cell_size_nm);
         let mesh = empty_tile_mesh();
+        let geom = CoastlineGeom::empty(&land);
         let stats = ShipStats::sloop();
-        let ctx = PathfindContext::new(&land, &wind, &stats, 0, &mesh);
+        let ctx = PathfindContext::new(&land, &wind, &stats, 0, &mesh, &geom);
 
         let start = Position::new(20.0, 20.0);
         let goal = Position::new(180.0, 180.0);

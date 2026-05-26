@@ -19,9 +19,9 @@ fn main() {
         &stats,
         0,
         &world.tile_mesh,
+        &world.coastline_geom,
     )
-    .with_port_routes(&world.port_routes)
-    .with_coastline_geom(&world.coastline_geom);
+    .with_port_routes(&world.port_routes);
 
     let n = world.ports.len();
     println!(

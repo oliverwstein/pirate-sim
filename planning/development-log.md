@@ -2903,3 +2903,50 @@ checks). No further legacy-navmesh code remains in the workspace.
 **Note (pre-existing).** `cargo clippy --examples` flags
 `unusual_byte_groupings` in `examples/diag_polygon_los.rs` —
 committed in Phase E, unrelated to this cleanup.
+
+---
+
+## 2025 — pathfind: polygon-truth corridor LOS
+
+**Context.** After Phase G the only consumers of
+`LandMap::corridor_is_clear` inside the planner were the three
+LOS checks: `find_path`'s start-to-goal short-circuit,
+`find_path_to_harbor`'s start-to-anchor short-circuit, and
+`stitch_tile_route`'s per-segment SSFA validation. Raster LOS
+over-rejects narrow channels (it rounds land outward by half a
+cell at the 1 NM grid), forcing detours through tile-mesh A*
+where a polygon-truth check would just take the direct line.
+
+**Change.** Added `CoastlineGeom::corridor_is_clear(land, a, b,
+margin_nm)`: three parallel polygon-LOS rays (center + ±perp
+offsets at `margin_nm`). Exact for any land polygon whose
+footprint reaches at least one of the three rays — which covers
+every coastline feature in the bundled mesh at the planner's
+2 NM margin. Falls back to `LandMap::corridor_is_clear` when no
+polylines are loaded (test fixtures).
+
+`PathfindContext::coastline_geom` is now a required `&'a
+CoastlineGeom` (dropped the `Option` and `.with_coastline_geom()`
+builder — mirrors how Phase G made `tile_mesh` required). All
+three callsites swapped from `land.corridor_is_clear(…)` to
+`geom.corridor_is_clear(land, …)`. `tile_mesh_cached_path`,
+`tile_mesh_path`, and `stitch_tile_route` now take an extra
+`geom: &CoastlineGeom` argument. `ai.rs` simplifies its
+`NavTerrain` materialisation: was `and_then(|c| c.coastline_geom
+.map(…))`, now `map(|c| NavTerrain { geom: c.coastline_geom, …
+})`.
+
+**Validation.** 237 tests pass, clippy `--workspace --tests`
+clean. `bench_pathfind`: 1406/1406 ok, avg 0.02 ms, max **0.31 ms**
+(vs 0.15 ms in Phase G — the per-segment polygon LOS does
+slightly more work than raster LOS for routes that traverse many
+tiles, but it now validates against the exact coastline instead
+of the rasterized one). `bench_trade 60 days × 503 ships`: 23 in
+the red — identical to Phase G, no behavioral regression.
+
+**Status.** `LandMap::corridor_is_clear` is no longer called by
+movement-side code, but stays available as the polygon-free
+fallback inside `CoastlineGeom::corridor_is_clear`. The raster is
+still used by `CoastlineGeom`'s bilevel queries (open-water
+fast-path inside `line_is_clear` / `first_land_hit`) and by
+non-movement callers.
