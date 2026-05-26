@@ -334,6 +334,153 @@ impl TileMesh {
             }
         })
     }
+
+    /// The two shared-edge endpoints between adjacent tiles `a` and `b`,
+    /// returned as `(left, right)` from the perspective of someone
+    /// **standing in tile `a` looking into tile `b`**. "Left" is the
+    /// endpoint that lies on the port (left) side of the directed
+    /// `centroid_a → centroid_b` ray; "right" is on the starboard side.
+    ///
+    /// Returns `None` if the tiles aren't adjacent or don't share two
+    /// vertices within the merge tolerance (which would indicate a
+    /// malformed mesh).
+    ///
+    /// Used by the SSFA funnel pass in `pathfind` to smooth the
+    /// centroid chain into a near-shortest polyline.
+    pub fn shared_edge(&self, a: u32, b: u32) -> Option<(Position, Position)> {
+        let ta = self.tiles.get(a as usize)?;
+        let tb = self.tiles.get(b as usize)?;
+        // Tiles share an edge iff two of `ta.vertices` appear in
+        // `tb.vertices` within ε. The preprocessor emits vertex
+        // coordinates rounded to f32 at the same precision in both
+        // tiles, so an exact match works for the bundled mesh; a
+        // small ε keeps us safe against any future preprocessor
+        // changes that introduce sub-NM jitter.
+        const EPS_NM: f32 = 0.05;
+        let near = |p: Position, q: Position| -> bool {
+            (p.x - q.x).abs() <= EPS_NM && (p.y - q.y).abs() <= EPS_NM
+        };
+
+        let mut shared: [Option<Position>; 2] = [None, None];
+        let mut n = 0usize;
+        for &va in &ta.vertices {
+            if tb.vertices.iter().any(|&vb| near(va, vb)) {
+                if n < 2 {
+                    shared[n] = Some(va);
+                }
+                n += 1;
+            }
+        }
+        if n != 2 {
+            return None;
+        }
+        let p0 = shared[0]?;
+        let p1 = shared[1]?;
+
+        // Orient (p0, p1) so that p0 is on the **left** of the
+        // directed ray `centroid_a → centroid_b`. The 2D cross
+        // product `(b - a) × (p - a)` is positive when `p` is on the
+        // left, negative on the right.
+        let ca = ta.centroid;
+        let cb = tb.centroid;
+        let dx = cb.x - ca.x;
+        let dy = cb.y - ca.y;
+        let cross_p0 = dx * (p0.y - ca.y) - dy * (p0.x - ca.x);
+        if cross_p0 >= 0.0 {
+            Some((p0, p1))
+        } else {
+            Some((p1, p0))
+        }
+    }
+}
+
+/// Simple Stupid Funnel Algorithm.
+///
+/// Given a `start` point, an `end` point, and a chain of `(left, right)`
+/// portal endpoints between them — each pair oriented so `left` lies
+/// on the left of the directed corridor — returns a near-shortest
+/// polyline through the corridor as a sequence of waypoints **not
+/// including `start`** (the caller already knows where the ship is)
+/// but **including `end`** (so the caller can re-anchor to a precise
+/// target like a harbor anchor).
+///
+/// The corridor is sealed by treating `end` as the final `(left, right)`
+/// pair `(end, end)` — a degenerate portal at the goal. This lets the
+/// algorithm terminate cleanly without special-casing the last segment.
+///
+/// Empty `portals` (no shared edges; `start` and `end` are inside the
+/// same tile) → `vec![end]`.
+pub fn funnel(start: Position, end: Position, portals: &[(Position, Position)]) -> Vec<Position> {
+    // Seal the corridor with a degenerate final portal at `end`.
+    let mut seq: Vec<(Position, Position)> = Vec::with_capacity(portals.len() + 1);
+    seq.extend_from_slice(portals);
+    seq.push((end, end));
+
+    let mut out: Vec<Position> = Vec::with_capacity(seq.len());
+    let mut apex = start;
+    let mut left = start;
+    let mut right = start;
+    let mut left_idx: usize = 0;
+    let mut right_idx: usize = 0;
+
+    let mut i = 0;
+    while i < seq.len() {
+        let (l, r) = seq[i];
+
+        // Right side: tighten when the new right point is on the
+        // **left** (or on) the current right ray — i.e. it shrinks
+        // the funnel from the right. Mononen's reference convention.
+        if triangle_area2(apex, right, r) >= 0.0 {
+            if apex == right || triangle_area2(apex, left, r) < 0.0 {
+                right = r;
+                right_idx = i;
+            } else {
+                // Right crossed over left: emit left as new apex.
+                out.push(left);
+                apex = left;
+                right = apex;
+                left = apex;
+                i = left_idx + 1;
+                left_idx = i;
+                right_idx = i;
+                continue;
+            }
+        }
+
+        // Left side: tighten when the new left point is on the
+        // **right** (or on) the current left ray — i.e. it shrinks
+        // the funnel from the left.
+        if triangle_area2(apex, left, l) <= 0.0 {
+            if apex == left || triangle_area2(apex, right, l) > 0.0 {
+                left = l;
+                left_idx = i;
+            } else {
+                // Left crossed over right: emit right as new apex.
+                out.push(right);
+                apex = right;
+                left = apex;
+                right = apex;
+                i = right_idx + 1;
+                left_idx = i;
+                right_idx = i;
+                continue;
+            }
+        }
+        i += 1;
+    }
+
+    // Final segment from the last emitted apex to `end`.
+    if out.last() != Some(&end) {
+        out.push(end);
+    }
+    out
+}
+
+/// Signed 2× area of triangle `(a, b, c)`. Positive when `c` is on the
+/// left of the directed segment `a → b`, negative when on the right,
+/// zero when collinear.
+fn triangle_area2(a: Position, b: Position, c: Position) -> f32 {
+    (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x)
 }
 
 fn pos_to_bucket(pos: Position, bucket_nm: f32) -> (i32, i32) {
@@ -554,6 +701,66 @@ mod tests {
         let p = m.portal_between(0, 1).expect("adjacent");
         assert_eq!(p, Position::new(10.0, 5.0));
         assert!(m.portal_between(0, 2).is_none(), "not adjacent");
+    }
+
+    #[test]
+    fn shared_edge_orients_left_right_by_ray() {
+        // Tiles 0 and 1 share the vertical edge at x=10, from (10,0) to
+        // (10,10). Looking from T0 (centroid 5,5) into T1 (centroid
+        // 15,5), the ray points +x; "left" is +y, "right" is -y. So
+        // left = (10,10), right = (10,0).
+        let m = linear_three_tile_mesh();
+        let (l, r) = m.shared_edge(0, 1).expect("adjacent");
+        assert_eq!(l, Position::new(10.0, 10.0));
+        assert_eq!(r, Position::new(10.0, 0.0));
+        // Reverse direction flips left/right.
+        let (l, r) = m.shared_edge(1, 0).expect("adjacent");
+        assert_eq!(l, Position::new(10.0, 0.0));
+        assert_eq!(r, Position::new(10.0, 10.0));
+    }
+
+    #[test]
+    fn shared_edge_none_for_non_adjacent() {
+        let m = linear_three_tile_mesh();
+        assert!(m.shared_edge(0, 2).is_none());
+    }
+
+    #[test]
+    fn funnel_no_portals_is_direct_to_end() {
+        let out = funnel(Position::new(0.0, 0.0), Position::new(10.0, 0.0), &[]);
+        assert_eq!(out, vec![Position::new(10.0, 0.0)]);
+    }
+
+    #[test]
+    fn funnel_straight_corridor_passes_through() {
+        // Three-tile straight corridor as in `linear_three_tile_mesh`.
+        // Start at (2,5) in T0, end at (28,5) in T2. The corridor is
+        // open all the way, so the smoothed path is a single segment
+        // straight to the end.
+        let portals = vec![
+            (Position::new(10.0, 10.0), Position::new(10.0, 0.0)),
+            (Position::new(20.0, 10.0), Position::new(20.0, 0.0)),
+        ];
+        let out = funnel(Position::new(2.0, 5.0), Position::new(28.0, 5.0), &portals);
+        assert_eq!(out, vec![Position::new(28.0, 5.0)]);
+    }
+
+    #[test]
+    fn funnel_bend_emits_apex_at_inside_corner() {
+        // Two-portal L-shape: corridor goes east, then turns north.
+        // Start (0,5), goes through portal1 at edge x=10 (right corner
+        // (10,0), left corner (10,10)), then portal2 at edge y=10
+        // through a north tile with corners (10,10) and (20,10).
+        // End at (15,20). The inside corner is (10,10); funnel should
+        // emit it as a waypoint.
+        let portals = vec![
+            (Position::new(10.0, 10.0), Position::new(10.0, 0.0)),
+            (Position::new(20.0, 10.0), Position::new(10.0, 10.0)),
+        ];
+        let out = funnel(Position::new(0.0, 5.0), Position::new(15.0, 20.0), &portals);
+        // Expect the inside-corner waypoint then the end.
+        assert!(out.contains(&Position::new(10.0, 10.0)));
+        assert_eq!(*out.last().unwrap(), Position::new(15.0, 20.0));
     }
 
     #[test]

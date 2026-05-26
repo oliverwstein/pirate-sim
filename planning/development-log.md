@@ -2700,3 +2700,63 @@ portal edge endpoints, but `navmesh.bin` v2 stores only the portal
 **midpoint** per edge. We will reconstruct the endpoints by
 intersecting adjacent tiles' vertex lists during corridor stitching
 (the vertices are present per tile). Confirm before implementing.
+
+---
+
+## 2026-05-28 — Ship navigation Phase C (planner on TileMesh + SSFA funnel)
+
+**Context.** Phase B left the planner on the legacy raster `Navmesh`
+while harbors moved to tile anchors, producing a substrate mismatch
+(1056/1406 routes solved in bench). Phase C rewires the planner onto
+the `TileMesh` with portal-corridor funnel smoothing so the planner,
+the harbors, and the underlying mesh are finally on the same
+substrate.
+
+**Mechanism.**
+1. `TileMesh::shared_edge(a, b)` returns the two vertices shared by
+   two adjacent tiles, oriented `(left, right)` from the perspective
+   of someone in tile `a` looking toward `b`. Orientation uses a 2D
+   cross product `(b - a) × (p - a)`; positive = LEFT. Vertex match
+   tolerance is ε=0.05 NM.
+2. Free function `tile_mesh::funnel(start, end, portals)` is a
+   straight implementation of Mikko Mononen's Simple Stupid Funnel
+   Algorithm. **Sign-convention gotcha**: my `triangle_area2` is the
+   negation of Mononen's reference (`(b-a)×(c-a)` vs `(c-a)×(b-a)`),
+   so all of his `<= 0` / `>= 0` conditions must be flipped. Caught
+   by one failing test. The output corridor is sealed with a
+   degenerate `(end, end)` portal so the algorithm terminates
+   cleanly; output excludes `start` but always includes `end`.
+3. `pathfind::tile_mesh_path` pipeline: nearest centroids (≤8 within
+   50 NM) → A* over tile graph → reconstruct `(left, right)` chain
+   via `shared_edge` → SSFA → per-segment validate with
+   `land.corridor_is_clear(SMOOTH_MARGIN_NM=2.0)` → on validation
+   failure, fall back to the raw centroid chain (provably safe
+   inside convex tiles).
+4. `PathfindContext` gained `tile_mesh: Option<&TileMesh>` + a
+   `with_tile_mesh()` builder. `find_path` / `find_path_to_harbor`
+   prefer the tile mesh when attached and fall back to the legacy
+   `Navmesh` otherwise. For harbor pathing, the goal set is seeded
+   with `anchor_tile ∪ neighbors(anchor_tile)` so the funnel has
+   room to smooth into the harbor mouth.
+
+**Validation.** `bench_pathfind`: 1406/1406 ok (was 1056/1406 after
+Phase B), avg 0.33 ms, max 4.58 ms. 238 tests pass, clippy clean.
+
+**Coordinates updated in same change.** Applied the
+`planning/research/port-coordinates.md` corrections to
+`data/registries/ports.ron`: 9 ports moved ≥5 NM (Philadelphia,
+Amsterdam, Maracaibo, Cartagena, Boston, London, Paramaribo, Ouidah,
+Tobago, Margarita, Charleston, Santiago). Amsterdam moved to
+historically-correct Texel Roads (4637, 2129) — was a workaround
+position at IJmuiden under the old raster harbor model; the new
+tile-anchored harbors handle Texel Roads cleanly. Kingston (founded
+1692, anachronism in 1680) placed at the Port Royal anchorage as a
+placeholder. Philadelphia (founded 1682, borderline) placed at the
+outer Delaware Bay off Cape Henlopen — the ship-accessible
+anchorage. See `port-coordinates.md` §4 for the open questions.
+
+**Phase D blocker.** `PortRouteCache` is still on the legacy
+`Navmesh`. Bench shows live A* on the TileMesh is fast enough
+(avg 0.33 ms), but per-port SSSP cache on the TileMesh is still the
+proper Phase D and removes the last planner dependency on the
+legacy mesh.

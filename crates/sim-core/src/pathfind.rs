@@ -1,16 +1,28 @@
 //! Navmesh-based ship path planning.
 //!
-//! All routing on the real world map goes through the [`Navmesh`] graph
-//! built once at world load (`World::load`). This module is a thin shim:
+//! **Phase C migration in progress.** Production callers now use the
+//! [`TileMesh`] portal-aware convex-tile mesh (loaded from
+//! `data/grids/navmesh.bin`) plus a Simple Stupid Funnel pass through
+//! the corridor of shared edges. The legacy raster-derived [`Navmesh`]
+//! is still loaded and retained on [`PathfindContext`] for tests and
+//! as a backstop, but [`find_path`] and [`find_path_to_harbor`] no
+//! longer consult it when a tile mesh is attached.
 //!
-//! 1. Trivial line-of-sight check from start to goal — if the corridor is
-//!    clear, return a single waypoint.
-//! 2. Otherwise, find visible mesh entry/exit nodes (via fine-grid
-//!    line-of-sight) from start and goal, run A* on the graph, and stitch
-//!    the result into a smoothed waypoint list.
+//! Pipeline:
 //!
-//! Build time of the mesh is ~250 ms; per-route planning is sub-millisecond
-//! (avg ~0.4 ms across all ordered port pairs in the bench).
+//! 1. Trivial line-of-sight check from start to goal — if the raster
+//!    corridor is clear, return a single waypoint. (Phase E replaces
+//!    raster LOS with polygon-truth `coastline_geom`.)
+//! 2. Locate nearest tile-mesh centroids around start and goal.
+//! 3. A* on tile centroids → tile-id sequence.
+//! 4. Reconstruct `(left, right)` shared-edge endpoints between
+//!    consecutive tiles via [`TileMesh::shared_edge`].
+//! 5. Run SSFA over the (left, right) chain → smoothed waypoint
+//!    polyline.
+//! 6. Validate each output segment with raster corridor LOS; on any
+//!    failure, fall back to the unsmoothed centroid sequence
+//!    (guaranteed safe because each centroid lies inside a convex
+//!    tile).
 
 use std::collections::HashSet;
 
@@ -19,6 +31,7 @@ use crate::map::land::LandMap;
 use crate::navmesh::Navmesh;
 use crate::portroutes::PortRouteCache;
 use crate::ship::ShipStats;
+use crate::tile_mesh::{self, TileMesh};
 use crate::types::Position;
 use crate::weather::wind::WindGrid;
 
@@ -29,6 +42,10 @@ pub struct PathfindContext<'a> {
     pub stats: &'a ShipStats,
     pub month: u8,
     pub navmesh: &'a Navmesh,
+    /// Phase C: portal-aware convex-tile mesh. When `Some`, the planner
+    /// uses it; when `None` (tests that haven't yet been migrated) it
+    /// falls back to the legacy [`Navmesh`] path.
+    pub tile_mesh: Option<&'a TileMesh>,
     /// Optional per-port SSSP cache. When present, `find_path_to_harbor`
     /// uses it instead of running A* every call. Tests and small
     /// fixtures may pass `None` to skip the precomputation step.
@@ -49,6 +66,7 @@ impl<'a> PathfindContext<'a> {
             stats,
             month,
             navmesh,
+            tile_mesh: None,
             port_routes: None,
         }
     }
@@ -56,6 +74,12 @@ impl<'a> PathfindContext<'a> {
     /// Attach a [`PortRouteCache`] to enable cached harbor pathing.
     pub fn with_port_routes(mut self, cache: &'a PortRouteCache) -> Self {
         self.port_routes = Some(cache);
+        self
+    }
+
+    /// Attach a [`TileMesh`] to enable Phase C tile-based planning.
+    pub fn with_tile_mesh(mut self, tile_mesh: &'a TileMesh) -> Self {
+        self.tile_mesh = Some(tile_mesh);
         self
     }
 }
@@ -80,6 +104,17 @@ const ENTRY_CANDIDATES: usize = 16;
 /// reject every candidate.
 const ENTRY_MARGIN_NM: f32 = 0.0;
 
+/// Search radius (NM) for finding the tile-mesh entry tiles from a
+/// non-mesh start/goal point. Smaller than the legacy `ENTRY_RADIUS_NM`
+/// because tile centroids are denser (~43k tiles vs ~thousands of
+/// navmesh nodes) and we only need a handful of nearby candidates.
+const TILE_ENTRY_RADIUS_NM: f32 = 50.0;
+
+/// Hard cap on tile-entry candidates the planner considers. Pure-A*
+/// over the centroid graph is cheap, so this exists only to bound
+/// extreme cases.
+const TILE_ENTRY_MAX: usize = 8;
+
 /// Find a navigable path of waypoints from `start` to a goal *point*. The
 /// returned list does NOT include `start` but ends at `goal`. Returns
 /// `None` if no path can be found.
@@ -94,6 +129,11 @@ pub fn find_path(
 ) -> Option<Vec<Position>> {
     if ctx.land.corridor_is_clear(start, goal, SMOOTH_MARGIN_NM) {
         return Some(vec![goal]);
+    }
+    if let Some(mesh) = ctx.tile_mesh {
+        if let Some(path) = tile_mesh_path(ctx.land, mesh, start, goal, None) {
+            return Some(path);
+        }
     }
     navmesh_path(ctx.land, ctx.navmesh, start, &[goal], goal)
 }
@@ -122,6 +162,23 @@ pub fn find_path_to_harbor(
     // Line-of-sight to the harbor anchor.
     if land.corridor_is_clear(start, harbor.anchor, SMOOTH_MARGIN_NM) {
         return Some(vec![harbor.anchor]);
+    }
+
+    // Phase C: prefer the tile mesh when attached. We seed the goal
+    // tile set with the anchor tile and its immediate neighbours so the
+    // funnel has room to smooth into the harbor's mouth.
+    if let Some(mesh) = ctx.tile_mesh {
+        if let Some(anchor_tile) = harbor.anchor_tile {
+            let mut goal_tiles: Vec<u32> = Vec::with_capacity(8);
+            goal_tiles.push(anchor_tile);
+            for e in &mesh.neighbors[anchor_tile as usize] {
+                goal_tiles.push(e.to);
+            }
+            if let Some(path) = tile_mesh_path(land, mesh, start, harbor.anchor, Some(&goal_tiles))
+            {
+                return Some(path);
+            }
+        }
     }
 
     if let Some(cache) = ctx.port_routes {
@@ -214,6 +271,100 @@ fn navmesh_path(
 
     let smoothed = smooth_boundaries(land, &points);
     Some(smoothed.into_iter().skip(1).collect())
+}
+
+/// Plan a path through the [`TileMesh`] from `start` to `terminal`.
+///
+/// If `goal_tiles` is `Some`, those tiles are the goal set for A*; the
+/// terminal is appended to the smoothed polyline so harbor anchors and
+/// rendezvous points are hit exactly. If `goal_tiles` is `None`, the
+/// nearest centroids to `terminal` are used (general point-to-point).
+///
+/// Pipeline: nearest-centroids → A* → shared-edge `(left, right)`
+/// reconstruction → SSFA → segment-LOS validation. On any SSFA segment
+/// that fails raster LOS (rare; only when the smoothed path tries to
+/// cut across a sliver outside the convex tile chain), we fall back to
+/// the raw centroid sequence, which is provably safe because each
+/// centroid lies inside a convex tile and each consecutive pair shares
+/// an edge.
+fn tile_mesh_path(
+    land: &LandMap,
+    mesh: &TileMesh,
+    start: Position,
+    terminal: Position,
+    goal_tiles: Option<&[u32]>,
+) -> Option<Vec<Position>> {
+    let start_candidates = mesh.nearest_centroids(start, TILE_ENTRY_RADIUS_NM);
+    if start_candidates.is_empty() {
+        return None;
+    }
+    let starts: Vec<u32> = start_candidates
+        .iter()
+        .take(TILE_ENTRY_MAX)
+        .map(|&(i, _)| i)
+        .collect();
+
+    let owned_goals: Vec<u32>;
+    let goals: &[u32] = if let Some(g) = goal_tiles {
+        g
+    } else {
+        let goal_candidates = mesh.nearest_centroids(terminal, TILE_ENTRY_RADIUS_NM);
+        if goal_candidates.is_empty() {
+            return None;
+        }
+        owned_goals = goal_candidates
+            .iter()
+            .take(TILE_ENTRY_MAX)
+            .map(|&(i, _)| i)
+            .collect();
+        &owned_goals
+    };
+
+    let route = mesh.route(&starts, goals)?;
+
+    // Build (left, right) portal chain from consecutive tile pairs.
+    let mut portals: Vec<(Position, Position)> = Vec::with_capacity(route.len().saturating_sub(1));
+    for w in route.windows(2) {
+        let Some((l, r)) = mesh.shared_edge(w[0], w[1]) else {
+            // Should not happen on the bundled mesh, but guard anyway.
+            return Some(centroid_chain_with_terminal(mesh, &route, terminal));
+        };
+        portals.push((l, r));
+    }
+
+    let smoothed = tile_mesh::funnel(start, terminal, &portals);
+
+    // Validate every smoothed segment against the raster. Any failure
+    // → fall back to the centroid chain (guaranteed safe).
+    let mut prev = start;
+    for &p in &smoothed {
+        if !land.corridor_is_clear(prev, p, SMOOTH_MARGIN_NM) {
+            return Some(centroid_chain_with_terminal(mesh, &route, terminal));
+        }
+        prev = p;
+    }
+    Some(smoothed)
+}
+
+/// Fallback: emit centroids in route order, then the terminal. Each
+/// consecutive pair of centroids is provably inside `tile_a ∪ tile_b`
+/// (both convex), so no segment can cross land. The terminal is
+/// appended unconditionally; callers must ensure it's reachable
+/// from the final centroid (true for harbor anchors by construction,
+/// since the anchor *is* a tile centroid).
+fn centroid_chain_with_terminal(
+    mesh: &TileMesh,
+    route: &[u32],
+    terminal: Position,
+) -> Vec<Position> {
+    let mut out: Vec<Position> = Vec::with_capacity(route.len() + 1);
+    for &t in route {
+        out.push(mesh.tiles[t as usize].centroid);
+    }
+    if out.last() != Some(&terminal) {
+        out.push(terminal);
+    }
+    out
 }
 
 /// Corridor-aware line-of-sight smoothing restricted to the two boundary

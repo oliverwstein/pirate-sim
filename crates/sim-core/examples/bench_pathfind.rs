@@ -19,7 +19,8 @@ fn main() {
         &stats,
         0,
         &world.navmesh,
-    );
+    )
+    .with_tile_mesh(&world.tile_mesh);
 
     let n = world.ports.len();
     println!(

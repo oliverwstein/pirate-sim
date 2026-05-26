@@ -657,7 +657,8 @@ impl World {
             month,
             &self.navmesh,
         )
-        .with_port_routes(&self.port_routes);
+        .with_port_routes(&self.port_routes)
+        .with_tile_mesh(&self.tile_mesh);
 
         // Rebuild the spatial index over Sailing ships before any AI
         // decisions are made this tick. Cheap (single pass, BTreeMap
