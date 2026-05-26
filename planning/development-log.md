@@ -2360,3 +2360,78 @@ non-zero shadow-price count + total surplus.
 **Validation:** 222 tests pass. bench_trade P/L 773710 → 915590
 (recovers and exceeds the B.3 baseline of 913342, consistent with
 the LP seed eliminating the startup transient).
+
+---
+
+## Coastal navigation overhaul — design agreed
+
+**Context:** Ships were repeatedly observed wedged in concave coastline
+in the visualizer. Iterated through several local fixes (`visible_from`
+nearest-node fallback, `deflect_for_land` navmesh-oracle escape,
+goal-aligned escape selection, deeper LOS probe) — none materially
+reduced the problem. Added per-voyage telemetry to quantify it
+(`World::nav_diag`, `bench_trade` reports incidents); 2-year run flagged
+256 stuck-or-slow voyages with worst-case stuck-runs of 742 hours
+(31 sim-days frozen against the coast). Added a coverage diagnostic
+(`diag_mesh_coverage`) that revealed ~580 sea cells (stride-4 sample)
+have *zero* LOS-clear navmesh nodes within 200 NM — concave bays whose
+walls block visibility to the nearby waypoints.
+
+**Root cause (architectural, not a steering bug):** the simulator uses a
+1 NM raster `LandMap` as the single substrate for both ship/land
+collision and waypoint-mesh construction. The polygon coastline (used
+for rendering) is smooth, but rasterizing it at 1 NM produces stairstep
+artifacts the ship "sees" as obstacles the player cannot see. Worse,
+the channel-pass waypoints sit in those same staircase-affected cells,
+so concave bays end up with waypoints that no interior point can
+reach via LOS.
+
+**Decision: full nav overhaul, polygon-based collision + waypoint mesh.**
+Land truth migrates from `LandMap` raster to `LandMesh` polygon mesh.
+Steering tweaks are abandoned as load-bearing fixes; the goal is to
+make the substrate match what the player sees.
+
+**Bilevel query design (`coastline_geom` module):**
+- `is_land(pos)`: if raster says sea → return sea (free); if raster
+  says land → consult polygon mesh (point-in-polygon). Full polygon
+  resolution only at coastal cells where staircasing matters.
+- `line_is_clear(a, b)`: walk raster cells along the segment; if all
+  sea → clear (open-water fast path); else spatial-indexed polygon
+  edge intersection over the touching span only.
+- `first_land_hit(a, b)`: same bilevel pattern; replaces the raster
+  `farthest_clear_point` that currently triggers the speed=0 halt.
+- Spatial index over coastline edges: uniform grid (10 NM cells).
+  Chosen over BVH/quadtree for determinism + simplicity.
+
+**Waypoint mesh, polygon-derived:**
+- Coastal ring: sample points along the offshore-offset polyline of
+  each coastline polygon, with offset distance matched to harbor-zone
+  extent so the ring naturally terminates at harbor entries.
+- Open-water grid (~25 NM stride) retained for long-haul efficiency.
+- Edges validated with the new polygon-aware `line_is_clear`.
+
+**What stays raster:** wind/weather sampling, and the raster acts as
+the coarse positive filter in the bilevel land queries. Unit-test
+worlds that build a tiny `LandMap` get a no-op polygon set
+(`coastline_geom` falls through to raster-only when polygons are
+empty), so tests don't need polygon scaffolding.
+
+**Migration plan (5 phases, each independently committable):**
+1. Polygon LOS primitive + bench (`coastline_geom`,
+   `diag_polygon_los`). No production callers yet.
+2. Polygon-aware waypoint mesh (`Navmesh::build_from_polygons`).
+   Validate via `diag_mesh_coverage` (dead-pocket count → ~0) and
+   `bench_pathfind` (all 1406 routes still found).
+3. Thread the new substrate through `PathfindContext`,
+   `compute_steering`, `deflect_for_land`, and the `world.rs` motion
+   sweep. Old raster paths remain callable.
+4. Validate: tests, `bench_trade -- 730` incident count ≤ 10
+   (from 256), no observable stuck ships in viz.
+5. Cleanup: remove `visible_from` LOS-blocked fallback, the speed=0
+   forced halt, and unused raster LOS callers.
+
+**WIP stashed:** `stash@{0}` contains the telemetry +
+`diag_mesh_coverage` + steering tweaks. The telemetry and diag tools
+are worth cherry-picking when ready; the steering tweaks become
+unnecessary once Phase 3 lands.
+
