@@ -164,9 +164,18 @@ pub fn find_path_to_harbor(
         return Some(vec![harbor.anchor]);
     }
 
-    // Phase C: prefer the tile mesh when attached. We seed the goal
-    // tile set with the anchor tile and its immediate neighbours so the
-    // funnel has room to smooth into the harbor's mouth.
+    // Phase D: prefer the SSSP cache when both the tile mesh and the
+    // cache are attached. Cache miss (port has no entry or no reachable
+    // start) silently falls through to live A* via `tile_mesh_path`.
+    if let (Some(mesh), Some(cache)) = (ctx.tile_mesh, ctx.port_routes) {
+        if let Some(path) = tile_mesh_cached_path(land, mesh, cache, start, harbor) {
+            return Some(path);
+        }
+    }
+
+    // Phase C: live A* on the tile mesh. Seed the goal tile set with
+    // the anchor tile and its immediate neighbours so the funnel has
+    // room to smooth into the harbor's mouth.
     if let Some(mesh) = ctx.tile_mesh {
         if let Some(anchor_tile) = harbor.anchor_tile {
             let mut goal_tiles: Vec<u32> = Vec::with_capacity(8);
@@ -181,48 +190,32 @@ pub fn find_path_to_harbor(
         }
     }
 
-    if let Some(cache) = ctx.port_routes {
-        if let Some(path) = navmesh_path_cached(land, ctx.navmesh, cache, start, harbor) {
-            return Some(path);
-        }
-    }
-
     navmesh_path(land, ctx.navmesh, start, &[harbor.anchor], harbor.anchor)
 }
 
-/// Cached variant of [`navmesh_path`]: looks up a precomputed SSSP
-/// path to the harbor's entry-node set instead of running A*. Returns
-/// `None` on cache miss (no entry for this port, or no reachable
-/// start) so the caller can fall back to live A*.
-fn navmesh_path_cached(
+/// Phase D cached harbor path: look up a precomputed tile-id route from
+/// the per-port SSSP cache, then stitch it into a polyline using the
+/// same shared-edge → SSFA pipeline as the live planner. Returns
+/// `None` on cache miss so the caller can fall back to live A*.
+fn tile_mesh_cached_path(
     land: &LandMap,
-    nm: &Navmesh,
+    mesh: &TileMesh,
     cache: &PortRouteCache,
     start: Position,
     harbor: &Harbor,
 ) -> Option<Vec<Position>> {
-    let starts = nm.visible_from(
-        land,
-        start,
-        ENTRY_RADIUS_NM,
-        ENTRY_CANDIDATES,
-        ENTRY_MARGIN_NM,
-    );
-    if starts.is_empty() {
+    let start_candidates = mesh.nearest_centroids(start, TILE_ENTRY_RADIUS_NM);
+    if start_candidates.is_empty() {
         return None;
     }
+    let starts: Vec<u32> = start_candidates
+        .iter()
+        .take(TILE_ENTRY_MAX)
+        .map(|&(i, _)| i)
+        .collect();
 
     let route = cache.route_from(&starts, harbor.port_index)?;
-
-    let mut points: Vec<Position> = Vec::with_capacity(route.len() + 2);
-    points.push(start);
-    for idx in &route {
-        points.push(nm.nodes[*idx as usize].pos);
-    }
-    points.push(harbor.anchor);
-
-    let smoothed = smooth_boundaries(land, &points);
-    Some(smoothed.into_iter().skip(1).collect())
+    Some(stitch_tile_route(land, mesh, start, harbor.anchor, &route))
 }
 
 /// Plan a path through the navmesh from `start` to any of the goal anchors,
@@ -321,13 +314,34 @@ fn tile_mesh_path(
     };
 
     let route = mesh.route(&starts, goals)?;
+    Some(stitch_tile_route(land, mesh, start, terminal, &route))
+}
 
-    // Build (left, right) portal chain from consecutive tile pairs.
+/// Stitch a tile-id `route` into a polyline of waypoints from `start`
+/// (excluded) to `terminal` (included). Reconstructs the `(left, right)`
+/// shared-edge chain between consecutive tiles, runs SSFA, and validates
+/// every output segment against raster LOS. On any validation failure
+/// (rare; only when the smoothed path tries to cut across a sliver
+/// outside the convex tile chain), falls back to the raw centroid
+/// sequence with the terminal appended — provably safe because each
+/// centroid lies inside a convex tile and each consecutive pair shares
+/// an edge.
+///
+/// Shared between the Phase C live planner ([`tile_mesh_path`]) and the
+/// Phase D cached planner ([`tile_mesh_cached_path`]); both produce
+/// identical waypoint streams given identical tile routes.
+fn stitch_tile_route(
+    land: &LandMap,
+    mesh: &TileMesh,
+    start: Position,
+    terminal: Position,
+    route: &[u32],
+) -> Vec<Position> {
     let mut portals: Vec<(Position, Position)> = Vec::with_capacity(route.len().saturating_sub(1));
     for w in route.windows(2) {
         let Some((l, r)) = mesh.shared_edge(w[0], w[1]) else {
             // Should not happen on the bundled mesh, but guard anyway.
-            return Some(centroid_chain_with_terminal(mesh, &route, terminal));
+            return centroid_chain_with_terminal(mesh, route, terminal);
         };
         portals.push((l, r));
     }
@@ -339,11 +353,11 @@ fn tile_mesh_path(
     let mut prev = start;
     for &p in &smoothed {
         if !land.corridor_is_clear(prev, p, SMOOTH_MARGIN_NM) {
-            return Some(centroid_chain_with_terminal(mesh, &route, terminal));
+            return centroid_chain_with_terminal(mesh, route, terminal);
         }
         prev = p;
     }
-    Some(smoothed)
+    smoothed
 }
 
 /// Fallback: emit centroids in route order, then the terminal. Each

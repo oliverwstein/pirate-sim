@@ -1,58 +1,48 @@
-//! Per-port pre-computed shortest paths over the [`Navmesh`].
+//! Per-port pre-computed shortest paths over the [`TileMesh`].
 //!
-//! Perf phase 7: every port destination in the world has a fixed set of
-//! navmesh entry nodes (the mesh nodes visible from the harbor anchor).
-//! Because the navmesh graph is static and edge costs (`dist_nm`) are
-//! invariant, the all-pairs shortest path *to* a given port can be
-//! precomputed once at world load via multi-source Dijkstra from those
-//! entry nodes. Per-tick voyages then become a constant-time lookup
-//! plus an O(path-length) predecessor walk — no A* at all.
+//! Phase D of the navmesh migration: the cache is now keyed by tile id
+//! (the convex-tile portal-aware mesh loaded from `data/grids/navmesh.bin`)
+//! rather than the legacy raster-derived [`Navmesh`] nodes. Each port's
+//! entry-tile set is `{ anchor_tile } ∪ neighbours(anchor_tile)`; a
+//! multi-source Dijkstra from that set yields, for every tile in the
+//! mesh, the shortest centroid-graph distance and predecessor toward
+//! the port. Per-tick voyages then resolve to a constant-time lookup
+//! plus a predecessor walk — no live A* at all.
 //!
-//! Algorithmic note: a cached Dijkstra returns an *optimal-cost* path
-//! that may differ from live A* at tie-break points (Dijkstra has no
-//! heuristic-induced ordering bias). Total cost is preserved, but the
-//! exact node sequence on equal-cost ties may shift. This is acceptable
-//! for our use case (waypoints stitched through `smooth_path` later).
+//! The output is a tile-id sequence; the caller (`pathfind.rs`) stitches
+//! it into a polyline by reconstructing each shared-edge `(left, right)`
+//! portal and running SSFA, identical to the live planner.
 //!
-//! Memory: ~8 bytes × `nodes.len()` × `ports.len()` ≈ ~11 MB for 38
-//! ports × 37,588 nodes. Build cost: ~30 ms per port (one Dijkstra),
-//! ~1 s added to `World::load`.
+//! Memory: ~8 bytes × `tiles.len()` × `ports.len()` ≈ ~13 MB for 38
+//! ports × 43k tiles. Build cost: ~few ms per port (one Dijkstra over
+//! ~43k tiles with avg degree ~3), well under 100 ms total.
 
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 
 use crate::harbor::HarborMap;
-use crate::map::land::LandMap;
-use crate::navmesh::Navmesh;
+use crate::tile_mesh::TileMesh;
 
 /// SSSP table for one port destination: the shortest distance and
-/// predecessor for every navmesh node toward that port's entry-node
-/// set. `pred == u32::MAX` marks an entry node (a Dijkstra source).
+/// predecessor (tile id) for every tile toward that port's entry-tile
+/// set. `pred == u32::MAX` marks an entry tile (a Dijkstra source).
 struct PortRoutes {
     dist: Vec<f32>,
     pred: Vec<u32>,
 }
 
 /// Static cache holding a [`PortRoutes`] for every port that has at
-/// least one navmesh entry node. Indexed by `port_index` (matches
-/// `Harbor::port_index`). Ports without a reachable mesh entry (e.g.
-/// totally enclosed test setups) get `None`.
+/// least one tile-mesh entry tile. Indexed by `port_index` (matches
+/// `Harbor::port_index`). Ports without an `anchor_tile` get `None`.
 pub struct PortRouteCache {
     entries: Vec<Option<PortRoutes>>,
 }
 
-/// Same constants as `pathfind::find_path_to_harbor` for the
-/// harbor-anchor → mesh visibility probe. Duplicated here to avoid a
-/// circular dependency with `pathfind`.
-const ENTRY_RADIUS_NM: f32 = 200.0;
-const ENTRY_CANDIDATES: usize = 16;
-const ENTRY_MARGIN_NM: f32 = 0.0;
-
 impl PortRouteCache {
     /// Build SSSP tables for every harbor in `harbors`. The result is
-    /// indexed by `port_index`; ports not present in the harbor map
-    /// (or with no reachable entry node) yield `None`.
-    pub fn build(land: &LandMap, nm: &Navmesh, harbors: &HarborMap) -> Self {
+    /// indexed by `port_index`; ports without an `anchor_tile` yield
+    /// `None`.
+    pub fn build(tile_mesh: &TileMesh, harbors: &HarborMap) -> Self {
         let max_port_idx = harbors
             .harbors
             .iter()
@@ -61,33 +51,35 @@ impl PortRouteCache {
             .map(|m| m + 1)
             .unwrap_or(0);
         let mut entries: Vec<Option<PortRoutes>> = (0..max_port_idx).map(|_| None).collect();
-        let n_nodes = nm.nodes.len();
+        let n_tiles = tile_mesh.tiles.len();
 
         for harbor in &harbors.harbors {
-            let entry_nodes = nm.visible_from(
-                land,
-                harbor.anchor,
-                ENTRY_RADIUS_NM,
-                ENTRY_CANDIDATES,
-                ENTRY_MARGIN_NM,
-            );
-            if entry_nodes.is_empty() {
+            let Some(anchor_tile) = harbor.anchor_tile else {
                 continue;
+            };
+            // Sources = anchor tile + immediate neighbours. Matches the
+            // live planner's harbor goal set (`pathfind::find_path_to_harbor`),
+            // giving the funnel room to smooth into the harbor mouth.
+            let mut sources: Vec<u32> = Vec::with_capacity(8);
+            sources.push(anchor_tile);
+            for e in &tile_mesh.neighbors[anchor_tile as usize] {
+                sources.push(e.to);
             }
-            let routes = dijkstra_from_sources(nm, n_nodes, &entry_nodes);
+            let routes = dijkstra_from_sources(tile_mesh, n_tiles, &sources);
             entries[harbor.port_index] = Some(routes);
         }
 
         Self { entries }
     }
 
-    /// Walk the cached predecessor chain to produce a path from one of
-    /// `starts` to the entry-node set for `port_idx`. Returns `None`
-    /// when the port has no cache entry or no start is reachable.
+    /// Walk the cached predecessor chain to produce a tile-id sequence
+    /// from one of `starts` to the entry-tile set for `port_idx`.
+    /// Returns `None` when the port has no cache entry or no start is
+    /// reachable.
     ///
-    /// The returned sequence starts with the chosen start node and
-    /// ends at an entry node — same orientation as `Navmesh::route`'s
-    /// output, so callers can substitute one for the other.
+    /// The returned sequence starts with the chosen start tile and
+    /// ends at an entry tile — matches `TileMesh::route`'s output
+    /// orientation, so callers can substitute one for the other.
     pub fn route_from(&self, starts: &[u32], port_idx: usize) -> Option<Vec<u32>> {
         if starts.is_empty() {
             return None;
@@ -122,12 +114,13 @@ impl PortRouteCache {
     }
 }
 
-/// Multi-source Dijkstra over the navmesh adjacency: every node in
+/// Multi-source Dijkstra over the tile-mesh adjacency: every tile in
 /// `sources` starts at distance 0 with `pred = u32::MAX` (sentinel for
-/// "I am a source"). Standard relaxation otherwise.
-fn dijkstra_from_sources(nm: &Navmesh, n_nodes: usize, sources: &[u32]) -> PortRoutes {
-    let mut dist = vec![f32::INFINITY; n_nodes];
-    let mut pred = vec![u32::MAX; n_nodes];
+/// "I am a source"). Standard relaxation otherwise; edge cost is the
+/// `dist_nm` field already carried on `TileMesh::neighbors`.
+fn dijkstra_from_sources(mesh: &TileMesh, n_tiles: usize, sources: &[u32]) -> PortRoutes {
+    let mut dist = vec![f32::INFINITY; n_tiles];
+    let mut pred = vec![u32::MAX; n_tiles];
     let mut heap: BinaryHeap<HeapEntry> = BinaryHeap::new();
 
     for &s in sources {
@@ -143,7 +136,7 @@ fn dijkstra_from_sources(nm: &Navmesh, n_nodes: usize, sources: &[u32]) -> PortR
         if d > dist[cur_us] {
             continue;
         }
-        for e in &nm.adj[cur_us] {
+        for e in &mesh.neighbors[cur_us] {
             let nd = d + e.dist_nm;
             let to_us = e.to as usize;
             if nd < dist[to_us] {

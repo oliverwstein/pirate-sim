@@ -2760,3 +2760,44 @@ anchorage. See `port-coordinates.md` §4 for the open questions.
 (avg 0.33 ms), but per-port SSSP cache on the TileMesh is still the
 proper Phase D and removes the last planner dependency on the
 legacy mesh.
+
+---
+
+## 2026-05-28 — Ship navigation Phase D (PortRouteCache on TileMesh)
+
+**Context.** After Phase C the live planner ran on the `TileMesh`, but
+`PortRouteCache` was still keyed by legacy `Navmesh` node ids, so the
+"cached" harbor path was actually slower than the fresh tile-mesh
+A* (it ran the legacy raster mesh and ignored the funnel). Phase D
+rewires the cache onto the tile mesh.
+
+**Mechanism.**
+1. `PortRouteCache::build(tile_mesh, harbors)` runs a multi-source
+   Dijkstra over `TileMesh::neighbors` for each port. Sources =
+   `{ anchor_tile } ∪ neighbours(anchor_tile)` — same set the live
+   planner uses as the goal set for harbor pathing, so the cached
+   route can hand off to the SSFA funnel with the same corridor
+   shape.
+2. `PortRouteCache::route_from(starts, port_idx)` walks the
+   predecessor chain to return a tile-id sequence; same contract as
+   `TileMesh::route` so the stitching pipeline doesn't care which
+   produced it.
+3. `pathfind::find_path_to_harbor` now prefers the cache when both
+   `tile_mesh` and `port_routes` are attached; cache miss silently
+   falls through to live `tile_mesh_path` (Phase C), then to the
+   legacy `navmesh_path` (Phase A backstop).
+4. The shared-edge → SSFA → segment-LOS validate → centroid-chain
+   fallback pipeline was extracted from `tile_mesh_path` into
+   `stitch_tile_route(land, mesh, start, terminal, route)` so the
+   cached and live paths emit identical waypoints from identical
+   tile routes.
+
+**Validation.** 238 tests pass, clippy clean. `bench_pathfind`:
+1406/1406 ok, avg 0.32 ms, max **2.44 ms** (Phase C live A* was
+4.58 ms max). The 38 SSSP builds add a small one-time cost at world
+load — far below the legacy `Navmesh` cache's ~1 s.
+
+**Status.** The PortRouteCache is now fully off the legacy Navmesh.
+`Navmesh::build(&LandMap)` is still loaded and remains the backstop
+inside `PathfindContext`; Phase G will remove it once the motion
+sweep migration (Phase E) lands and no caller is left.
