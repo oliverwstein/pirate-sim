@@ -92,50 +92,6 @@ impl LandMap {
         self.data[idx] != 255
     }
 
-    /// Find the nearest sea cell to a starting cell using BFS. Useful when a
-    /// destination position falls on a land cell (e.g., a coastal port).
-    /// Returns None only if no sea cell is reachable within `max_radius` cells.
-    pub fn nearest_sea_cell(&self, col: u32, row: u32, max_radius: u32) -> Option<(u32, u32)> {
-        if self.is_sea_cell(col, row) {
-            return Some((col, row));
-        }
-        use std::collections::{HashSet, VecDeque};
-        let mut visited: HashSet<(u32, u32)> = HashSet::new();
-        let mut queue: VecDeque<(u32, u32, u32)> = VecDeque::new();
-        visited.insert((col, row));
-        queue.push_back((col, row, 0));
-        while let Some((c, r, d)) = queue.pop_front() {
-            if d > max_radius {
-                continue;
-            }
-            for (dc, dr) in &[
-                (-1i32, 0i32),
-                (1, 0),
-                (0, -1),
-                (0, 1),
-                (-1, -1),
-                (1, -1),
-                (-1, 1),
-                (1, 1),
-            ] {
-                let nc = c as i32 + dc;
-                let nr = r as i32 + dr;
-                if nc < 0 || nr < 0 || nc >= self.width as i32 || nr >= self.height as i32 {
-                    continue;
-                }
-                let key = (nc as u32, nr as u32);
-                if !visited.insert(key) {
-                    continue;
-                }
-                if self.is_sea_cell(key.0, key.1) {
-                    return Some(key);
-                }
-                queue.push_back((key.0, key.1, d + 1));
-            }
-        }
-        None
-    }
-
     /// Returns true if the position is on land (or out of bounds = treated as land).
     pub fn is_land(&self, pos: Position) -> bool {
         match self.pos_to_cell(pos) {

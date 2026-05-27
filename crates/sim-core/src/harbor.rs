@@ -154,7 +154,7 @@ impl HarborMap {
         for (idx, port) in ports.iter().enumerate() {
             let Some(anchor_tile) = find_anchor_tile(land, tile_mesh, port.position) else {
                 // Genuinely unreachable port — skip, same failure mode
-                // as the legacy `nearest_sea_cell` miss.
+                // as the legacy nearest-sea-cell miss.
                 eprintln!(
                     "[harbor] {}: no tile centroid within {} NM (expanding shell exhausted) — skipping",
                     port.name, ANCHOR_FALLBACK_MAX_RADIUS_NM
@@ -294,8 +294,8 @@ mod tests {
             buf.extend_from_slice(&c.x.to_le_bytes());
             buf.extend_from_slice(&c.y.to_le_bytes());
             buf.extend_from_slice(&0.0f32.to_le_bytes()); // clearance_nm
-            // One neighbour: the other tile, with portal at the midpoint
-            // (any finite Position works for this test).
+                                                          // One neighbour: the other tile, with portal at the midpoint
+                                                          // (any finite Position works for this test).
             buf.extend_from_slice(&1u32.to_le_bytes());
             let other = 1 - i;
             buf.extend_from_slice(&other.to_le_bytes());
