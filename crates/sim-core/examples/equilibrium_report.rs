@@ -11,7 +11,7 @@
 
 use sim_core::equilibrium::{self, EquilibriumScenario, FreightCostModel, PortSpec};
 use sim_core::goods::GoodsRegistry;
-use sim_core::market::{archetype_for, PortMarket};
+use sim_core::market::{archetype_for, seed_balance_from_equilibrium, PortMarket};
 use sim_core::port::all_ports;
 use sim_core::ship::ShipStats;
 use sim_core::shiptype::ShipTypeRegistry;
@@ -31,9 +31,9 @@ fn main() {
         })
         .collect();
 
-    // Day-0 simulation prices. Same recipes → same with_recipe seeding,
-    // so this is a direct apples-to-apples baseline.
-    let markets: Vec<PortMarket> = ports
+    // Day-0 simulation prices. Start from the same recipe heuristic as
+    // World::load, then apply the linear LP shadow-price seed below.
+    let mut markets: Vec<PortMarket> = ports
         .iter()
         .map(|p| PortMarket::with_recipe(&goods, archetype_for(&p.name).recipe()))
         .collect();
@@ -63,6 +63,11 @@ fn main() {
     });
     println!("  total surplus: {:+.0} pesos/month", sol_simple.objective);
     println!("  active flows:  {}", sol_simple.flows.len());
+    let non_zero_linear = sol_simple.supply_prices.len() + sol_simple.demand_prices.len();
+    println!("  non-zero shadow prices: {}", non_zero_linear);
+    for (port_idx, market) in markets.iter_mut().enumerate() {
+        seed_balance_from_equilibrium(market, port_idx, &sol_simple, &goods);
+    }
 
     println!();
     println!("Solving equilibrium under voyage-cost (sloop) model…");
@@ -73,6 +78,8 @@ fn main() {
     });
     println!("  total surplus: {:+.0} pesos/month", sol_real.objective);
     println!("  active flows:  {}", sol_real.flows.len());
+    let non_zero_voyage = sol_real.supply_prices.len() + sol_real.demand_prices.len();
+    println!("  non-zero shadow prices: {}", non_zero_voyage);
 
     // ── Per (port, good) report. For each cell: equilibrium price
     //    under each model, simulation day-0 price, and base price for
@@ -102,7 +109,7 @@ fn main() {
             let g = goods.get(good);
             let p_lin = sol_simple.price_at(port_idx, good);
             let p_voy = sol_real.price_at(port_idx, good);
-            let p_sim = markets[port_idx].buy_price(good, &goods);
+            let p_sim = markets[port_idx].price_at(good, &goods);
             let lin_str = p_lin
                 .map(|p| format!("{:.1}", p))
                 .unwrap_or_else(|| "  —  ".to_string());
@@ -136,7 +143,7 @@ fn main() {
                 continue;
             }
             if let Some(p_eq) = sol_real.price_at(port_idx, *good) {
-                let p_sim = markets[port_idx].buy_price(*good, &goods);
+                let p_sim = markets[port_idx].price_at(*good, &goods);
                 if p_eq > 1.0 {
                     diffs.push(((p_sim - p_eq) / p_eq).abs());
                 }

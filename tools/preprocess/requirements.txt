@@ -1,5 +1,8 @@
 netCDF4>=1.6
 numpy>=1.24
+pyproj>=3.0
 pyshp>=2.3
 shapely>=2.0
 mapbox_earcut>=1.0
+triangle>=20230923
+matplotlib>=3.7

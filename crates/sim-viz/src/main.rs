@@ -17,6 +17,11 @@ const SHIP_SIGHT_RANGE_NM: f32 = SPATIAL_CELL_NM;
 const SIGHT_LINE_COLOR: Color = Color::new(0.85, 0.85, 0.9, 0.18);
 const WIND_COLOR: Color = Color::new(0.5, 0.7, 1.0, 0.6);
 const PATH_COLOR: Color = Color::new(1.0, 0.9, 0.2, 0.15);
+/// Stroke for the all-routes overlay (toggle with `P`).
+const ROUTE_COLOR: Color = Color::new(1.0, 0.55, 0.1, 0.35);
+/// Stroke for navmesh node dots. White with low alpha so dense coverage
+/// blends visually instead of washing the map out.
+const NAVMESH_NODE_COLOR: Color = Color::new(1.0, 1.0, 1.0, 0.55);
 const SELECT_COLOR: Color = Color::new(0.4, 0.9, 1.0, 1.0);
 
 /// Discrete level-of-detail zoom steps in pixels-per-NM. Mouse wheel
@@ -240,6 +245,81 @@ fn draw_wind_arrows(world: &World, camera: &Camera) {
     }
 }
 
+/// Render every tile-mesh centroid as a small white dot. Used to
+/// visually audit planning-substrate coverage — concave coastlines
+/// that lack a nearby centroid show up as bare patches where the A*
+/// search has nothing to lock onto. Off-screen culling keeps the
+/// per-frame cost proportional to the visible area regardless of
+/// total tile count.
+fn draw_tile_centroids(world: &World, camera: &Camera) {
+    let sw = screen_width();
+    let sh = screen_height();
+    let radius = (camera.zoom() * 0.6).clamp(0.6, 2.0);
+    for tile in &world.tile_mesh.tiles {
+        let p = camera.world_to_screen(tile.centroid);
+        if p.x < 0.0 || p.y < 0.0 || p.x > sw || p.y > sh {
+            continue;
+        }
+        draw_circle(p.x, p.y, radius, NAVMESH_NODE_COLOR);
+    }
+}
+
+/// Overlay every cached port-to-port route in the world. For each
+/// ordered pair (port_a, port_b) where both have anchor tiles, walks
+/// `PortRouteCache::route_from` (which already applies the deep-water
+/// simplification) and renders the resulting tile-centroid polyline.
+/// Drawn before ports/ships so it sits under them. Each segment is
+/// stroked at a fixed thin width regardless of zoom — fine at any
+/// scale and keeps the cost bounded.
+fn draw_all_routes(world: &World, camera: &Camera) {
+    let n = world.harbors.harbors.len();
+    let sw = screen_width();
+    let sh = screen_height();
+    for i in 0..n {
+        let ha = &world.harbors.harbors[i];
+        let Some(anchor_tile) = ha.anchor_tile else {
+            continue;
+        };
+        let starts = [anchor_tile];
+        for j in 0..n {
+            if i == j {
+                continue;
+            }
+            let hb = &world.harbors.harbors[j];
+            let Some(route) = world.port_routes.route_from(&starts, hb.port_index) else {
+                continue;
+            };
+            if route.len() < 2 {
+                continue;
+            }
+            // Convert tile ids to centroids; tack on the destination
+            // anchor so the final segment terminates at the port's
+            // actual anchor (matches what `stitch_tile_route` does for
+            // the live planner).
+            let mut prev = world.tile_mesh.tiles[route[0] as usize].centroid;
+            for &t in &route[1..] {
+                let next = world.tile_mesh.tiles[t as usize].centroid;
+                let a = camera.world_to_screen(prev);
+                let b = camera.world_to_screen(next);
+                // Cheap on-screen reject — both endpoints far off the
+                // viewport ⇒ skip the stroke.
+                let off = (a.x < 0.0 && b.x < 0.0)
+                    || (a.x > sw && b.x > sw)
+                    || (a.y < 0.0 && b.y < 0.0)
+                    || (a.y > sh && b.y > sh);
+                if !off {
+                    draw_line(a.x, a.y, b.x, b.y, 1.0, ROUTE_COLOR);
+                }
+                prev = next;
+            }
+            // Tail to the harbor anchor itself.
+            let a = camera.world_to_screen(prev);
+            let b = camera.world_to_screen(hb.anchor);
+            draw_line(a.x, a.y, b.x, b.y, 1.0, ROUTE_COLOR);
+        }
+    }
+}
+
 fn draw_ports(world: &World, camera: &Camera) {
     for port in &world.ports {
         let sp = camera.world_to_screen(port.position);
@@ -267,23 +347,12 @@ fn draw_ports(world: &World, camera: &Camera) {
 }
 
 fn draw_ships(world: &World, camera: &Camera, selected_ship: Option<ShipId>) {
-    // Planned paths first, so ship triangles draw on top.
-    for (id, ship) in &world.ships {
-        let nav = &ship.nav;
-        if world.ship_ais.get(id).is_none() {
-            continue;
-        }
-        if nav.waypoints.is_empty() {
-            continue;
-        }
-        let mut prev = camera.world_to_screen(ship.position);
-        for wp in nav.waypoints.iter() {
-            let p = camera.world_to_screen(*wp);
-            draw_line(prev.x, prev.y, p.x, p.y, 1.5, PATH_COLOR);
-            draw_circle(p.x, p.y, 2.0, PATH_COLOR);
-            prev = p;
-        }
-    }
+    // Planned-path overlay intentionally disabled: while debugging
+    // tile-mesh coverage we render every tile centroid as a white dot
+    // (see `draw_tile_centroids`) so the ship-by-ship yellow chains
+    // would just clutter the view. Re-enable by drawing
+    // `ship.nav.waypoints` here if you need per-ship route inspection.
+    let _ = PATH_COLOR;
 
     // Inter-faction sight lines: for each Sailing ship, draw a faint
     // line to any *Sailing* neighbor of a different faction within
@@ -550,7 +619,7 @@ fn draw_ship_panel(world: &World, ship_id: ShipId) {
 }
 
 /// Right-side panel showing a selected port's market state: prices,
-/// stockpile, treasury, gateway flag.
+/// balance, treasury, gateway flag.
 fn draw_market_panel(world: &World, port_idx: usize) {
     if port_idx >= world.ports.len() || port_idx >= world.markets.len() {
         return;
@@ -575,7 +644,7 @@ fn draw_market_panel(world: &World, port_idx: usize) {
         LIGHTGRAY,
     );
     draw_text(
-        "Good          stk(t)   buy   sell",
+        "Good          bal(t)   price",
         x + 10.0,
         y + 62.0,
         14.0,
@@ -583,10 +652,9 @@ fn draw_market_panel(world: &World, port_idx: usize) {
     );
 
     for (i, good) in world.goods.iter().enumerate() {
-        let stk = market.stockpile.get(good.id);
-        let buy = market.buy_price(good.id, &world.goods);
-        let sell = market.sell_price(good.id, &world.goods);
-        let line = format!("{:<14}{:>7.0} {:>5.1} {:>5.1}", good.name, stk, buy, sell);
+        let bal = market.balance.get(good.id);
+        let price = market.price_at(good.id, &world.goods);
+        let line = format!("{:<14}{:>7} {:>7.1}", good.name, bal, price);
         draw_text(&line, x + 10.0, y + 80.0 + i as f32 * 18.0, 14.0, WHITE);
     }
 }
@@ -632,6 +700,7 @@ async fn main() {
     let mut ticks_per_frame: u32 = 1;
     let mut selected_port: Option<usize> = None;
     let mut selected_ship: Option<ShipId> = None;
+    let mut show_routes = false;
 
     loop {
         // Input
@@ -645,6 +714,9 @@ async fn main() {
         }
         if is_key_pressed(KeyCode::Minus) {
             ticks_per_frame = (ticks_per_frame / 2).max(1);
+        }
+        if is_key_pressed(KeyCode::P) {
+            show_routes = !show_routes;
         }
         if is_key_pressed(KeyCode::R) {
             world = World::load(Path::new("data/"));
@@ -693,6 +765,10 @@ async fn main() {
         draw_land(&world, &camera);
         draw_coastline(&world, &camera);
         draw_wind_arrows(&world, &camera);
+        draw_tile_centroids(&world, &camera);
+        if show_routes {
+            draw_all_routes(&world, &camera);
+        }
         draw_ports(&world, &camera);
         draw_ships(&world, &camera, selected_ship);
         draw_hud(&world, &camera, paused, ticks_per_frame);

@@ -24,11 +24,8 @@
 //! from carpet-bombing the seas.
 //!
 //! When a build fires, the port debits its treasury (silver) and
-//! consumes the inputs from its stockpile. Because the shadow-price
-//! model permits borrowing against next month's production for goods
-//! the port produces, a port that is short on (e.g.) its own naval
-//! stores can still build by going into hinterland debt — which
-//! naturally raises future prices for everyone.
+//! consumes inputs from its bounded market balance. Builds are refused
+//! when any required input would push the port below its shortage bound.
 //!
 //! Stage 2 (deferred): home-port deposit/withdraw loop, ownership
 //! profit remittance, and refusing to build when fleet is overcrowded.
@@ -92,9 +89,9 @@ impl BuildCost {
 pub fn build_cost(ty: &ShipType, market: &PortMarket, goods: &GoodsRegistry) -> BuildCost {
     BuildCost {
         silver: ty.build_silver,
-        naval_stores: ty.build_naval_stores * market.buy_price(ids::NAVAL_STORES, goods),
-        manufactures: ty.build_manufactures * market.buy_price(ids::MANUFACTURES, goods),
-        provisions: ty.build_provisions * market.buy_price(ids::PROVISIONS, goods),
+        naval_stores: ty.build_naval_stores * market.price_at(ids::NAVAL_STORES, goods),
+        manufactures: ty.build_manufactures * market.price_at(ids::MANUFACTURES, goods),
+        provisions: ty.build_provisions * market.price_at(ids::PROVISIONS, goods),
     }
 }
 
@@ -109,7 +106,7 @@ pub fn starting_silver(ty: &ShipType, market: &PortMarket, goods: &GoodsRegistry
     } else {
         let avg_export_price: f32 = outputs
             .iter()
-            .map(|(g, _)| market.buy_price(*g, goods))
+            .map(|(g, _)| market.price_at(*g, goods))
             .sum::<f32>()
             / outputs.len() as f32;
         Pesos::from_pesos_f32(ty.stats.cargo_capacity_tons * avg_export_price)
@@ -178,9 +175,7 @@ pub fn try_build(
         if market.silver < ty.build_silver {
             continue;
         }
-        // Verify input availability. For goods the port produces, the
-        // shadow-price model allows borrowing against next month — so
-        // we still permit those. For pure imports, the wharf must cover.
+        // Verify input availability against the shortage bound.
         let need = [
             (ids::NAVAL_STORES, ty.build_naval_stores),
             (ids::MANUFACTURES, ty.build_manufactures),
@@ -188,9 +183,7 @@ pub fn try_build(
         ];
         let mut inputs_ok = true;
         for (gid, tons) in need.iter().copied() {
-            let in_stock = market.stockpile.get(gid);
-            let produces = market.recipe.monthly_outputs.iter().any(|(g, _)| *g == gid);
-            if in_stock + 1e-4 < tons && !produces {
+            if market.available_to_buy(gid) + 1e-4 < tons {
                 inputs_ok = false;
                 break;
             }
@@ -219,15 +212,9 @@ pub fn try_build(
         (ids::PROVISIONS, ty.build_provisions),
     ];
     for (gid, tons) in need.iter().copied() {
-        let in_stock = market.stockpile.get(gid);
-        let from_wharf = tons.min(in_stock);
-        if from_wharf > 0.0 {
-            market.stockpile.remove(gid, from_wharf);
-        }
-        let from_hinterland = (tons - from_wharf).max(0.0);
-        if from_hinterland > 0.0 {
-            market.debt.add(gid, from_hinterland);
-        }
+        let next = (market.balance.get(gid) as f32 - tons).round() as i32;
+        let bound = market.effective_bound(gid);
+        market.balance.set(gid, next.clamp(-bound, bound));
     }
 
     let start_silver = starting_silver(ty, market, goods);
@@ -285,9 +272,15 @@ mod tests {
         let goods = GoodsRegistry::starter();
         let mut market =
             PortMarket::with_recipe(&goods, PortArchetype::NorthAmericanFarming.recipe());
-        market.stockpile.add(ids::NAVAL_STORES, 200.0);
-        market.stockpile.add(ids::MANUFACTURES, 200.0);
-        market.stockpile.add(ids::PROVISIONS, 200.0);
+        market
+            .balance
+            .set(ids::NAVAL_STORES, market.effective_bound(ids::NAVAL_STORES));
+        market
+            .balance
+            .set(ids::MANUFACTURES, market.effective_bound(ids::MANUFACTURES));
+        market
+            .balance
+            .set(ids::PROVISIONS, market.effective_bound(ids::PROVISIONS));
         market.silver = Pesos::from_pesos(100_000);
         market
     }
@@ -352,13 +345,14 @@ mod tests {
         let types = ShipTypeRegistry::starter();
         let port = yard_port("Boston", &[st_ids::SLOOP]);
         let silver_before = market.silver;
-        let ns_before = market.stockpile.get(ids::NAVAL_STORES);
+        let ns_before = market.balance.get(ids::NAVAL_STORES);
         let (outcome, _ship) = try_build(&port, 0, &mut market, &goods, &types, 500.0);
         assert!(matches!(outcome, BuildOutcome::Built { .. }));
         let sloop = types.get(st_ids::SLOOP);
         assert_eq!(silver_before - market.silver, sloop.build_silver);
         assert!(
-            ns_before - market.stockpile.get(ids::NAVAL_STORES) >= sloop.build_naval_stores - 1e-3
+            ns_before - market.balance.get(ids::NAVAL_STORES)
+                >= sloop.build_naval_stores.round() as i32
         );
     }
 

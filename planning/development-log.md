@@ -2150,3 +2150,1424 @@ today's samply runs with `cargo build --profile=profiling
 tree internals (~12.6 % inclusive, distributed across many
 actions), and persisting the SSSP cache to disk to amortize the
 ~1 s `World::load` cost.
+
+---
+
+## Navigation: Amsterdam port relocation + path-stale LOS replan
+*(ai-expansion branch)*
+
+**Problem.** In sim-viz, two pathological behaviors visible within
+the first sim-year: (a) a permanent crowd of ~170 non-docked ships
+loitering within 50 NM of Amsterdam — the harbor zone overlapped
+the Dutch coastline, so ships approaching from the SW kept
+losing LOS to the anchor at the last mile and falling into an
+endless replan/drift loop; (b) ships blown off course by wind /
+tacking would dead-reckon straight toward the destination through
+intervening land, pinning against the coast.
+
+**Diagnosis.** New `crates/sim-core/examples/bench_long.rs` ran
+a 10-year headless sim with `JAM_PROBES` counting non-docked ships
+within 50 NM of Amsterdam / Nantes / Elmina. Confirmed Amsterdam
+loiterer count grew monotonically to ~170. For mode (b), traced
+`act_sail` and found only two narrow replan triggers — neither
+fires when the *next* waypoint is blocked by land from the ship's
+*current truth* position.
+
+**Fixes.**
+1. Move Amsterdam (4644, 2092) → (4625, 2105) — Ijmuiden offshore
+   (52.58°N 4.58°E). Harbor radius unchanged (25 NM).
+2. Add path-stale LOS check in `act_sail`: each tick, if
+   `land.corridor_is_clear(ship.position, next_target, 2.0)` is
+   false, re-A* from truth. Handles both port destinations
+   (calls `replan_to_port`) and free-form destinations (calls
+   `pathfind::find_path`). No cooldown; relies on the replan
+   producing a different path because `pos_truth` changes.
+
+**Validation.** `bench_long 10y`: ships alive at year 10:
+272 → 375 (baseline → post-fix). Amsterdam loiterers 170 → ~1.
+Elmina loiterers 330 → ~37 (partial — Elmina has its own
+silver-sink issue). `bench_trade` 60-day calibration unchanged
+within noise. 171+23+10 tests pass.
+
+**Tried and reverted.** Doubling ship `provision_capacity` —
+no material effect (capacity was already 130-360 days, the bug
+was supply not capacity). Emergency-provisions-at-2× resolver
+that lets ships always buy provisions even when port stockpile
+is dry — *worked* (390 ships alive at year 10, no provision-
+strand) but didn't fix the underlying market dynamics and
+caused MANUFACTURES stockpile to balloon 28k → 80k tons
+because surviving ships kept producing into a market that
+couldn't absorb. Reverted in favor of a deeper redesign of
+the supply/price model (bounded trade balance with smooth
+distance-from-0 pricing — see next entry).
+
+---
+
+## Market Redesign: Bounded Signed Trade Balance (planned)
+*(ai-expansion branch — design only, no code yet)*
+
+**Problem.** The current `Stockpile<good> = tons (≥0)` model has two
+chronic failure modes: (a) ports go dry and ships strand because no
+seller exists at any price, and (b) ports accumulate unbounded surplus
+because ship demand is fixed by routes, not by price signals. The
+emergency-resupply experiment confirmed that decoupling provisions
+from stockpile keeps ships alive, but goods like Manufactures still
+pile up (28k→80k tons over 10 sim-years) because demand never bites
+back.
+
+**New model.** Each port × good has a signed integer `balance` in
+`[-bound, +bound]`. Production adds, consumption/sales subtract. Bound
+is RON-declared per port × good, scaled by prosperity. Price is an
+asymmetric monotone function of `balance/bound` — shortage spikes
+hard (`α=4, p=2`, up to 5× base at -bound), glut softens (`β=1,
+p=1.5`, floor ~0.3× base at +bound). Ship cargo remains physical;
+only port inventory becomes abstract.
+
+**Auction kept.** Port-tick clearing becomes a 1-D fixed-point
+solve: find clearing price P* such that the post-trade balance
+b₁ = b₀ + ΔQ(P*) satisfies P(b₁) = P*. Monotonicity guarantees
+unique solution; binary search runs in ~20 iters.
+
+**Prosperity feedback (new).** Recipe profitability at current
+balance-driven prices drifts prosperity up/down monthly. Prosperity
+scales bound *and* production/consumption rates, so a port whose
+recipe is profitable grows its market; an unprofitable port shrinks.
+This is the auto-throttle that prevents the Manufactures pile-up.
+
+**Initial seed.** Run Kantorovich LP at world load; invert the price
+curve on each port's per-good shadow price to derive starting balance.
+Sim starts at LP equilibrium → no startup transient.
+
+**Phasing.** (A) additive schema + curve, no behavior change.
+(B) auction rewrite, stockpile removal, LP seed. (C) prosperity
+feedback loop. (D) tuning + sim-viz HUD updates.
+
+**Impact surface.** market.rs, world.rs (clear_port_intents), ai.rs
+profit math, shipyard.rs, equilibrium.rs, all trade.rs tests, full
+ports.ron migration, sim-viz HUD. ~8 substantive files plus tests
+plus data.
+
+**Deferred to later.** Hinterland population consumption (city eats
+provisions/manufactures distinct from recipe inputs) — omitted for
+v1 since the bounded-balance model makes ships self-regulating
+without it; revisit as a separate hinterland-demand concept.
+
+---
+
+### 2025: Market redesign — Phase B.3 (auction switchover)
+
+**Change:** `world.rs::clear_one_good` rewritten to use the
+`market_clearer::clear` fixed-point auction. Price discovery now reads
+`market.balance` + `market.effective_bound(good)` via the asymmetric
+curve from `market_curve.rs`; the old `buy_price_at`/`sell_price_at`
+path is dead. `market.stockpile` / `market.debt` continue to be
+shadow-updated by the auction so existing telemetry keeps working
+unchanged until Phase B.4 strips them.
+
+**Algorithm:**
+1. Faction-policy filter (unchanged): drop prohibited intents,
+   compute `(buy_duty, sell_duty)` per ship.
+2. Translate bid/ask limits into base-currency limits the clearer
+   understands: `max_base = limit / (1 + buy_duty)` for bids,
+   `min_base = limit / (1 - sell_duty)` for asks.
+3. Call `market_clearer::clear` → `(clearing_price, new_balance, fills)`.
+4. Pre-pass: cap each fill by ship cargo / silver to compute the
+   *actual* `total_sell_base` and `total_buy_base` → derive
+   `payout_ratio` from real settling tons (not the clearer's gross
+   request). This was a real bug caught by code review.
+5. Apply pass: charge / pay each ship at base ± duty wedge, accrue
+   crown_silver, update market.balance, shadow-update stockpile/debt.
+
+**Determinism:** all per-ship state lives in `BTreeMap<u32, _>`; fills
+are sorted by `ship_id` before apply. ShipId → u32 via
+`data().as_ffi() as u32` (slot index; unique among live ships).
+
+**Validation:** 232 tests pass, clippy clean. bench_trade 60d: Fleet
+P/L +913342 / 0 bankrupt / 232k outstanding debt (identical to
+pre-switchover). bench_long 10y: 446 ships alive (vs 375 baseline
+with LOS+Amsterdam fix), with notable Amsterdam port congestion (164
+ships docked there) suggesting the B.1 heuristic balance seeding
+is letting some good's balance pin at a wall. Expected to resolve in
+B.5 (LP-shadow-price seeding).
+
+---
+
+### 2025: Market redesign — Phase B.4 (stockpile/debt removal)
+
+**Change:** `PortMarket::stockpile` and `PortMarket::debt` deleted, along
+with all their helpers (`buy_price_at`, `sell_price_at`,
+`price_at_effective_stock`, `produces_good`, `settle_debt`,
+`settle_hinterland_debt`) and constants (`INITIAL_STOCKPILE_TONS`,
+`PRICE_K`, `PRICE_FLOOR_FRAC`, `PRICE_CEIL_FRAC`, `PRICE_SPREAD`).
+Every consumer migrated to the bounded `balance` + asymmetric curve.
+
+**New `PortMarket` API:**
+- `price_at(good, &goods) -> f32` — current price from balance.
+- `price_after_trade(good, delta_tons, &goods) -> f32` — sign
+  convention: positive `delta_tons` = ship buys (balance decreases).
+- `available_to_buy(good) -> f32` — tons available before hitting
+  `balance == -bound`. Used as the shipyard / resupply availability
+  gate (formerly `stockpile.get`).
+
+**Migration highlights:**
+- `world.rs::clear_one_good`: dropped the shadow stockpile/debt mutation
+  block. The auction now updates only `balance`, `silver`,
+  `crown_silver`, and telemetry.
+- `clear_port_intents`: dropped the `settle_hinterland_debt()` call.
+- `ai.rs` / `trade.rs`: planner uses a 1-ton reference lot with
+  `price_after_trade` for opportunity ranking (the planner doesn't
+  know cargo size at decision time, so it can't price the full trade
+  impact; this is an explicit calibration choice).
+- `shipyard.rs`: refuses builds when any input good is at
+  `balance == -bound` (`available_to_buy == 0`). Consumption is
+  i32 with `clamp(-bound, bound)` post-decrement.
+- `ship.rs::resupply_one_hour`: same migration to balance API.
+- Benches and viz HUD: stockpile snapshots replaced with balance +
+  price_at displays.
+
+**Validation:** 218 tests pass (down from 232 — 14 tests that
+asserted exact stockpile counts were rewritten in terms of balance/
+price; none ignored). bench_trade P/L 913342 → 773710 (-15%), 0/505
+bankrupt (unchanged). bench_long alive at year 10: 446 → 366 (-18%).
+
+The -18% drop is the predicted design consequence of removing the
+old infinite-hinterland-credit backstop: ports that previously
+absorbed unbounded buy demand by going into perpetual debt now
+hard-cap at `-bound` and refuse further sales. Phase B.5 (LP-shadow-
+price balance seeding) is expected to re-center initial balances
+closer to economic equilibrium and recover this gap.
+
+---
+
+### 2025: Market redesign — Phase B.5 (LP shadow-price balance seeding)
+
+**Change:** at world load, solve the Kantorovich LP over the port/good
+graph (linear freight cost, 0.05 pesos/ton·NM, matching
+`equilibrium_report`) and for each (port, good) with a finite, sane
+shadow price, invert the asymmetric price curve to derive the
+initial `balance`. The simulation now starts at LP equilibrium
+instead of at `balance == 0` (the Phase B.1 heuristic seed).
+
+**New:** `market::seed_balance_from_equilibrium(port_idx, good_id,
+shadow_price, base_price, …) -> i32`. 4 unit tests cover: at-base,
+shortage clamping, glut clamping, and skip-on-nonfinite-or-extreme.
+
+**Wiring:** `World::new` builds `port_specs` from prices/goods/recipes,
+calls `equilibrium::solve`, then walks each (port, good) and seeds
+balance when a shadow price is available. Stderr summary prints
+non-zero shadow-price count + total surplus.
+
+**Validation:** 222 tests pass. bench_trade P/L 773710 → 915590
+(recovers and exceeds the B.3 baseline of 913342, consistent with
+the LP seed eliminating the startup transient).
+
+---
+
+## Coastal navigation overhaul — design agreed
+
+**Context:** Ships were repeatedly observed wedged in concave coastline
+in the visualizer. Iterated through several local fixes (`visible_from`
+nearest-node fallback, `deflect_for_land` navmesh-oracle escape,
+goal-aligned escape selection, deeper LOS probe) — none materially
+reduced the problem. Added per-voyage telemetry to quantify it
+(`World::nav_diag`, `bench_trade` reports incidents); 2-year run flagged
+256 stuck-or-slow voyages with worst-case stuck-runs of 742 hours
+(31 sim-days frozen against the coast). Added a coverage diagnostic
+(`diag_mesh_coverage`) that revealed ~580 sea cells (stride-4 sample)
+have *zero* LOS-clear navmesh nodes within 200 NM — concave bays whose
+walls block visibility to the nearby waypoints.
+
+**Root cause (architectural, not a steering bug):** the simulator uses a
+1 NM raster `LandMap` as the single substrate for both ship/land
+collision and waypoint-mesh construction. The polygon coastline (used
+for rendering) is smooth, but rasterizing it at 1 NM produces stairstep
+artifacts the ship "sees" as obstacles the player cannot see. Worse,
+the channel-pass waypoints sit in those same staircase-affected cells,
+so concave bays end up with waypoints that no interior point can
+reach via LOS.
+
+**Decision: full nav overhaul, polygon-based collision + waypoint mesh.**
+Land truth migrates from `LandMap` raster to `LandMesh` polygon mesh.
+Steering tweaks are abandoned as load-bearing fixes; the goal is to
+make the substrate match what the player sees.
+
+**Bilevel query design (`coastline_geom` module):**
+- `is_land(pos)`: if raster says sea → return sea (free); if raster
+  says land → consult polygon mesh (point-in-polygon). Full polygon
+  resolution only at coastal cells where staircasing matters.
+- `line_is_clear(a, b)`: walk raster cells along the segment; if all
+  sea → clear (open-water fast path); else spatial-indexed polygon
+  edge intersection over the touching span only.
+- `first_land_hit(a, b)`: same bilevel pattern; replaces the raster
+  `farthest_clear_point` that currently triggers the speed=0 halt.
+- Spatial index over coastline edges: uniform grid (10 NM cells).
+  Chosen over BVH/quadtree for determinism + simplicity.
+
+**Waypoint mesh, polygon-derived:**
+- Coastal ring: sample points along the offshore-offset polyline of
+  each coastline polygon, with offset distance matched to harbor-zone
+  extent so the ring naturally terminates at harbor entries.
+- Open-water grid (~25 NM stride) retained for long-haul efficiency.
+- Edges validated with the new polygon-aware `line_is_clear`.
+
+**What stays raster:** wind/weather sampling, and the raster acts as
+the coarse positive filter in the bilevel land queries. Unit-test
+worlds that build a tiny `LandMap` get a no-op polygon set
+(`coastline_geom` falls through to raster-only when polygons are
+empty), so tests don't need polygon scaffolding.
+
+**Migration plan (5 phases, each independently committable):**
+1. Polygon LOS primitive + bench (`coastline_geom`,
+   `diag_polygon_los`). No production callers yet.
+2. Polygon-aware waypoint mesh (`Navmesh::build_from_polygons`).
+   Validate via `diag_mesh_coverage` (dead-pocket count → ~0) and
+   `bench_pathfind` (all 1406 routes still found).
+3. Thread the new substrate through `PathfindContext`,
+   `compute_steering`, `deflect_for_land`, and the `world.rs` motion
+   sweep. Old raster paths remain callable.
+4. Validate: tests, `bench_trade -- 730` incident count ≤ 10
+   (from 256), no observable stuck ships in viz.
+5. Cleanup: remove `visible_from` LOS-blocked fallback, the speed=0
+   forced halt, and unused raster LOS callers.
+
+**WIP stashed:** `stash@{0}` contains the telemetry +
+`diag_mesh_coverage` + steering tweaks. The telemetry and diag tools
+are worth cherry-picking when ready; the steering tweaks become
+unnecessary once Phase 3 lands.
+
+
+---
+
+## 2024-xx (post-Phase-1): pivot to convex-tile navmesh
+
+**Context.** After Phase 1 of the nav overhaul landed
+(`coastline_geom` bilevel LOS primitive, commit a150e72), the next
+question was how to *place* waypoints so coverage is guaranteed.
+
+**Alternatives considered.**
+1. *Offset-coastline ring + open-water grid* — sample a 5 NM offset
+   from each coastline polyline, lay nodes every 5 NM along it. Pro:
+   simple. Con: offset direction is ambiguous on isolated polylines;
+   self-intersections in concave bays; no guarantee that every sea
+   point has LOS to a waypoint.
+2. *Coverage-driven deficit repair* — start with open-water grid,
+   scan sea cells, add waypoints wherever no existing waypoint is
+   LOS-clear. Pro: guarantees LOS coverage at the scan stride. Con:
+   the new waypoints can be in isolated concave pockets with no edges
+   to the main graph; needs a separate connectivity-repair pass.
+3. *Convex partition of the navigable sea polygon (CHOSEN).* Treat
+   the sea as a polygon-with-holes (world bounds minus union of land
+   polygons). Convex-partition it (Hertel–Mehlhorn or Keil). Tile
+   centroids become the navmesh nodes; adjacency becomes the edge set.
+
+**Why (3) wins.** Two structural properties fall out for free:
+
+- T convex ⇒ every point in T has LOS to centroid(T).
+- A, B adjacent convex tiles sharing edge e ⇒ segment
+  centroid(A)→centroid(B) crosses e and lies in A∪B, which is all sea.
+  So centroid-to-neighbor-centroid LOS is *guaranteed by construction*.
+
+No coverage scan, no offset distance to tune, no isolated-pocket
+handling. Path planning becomes a clean tile-graph A*; ship
+localization becomes O(log n) point location.
+
+**Implementation split.** Polygon Boolean union + CDT + convex merge
+is hard to do robustly. Shapely + Shewchuk's `triangle` in Python are
+mature; the equivalent Rust stack (`geo`/`i_overlay` + `spade` +
+hand-rolled merge) is doable but a lot of code. Decision: build the
+navmesh *offline* via a new Python script
+(`tools/preprocess/preprocess_navmesh.py`), ship `data/grids/navmesh.bin`,
+runtime just loads it. Matches the existing `coastline.bin` /
+`land_polys.bin` pattern; runtime stays minimal.
+
+**Fallback.** Test worlds without polygon data fall back to the
+legacy `Navmesh::build(land)` raster build (already exists),
+preserving existing unit-test behavior.
+
+
+---
+
+## 2026-05-26 — NavMesh Preprocessing Overhaul (Phase 1: Python + Visuals)
+
+**Context.** The previous `preprocess_navmesh.py` had two bugs and a performance problem:
+1. *Projection flaw*: shore buffer was applied in flat lat/lon degrees; at 60°N a 1 NM buffer was only ~0.5 NM wide east-west (cosine shrinkage).
+2. *Centroid LOS Fallacy*: no portal coordinates stored; the Rust pathfinder was routing centroid-to-centroid, which clips land on Hertel–Mehlhorn "L-shaped" merged tiles.
+3. *Steiner performance*: ~13k individual Shapely `contains()` calls per grid generation.
+
+**Decisions:**
+
+1. **Buffer distance: 0.25 NM (not 1 NM).** User requested small default to keep narrow channels (Delaware, Maracaibo) navigable. Can be increased per-run if more coastal clearance is needed.
+
+2. **Projection: EPSG:3857 via pyproj.** All buffering and simplification now performed in Web Mercator meters. Buffer is isotropic at each latitude (conformal projection). Ships no longer scrape east/west-facing coasts at high latitudes.
+
+3. **Binary format v2 (portals).** Each neighbor entry now carries `(u32 tile_index, f32 portal_x, f32 portal_y)` — the exact midpoint of the shared polygon edge. Rust pathfinder will route `Centroid_A → Portal_AB → Centroid_B`, guaranteeing no land crossing on merged tiles.
+
+4. **Steiner optimization: MultiPoint intersection.** Replaced O(N) per-point `contains()` loop with a single `sea.intersection(MultiPoint(...))` call. Shapely 2.0 vectorises this internally.
+
+5. **`visualize_navmesh.py` overhauled.** Now supports:
+   - `--shp` for land background
+   - `--shore-margin-nm` to show the buffer contour (uses same EPSG:3857 pipeline)
+   - `--portals` to show portal midpoints as orange dots
+   - `--input` now optional (can render land+buffer without navmesh.bin)
+
+**Results.** 39,079 tiles, 1 connected component, 2.96 MB. Three images written to `planning/`:
+  - `buffer-contour-025nm.png` — full map with 0.25 NM buffer contour
+  - `navmesh-full.png` — full map with tiles + buffer + portals
+  - `navmesh-caribbean.png` — Caribbean zoom with tiles + buffer + portals
+
+**Pending (separate step):** Update Rust `navmesh.rs` / `world.rs` to load from `navmesh.bin` instead of building programmatically from `LandMap`. Narrow-waterway handling to be reviewed after visual inspection.
+
+---
+
+## 2026-05-26 — NavMesh Visualization & Design Exploration
+
+**Context.** Following the Python overhaul (preprocess_navmesh.py, visualize_navmesh.py), we spent a session exploring the navmesh design space before committing to Rust alignment.
+
+**Buffer tuning (0.25 → 0.5 → 0.3 → 0.1 NM):**
+- 0.25 NM: 39,079 tiles, 213 components. Too many tiles, too many orphans.
+- 0.5 NM: 32,078 tiles, 603 components. Closed too many narrow passages.
+- 0.3 NM: 35,363 tiles, 299 components.
+- 0.1 NM (chosen): 42,807 tiles, only 28 components. Best connectivity; 0.1 NM (185 m) buffer is enough to smooth coastal staircasing without closing Delaware Bay or similar passages. Harbor anchors in ports.ron already handle river-mouth ports (Philadelphia at bay mouth, 30 NM harbor radius).
+
+**Skeleton / Voronoi exploration:**
+- Tested a Voronoi-based topological skeleton (`visualize_skeleton.py`) as an alternative to convex tiles.
+- Problem: Voronoi of discretized coastline samples produces a zigzag pattern in narrow channels rather than a clean centerline. This is a known limitation; the correct solution (straight skeleton via CGAL/scikit-geometry) was not installed.
+- Decision: stay with convex-tile approach. Tile centroids are guaranteed-safe routing nodes; portal routing (Centroid_A → Portal_AB → Centroid_B) eliminates land crossings.
+
+**Shortcut edges (added to visualizer, not yet baked into navmesh.bin):**
+- Identified pairs within N NM where the convex-tile graph path is > 2× the direct water distance.
+- Implemented `--shortcuts-nm` in visualize_navmesh.py using KD-tree + Shapely water check + scipy Dijkstra.
+- Results: 5,041 shortcuts at 12 NM, 6,405 at 15 NM, 11,083 at 24 NM, 22,228 at 50 NM.
+- **Not yet baked into navmesh.bin** — deferred pending Rust alignment and architecture decisions about tactical vs. strategic routing.
+
+**Visualizer upgrades added this session:**
+- `--mst`: MST of centroid adjacency (green backbone)
+- `--full-graph`: all 50,053 tile-adjacency edges
+- `--shortcuts-nm`: orange shortcut edges
+- `--ports-ron`: port markers from ports.ron
+- `--no-tiles`: suppress tile polygons (centroids + lines only)
+- Reader updated to use `struct.unpack_from("<Iff", ...)` for neighbor records (byte-alignment safe)
+- Portal dots (`--portals`) verified drawing correctly
+
+**Architecture questions deferred to next session:**
+1. Shortcut edges: bake into navmesh.bin or compute at Rust load time?
+2. Point-location: given a ship's Position, how to find its tile in O(log n)?
+3. Tactical vs. strategic routing: SSSP pre-baked for port-pair routes; online A* for flee/pursue/guard. Open question: is 50 NM Steiner spacing fine enough for tactical decisions (ship moves ~12 NM/hr)?
+
+**Next action:** Rust alignment — update navmesh.rs / world.rs to load navmesh.bin (portal-aware format) instead of building from LandMap.
+
+---
+
+## 2026-05-26 — Ship navigation: substrate swap (plan agreed)
+
+**Context.** The convex-tile portal navmesh is now produced offline by
+`preprocess_navmesh.py` (`data/grids/navmesh.bin`, ~43k tiles at 0.1 NM
+shore margin). Polygon-aware LOS exists as `coastline_geom` (Phase 1
+of the older overhaul, no production callers yet). Ship movement and
+pathing still run on the 1 NM `LandMap` raster — the substrate that
+caused the stairstep wedging in concave bays.
+
+**Decision.** Switch ship navigation off the raster in a piecemeal
+pass. Keep `LandMap` loaded as `coastline_geom`'s positive-filter
+speedup and for unchanged callers (shipyard, weather, harbor cell
+lookups elsewhere). No big-bang removal.
+
+**Design choices (this session):**
+
+1. **Path planning** — string-pulling (Simple Stupid Funnel) through
+   the portal corridor produced by A* on tile centroids. Portal
+   midpoints are guaranteed safe by construction; the funnel produces
+   near-shortest polylines inside the tile chain. Each output segment
+   is LOS-validated by `coastline_geom::line_is_clear` as a safety net.
+
+2. **Tile lookup** — uniform-grid hash on tile **centroids only**.
+   Queries are always "nearest few LOS-visible centroids from `pos`",
+   never point-in-tile. Tiles can be sharp shards without consequence
+   because we don't ask which one we're in. The navmesh is for
+   navigation, not for any "is this point in water" authority.
+
+3. **No `is_land` check on ship positions.** Ships cannot legitimately
+   be on land (docking/careening abstract the ship as just off-coast),
+   so being in water is invariant, not a runtime check. The motion
+   sweep needs `first_land_hit(ray)` for look-ahead deflection; the
+   pathing needs `line_is_clear(a, b)` for visibility / smoothing.
+   Both already exist on `coastline_geom`.
+
+4. **Harbor zone** — drop `Harbor.cells: HashSet<(u32,u32)>`. New
+   contract: `dist(pos, port.position) ≤ harbor_radius_nm` AND
+   `line_is_clear(pos, anchor)`. Each port gets an `anchor_tile`
+   derived at world-load: nearest LOS-visible centroid to
+   `port.position`, with a tile-graph BFS fallback for river-mouth
+   ports (Philadelphia etc.) whose coordinate sits on land at the
+   coastline polygon's resolution.
+
+5. **Substrate scope today** — replace the raster only in:
+   - `pathfind.rs` (LOS short-circuit + smoothing)
+   - `portroutes.rs` (entry-tile derivation)
+   - `nav.rs::deflect_for_land` (forward probe)
+   - `world.rs` motion sweep (`farthest_clear_point` → `first_land_hit`)
+   - `harbor.rs` (anchor + contains)
+   Everything else keeps using `LandMap` until later passes render it
+   obsolete.
+
+**Rejected alternatives.**
+- *Portal-midpoint waypoints only* (no funnel): cheaper but the paths
+  zig-zag visibly through every portal, hurting both visual quality and
+  effective speed. The funnel pass is ~150 LOC and well-understood.
+- *KD-tree / R-tree / Delaunay-walk for point location*: overkill once
+  we realised we never need point-in-tile, only nearest-centroid +
+  LOS filter.
+- *Polygon harbor zones* (union of tiles within radius): symmetric
+  but adds offline build-time complexity for no observable behavior
+  change vs. the distance + LOS predicate.
+- *Big-bang LandMap removal*: too much surface in one pass, and
+  `coastline_geom` already wants the raster as its positive-filter
+  speedup.
+
+**Phases (each independently committable).**
+- **A** Load `navmesh.bin` into a portal-aware `TileMesh` (no behavior
+  change yet).
+- **B** New `Harbor` (anchor + anchor_tile), drop cell BFS.
+- **C** Rewrite `pathfind.rs` — A* on tiles → portal corridor → funnel
+  smoothing → LOS-validated waypoints.
+- **D** `PortRouteCache` SSSP on the tile graph; same `route_from`
+  contract.
+- **E** `nav.rs::deflect_for_land` and `world.rs` motion sweep use
+  `coastline_geom::first_land_hit`.
+- **F** Wire `CoastlineGeom` into `World::load`; validate via
+  `bench_pathfind`, `bench_trade --days 60`, and visualizer
+  spot-check (expectation: stuck/slow incident count drops to near
+  zero).
+- **G** Cleanup — delete `Navmesh::build(&LandMap)`, `bfs_zone`, and
+  the raster anchor snap. `LandMap` stays loaded for unchanged
+  callers.
+
+**Out of scope this pass.** Migrating ports to tile-ids; removing the
+raster fast-path inside `coastline_geom`; baking shortcut edges from
+the visualizer experiments; per-ship cached current-tile tracking.
+
+---
+
+## 2026-05-27 — Ship navigation Phase B: tile-anchored harbors
+
+**Phase A** (committed `1872691`) landed the portal-aware `TileMesh`
+loader for `data/grids/navmesh.bin`. **Phase B** (committed `d2058fb`)
+swaps the `Harbor` representation off the 1 NM raster cell-set and
+onto a tile-centroid anchor:
+
+- `Harbor` drops `cells: HashSet<(u32,u32)>` and gains `port_pos`,
+  `harbor_radius_nm`, `anchor: Position` (a tile centroid),
+  `anchor_tile: Option<u32>` (`TileMesh` index), and `bbox`.
+- `HarborMap::build(land, tile_mesh, ports)` picks the
+  geometric-nearest tile centroid per port via the `TileMesh`
+  centroid hash, with an expanding-shell fallback for ports outside
+  the initial 80 NM scan.
+- `Harbor::contains_pos(land, pos)` keeps the raster LOS clause
+  between the **ship's** position and the anchor (still meaningful;
+  ships are in water by invariant). Phase E will swap it for
+  polygon-truth `coastline_geom::line_is_clear`.
+- `World` now loads `TileMesh` from disk and stores it alongside the
+  legacy `Navmesh` (which Phase C will retire from the path planner).
+
+**Reversal from the plan**: the original Phase B spec had a two-stage
+anchor search — nearest LOS-visible centroid, then tile-graph BFS
+fallback for river-mouth ports. In practice it skipped 23 of 38
+ports because the `ports.ron` coordinates are fudged onto land (the
+authoritative coords are still being researched by the background
+agent). With no `port_pos` LOS line possible, the BFS exhausted with
+nothing to return. We replaced both stages with a flat
+geometric-nearest-centroid lookup: the navmesh preprocessor already
+guarantees the centroid is in clean water (largest connected ocean
+component, 0.1 NM shore margin), so it's always a safe planner
+target even when the city itself is on land. The LOS clause remains
+in `contains_pos` where it actually matters.
+
+**Status of the legacy raster path planner under tile anchors.**
+`bench_pathfind` now attempts all 1406 routes (was 555, because half
+the harbors had previously been skipped). 1056 succeed; 350 return
+no-path. Cause: the legacy `find_path_to_harbor` still uses the old
+`Navmesh` (raster-derived graph) and `LandMap::corridor_is_clear` to
+plan paths, and requires the anchor be visible-from at least one
+old-Navmesh node via a zero-margin raster corridor. Tile centroids
+are derived from the polygon coastline (different discretization);
+for a chunk of ports the centroid lands in a raster cell that's
+classified as land, so the planner can't connect to it. Phase C
+fixes this by routing on `TileMesh` directly, eliminating the
+anchor-source vs planner-source mismatch.
+
+**Phase C blocker carried forward.** SSFA needs `(left, right)`
+portal edge endpoints, but `navmesh.bin` v2 stores only the portal
+**midpoint** per edge. We will reconstruct the endpoints by
+intersecting adjacent tiles' vertex lists during corridor stitching
+(the vertices are present per tile). Confirm before implementing.
+
+---
+
+## 2026-05-28 — Ship navigation Phase C (planner on TileMesh + SSFA funnel)
+
+**Context.** Phase B left the planner on the legacy raster `Navmesh`
+while harbors moved to tile anchors, producing a substrate mismatch
+(1056/1406 routes solved in bench). Phase C rewires the planner onto
+the `TileMesh` with portal-corridor funnel smoothing so the planner,
+the harbors, and the underlying mesh are finally on the same
+substrate.
+
+**Mechanism.**
+1. `TileMesh::shared_edge(a, b)` returns the two vertices shared by
+   two adjacent tiles, oriented `(left, right)` from the perspective
+   of someone in tile `a` looking toward `b`. Orientation uses a 2D
+   cross product `(b - a) × (p - a)`; positive = LEFT. Vertex match
+   tolerance is ε=0.05 NM.
+2. Free function `tile_mesh::funnel(start, end, portals)` is a
+   straight implementation of Mikko Mononen's Simple Stupid Funnel
+   Algorithm. **Sign-convention gotcha**: my `triangle_area2` is the
+   negation of Mononen's reference (`(b-a)×(c-a)` vs `(c-a)×(b-a)`),
+   so all of his `<= 0` / `>= 0` conditions must be flipped. Caught
+   by one failing test. The output corridor is sealed with a
+   degenerate `(end, end)` portal so the algorithm terminates
+   cleanly; output excludes `start` but always includes `end`.
+3. `pathfind::tile_mesh_path` pipeline: nearest centroids (≤8 within
+   50 NM) → A* over tile graph → reconstruct `(left, right)` chain
+   via `shared_edge` → SSFA → per-segment validate with
+   `land.corridor_is_clear(SMOOTH_MARGIN_NM=2.0)` → on validation
+   failure, fall back to the raw centroid chain (provably safe
+   inside convex tiles).
+4. `PathfindContext` gained `tile_mesh: Option<&TileMesh>` + a
+   `with_tile_mesh()` builder. `find_path` / `find_path_to_harbor`
+   prefer the tile mesh when attached and fall back to the legacy
+   `Navmesh` otherwise. For harbor pathing, the goal set is seeded
+   with `anchor_tile ∪ neighbors(anchor_tile)` so the funnel has
+   room to smooth into the harbor mouth.
+
+**Validation.** `bench_pathfind`: 1406/1406 ok (was 1056/1406 after
+Phase B), avg 0.33 ms, max 4.58 ms. 238 tests pass, clippy clean.
+
+**Coordinates updated in same change.** Applied the
+`planning/research/port-coordinates.md` corrections to
+`data/registries/ports.ron`: 9 ports moved ≥5 NM (Philadelphia,
+Amsterdam, Maracaibo, Cartagena, Boston, London, Paramaribo, Ouidah,
+Tobago, Margarita, Charleston, Santiago). Amsterdam moved to
+historically-correct Texel Roads (4637, 2129) — was a workaround
+position at IJmuiden under the old raster harbor model; the new
+tile-anchored harbors handle Texel Roads cleanly. Kingston (founded
+1692, anachronism in 1680) placed at the Port Royal anchorage as a
+placeholder. Philadelphia (founded 1682, borderline) placed at the
+outer Delaware Bay off Cape Henlopen — the ship-accessible
+anchorage. See `port-coordinates.md` §4 for the open questions.
+
+**Phase D blocker.** `PortRouteCache` is still on the legacy
+`Navmesh`. Bench shows live A* on the TileMesh is fast enough
+(avg 0.33 ms), but per-port SSSP cache on the TileMesh is still the
+proper Phase D and removes the last planner dependency on the
+legacy mesh.
+
+---
+
+## 2026-05-28 — Ship navigation Phase D (PortRouteCache on TileMesh)
+
+**Context.** After Phase C the live planner ran on the `TileMesh`, but
+`PortRouteCache` was still keyed by legacy `Navmesh` node ids, so the
+"cached" harbor path was actually slower than the fresh tile-mesh
+A* (it ran the legacy raster mesh and ignored the funnel). Phase D
+rewires the cache onto the tile mesh.
+
+**Mechanism.**
+1. `PortRouteCache::build(tile_mesh, harbors)` runs a multi-source
+   Dijkstra over `TileMesh::neighbors` for each port. Sources =
+   `{ anchor_tile } ∪ neighbours(anchor_tile)` — same set the live
+   planner uses as the goal set for harbor pathing, so the cached
+   route can hand off to the SSFA funnel with the same corridor
+   shape.
+2. `PortRouteCache::route_from(starts, port_idx)` walks the
+   predecessor chain to return a tile-id sequence; same contract as
+   `TileMesh::route` so the stitching pipeline doesn't care which
+   produced it.
+3. `pathfind::find_path_to_harbor` now prefers the cache when both
+   `tile_mesh` and `port_routes` are attached; cache miss silently
+   falls through to live `tile_mesh_path` (Phase C), then to the
+   legacy `navmesh_path` (Phase A backstop).
+4. The shared-edge → SSFA → segment-LOS validate → centroid-chain
+   fallback pipeline was extracted from `tile_mesh_path` into
+   `stitch_tile_route(land, mesh, start, terminal, route)` so the
+   cached and live paths emit identical waypoints from identical
+   tile routes.
+
+**Validation.** 238 tests pass, clippy clean. `bench_pathfind`:
+1406/1406 ok, avg 0.32 ms, max **2.44 ms** (Phase C live A* was
+4.58 ms max). The 38 SSSP builds add a small one-time cost at world
+load — far below the legacy `Navmesh` cache's ~1 s.
+
+**Status.** The PortRouteCache is now fully off the legacy Navmesh.
+`Navmesh::build(&LandMap)` is still loaded and remains the backstop
+inside `PathfindContext`; Phase G will remove it once the motion
+sweep migration (Phase E) lands and no caller is left.
+
+---
+
+## 2026-05-28 — Ship navigation Phase E (motion sweep + deflection on polygon truth)
+
+**Context.** Phases A–D moved the planner and harbors off the raster
+`LandMap` substrate but the per-tick motion sweep was still using
+`LandMap::farthest_clear_point` and the reactive deflection in
+`nav.rs` was still probing `LandMap::line_is_clear`. Phase E pulls
+both onto the polygon-truth `CoastlineGeom`.
+
+**Refactor of `CoastlineGeom`.** Was `CoastlineGeom<'a>` borrowing
+`&'a LandMap`; now it's an owned struct (no lifetime) so it can sit
+on `World` for the duration of a run. Bilevel queries take `&LandMap`
+as a parameter — the polygon mesh is truth, the raster is a
+positive pre-filter the caller supplies. Public methods affected:
+`is_land`, `line_is_clear`, `first_land_hit`, plus a new
+`farthest_clear_point(land, a, b)` that wraps `first_land_hit` and
+pulls back by 0.02 NM (~37 m) so the result sits cleanly off the
+polygon edge instead of grazing it.
+
+**Motion sweep rewrite (`world.rs`).** The old raster-rescue clause
+(snap-to-nearest-sea-cell when `is_land(ship.position)`) is **gone**.
+Port coordinates now sit at true offshore anchorages (Phase B +
+historical-coordinate update), and the polygon `is_land` won't
+misclassify a sea position as land. The rescue's only justification
+was the 1-NM raster staircasing the coastline. Replaced with a
+`debug_assert!` that surfaces real bugs instead of papering over
+them. The motion sweep itself now calls
+`coastline_geom.farthest_clear_point(&land, old, new)`.
+
+**Deflection (`nav.rs`).** Introduced `NavTerrain { geom, land }`
+to bundle the two references `compute_steering` needs. Signature
+changed from `Option<&LandMap>` to `Option<NavTerrain<'_>>`;
+`deflect_for_land` and `sweep_clear` likewise. The probe is
+`terrain.geom.line_is_clear(terrain.land, pos, end)` — polygon
+truth with the raster as its fast pre-filter. Tests pass `None`
+unchanged.
+
+**Wiring.** `PathfindContext` gained `coastline_geom:
+Option<&'a CoastlineGeom>` + a `.with_coastline_geom()` builder.
+`World::tick_hourly_ai_and_physics` attaches it. The AI then
+materialises `NavTerrain` from the context for each
+`compute_steering` call.
+
+**Validation.** 238 tests pass, clippy clean. `bench_pathfind`:
+1406/1406 ok, avg 0.32 ms, max 2.01 ms (was 2.44 ms). `bench_trade
+60 days × 503 ships`: 23 ships in the red (vs 25 at the Phase D
+baseline — unrelated economic drift, not a Phase E regression).
+Crucially, the polygon-truth `is_land` debug_assert NEVER fired
+across the full 60-day run — confirming the raster rescue is no
+longer needed.
+
+**Status.** `LandMap` is still loaded; it backs the bilevel
+pre-filter inside `CoastlineGeom` queries and is used by the
+remaining raster-based callers (`pathfind::tile_mesh_path`'s
+`corridor_is_clear` validate step, weather, shipyard, etc.).
+Phase G can now drop `Navmesh::build(&LandMap)` (no movement
+caller left), but `LandMap` itself stays.
+
+---
+
+## 2025 — Phase G: drop legacy `Navmesh`
+
+**Context.** Phases A–E moved every movement-side caller off the
+raster-derived `Navmesh` and onto the portal-aware `TileMesh` +
+polygon-truth `CoastlineGeom`. With no remaining caller, the
+~540-line `navmesh.rs`, its diagnostic example, the
+`PathfindContext::navmesh` field, and the `navmesh_path` A* fallback
+were all dead weight.
+
+**Change.** Deleted `crates/sim-core/src/navmesh.rs` and
+`examples/diag_navmesh.rs`. Removed `pub mod navmesh;` and the
+`World::navmesh` field. `PathfindContext::tile_mesh` is now a
+required `&'a TileMesh` (no longer `Option<&'a TileMesh>`); the
+`find_path` / `find_path_to_harbor` `navmesh_path` fallbacks are
+gone — if the tile mesh has no route, the planner returns `None`.
+Added `TileMesh::empty()` for tests that don't exercise the
+routing pipeline.
+
+**Visualizer.** `draw_navmesh_nodes` → `draw_tile_centroids`,
+reading `world.tile_mesh.tiles[i].centroid`. The dot overlay still
+audits planning-substrate coverage, just on the new substrate.
+
+**Validation.** `cargo fmt --all`, `cargo clippy --workspace
+--tests -- -D warnings`, `cargo test --workspace` (237 pass; the
+old `path_avoids_land_obstacle` unit test was deleted because the
+new pipeline is exercised by `bench_pathfind`'s 1406 real-world
+routes). `bench_pathfind`: 1406/1406 ok, avg **0.01 ms**, max
+**0.15 ms** — order-of-magnitude faster than the Phase D baseline
+(0.33 ms / 2.44 ms), because the planner no longer threads the
+`Navmesh` reference through every call site or compiles the
+fallback A*.
+
+**Status.** Migration complete. `LandMap` stays loaded as the
+bilevel pre-filter inside `CoastlineGeom` queries and for the
+remaining raster callers (weather, shipyard, harbor `is_land`
+checks). No further legacy-navmesh code remains in the workspace.
+
+**Note (pre-existing).** `cargo clippy --examples` flags
+`unusual_byte_groupings` in `examples/diag_polygon_los.rs` —
+committed in Phase E, unrelated to this cleanup.
+
+---
+
+## 2025 — pathfind: polygon-truth corridor LOS
+
+**Context.** After Phase G the only consumers of
+`LandMap::corridor_is_clear` inside the planner were the three
+LOS checks: `find_path`'s start-to-goal short-circuit,
+`find_path_to_harbor`'s start-to-anchor short-circuit, and
+`stitch_tile_route`'s per-segment SSFA validation. Raster LOS
+over-rejects narrow channels (it rounds land outward by half a
+cell at the 1 NM grid), forcing detours through tile-mesh A*
+where a polygon-truth check would just take the direct line.
+
+**Change.** Added `CoastlineGeom::corridor_is_clear(land, a, b,
+margin_nm)`: three parallel polygon-LOS rays (center + ±perp
+offsets at `margin_nm`). Exact for any land polygon whose
+footprint reaches at least one of the three rays — which covers
+every coastline feature in the bundled mesh at the planner's
+2 NM margin. Falls back to `LandMap::corridor_is_clear` when no
+polylines are loaded (test fixtures).
+
+`PathfindContext::coastline_geom` is now a required `&'a
+CoastlineGeom` (dropped the `Option` and `.with_coastline_geom()`
+builder — mirrors how Phase G made `tile_mesh` required). All
+three callsites swapped from `land.corridor_is_clear(…)` to
+`geom.corridor_is_clear(land, …)`. `tile_mesh_cached_path`,
+`tile_mesh_path`, and `stitch_tile_route` now take an extra
+`geom: &CoastlineGeom` argument. `ai.rs` simplifies its
+`NavTerrain` materialisation: was `and_then(|c| c.coastline_geom
+.map(…))`, now `map(|c| NavTerrain { geom: c.coastline_geom, …
+})`.
+
+**Validation.** 237 tests pass, clippy `--workspace --tests`
+clean. `bench_pathfind`: 1406/1406 ok, avg 0.02 ms, max **0.31 ms**
+(vs 0.15 ms in Phase G — the per-segment polygon LOS does
+slightly more work than raster LOS for routes that traverse many
+tiles, but it now validates against the exact coastline instead
+of the rasterized one). `bench_trade 60 days × 503 ships`: 23 in
+the red — identical to Phase G, no behavioral regression.
+
+**Status.** `LandMap::corridor_is_clear` is no longer called by
+movement-side code, but stays available as the polygon-free
+fallback inside `CoastlineGeom::corridor_is_clear`. The raster is
+still used by `CoastlineGeom`'s bilevel queries (open-water
+fast-path inside `line_is_clear` / `first_land_hit`) and by
+non-movement callers.
+
+---
+
+## 2025 — harbor: polygon-truth LOS in `contains_pos`
+
+**Context.** With the planner on polygon LOS, the only remaining
+raster-LOS call in the movement path was `Harbor::contains_pos`'s
+`land.line_is_clear(pos, anchor)` check that rejects "in radius
+but on the wrong side of a peninsula" memberships.
+
+**Change.** `contains_pos` now takes `&CoastlineGeom` alongside
+`&LandMap` and dispatches to `geom.line_is_clear(land, pos,
+anchor)`. Callers (`ai.rs::Heart::find_path_to_harbor` and
+`pathfind::find_path_to_harbor`) pass `pf.coastline_geom`
+through. Unit tests build a `CoastlineGeom::empty(&land)` which
+correctly falls back to the raster path inside `line_is_clear`
+when `has_polylines == false`.
+
+**Validation.** 237 tests pass, clippy clean. `bench_pathfind`
+unchanged (1406/1406 ok, max 0.32 ms). No behavioral change
+expected — `line_is_clear` returns identical verdicts to the
+raster on this fixture's clear cases, and the polygon path
+correctly catches the peninsula-blocked case.
+
+**Status.** No raster LOS calls remain on the ship-movement
+path. `LandMap` is still loaded for `CoastlineGeom`'s bilevel
+pre-filter and for non-movement callers.
+
+---
+
+## 2025 — Port refactor, harbor proximity, deflection-aware combat steering
+
+**Context.** With Phases A–G of the tile-mesh/polygon-truth refactor
+landed, ships at Port Royal (and a handful of other small-harbor
+ports) were observed pinning against coastlines at `speed = 0`, or
+oscillating 180° in tight straits.
+
+**Changes shipped together as one navigation-robustness pass.**
+
+1. **Ports → real-world coordinates.** `data/registries/ports.ron`
+   now stores `coord: (lat, lon)` (WGS84 decimal degrees). The
+   `PortRecord` projects to engine NM at load using
+   `ORIGIN_LAT_DEG=17.5`, `ORIGIN_LON_DEG=-72.5`, `NM_PER_DEG=60.0`.
+   Kingston was removed (it merges into Port Royal for the period).
+   `tools/preprocess/visualize_navmesh.py` updated to parse the new
+   schema. No behavioural change vs. the back-calculated NM
+   coordinates that were committed in Phase B; this just makes the
+   data file self-documenting and editable from a chart.
+
+2. **Harbor proximity short-circuit.** `harbor::ANCHOR_PROXIMITY_NM`
+   raised 6 → 12 NM (matches `ARRIVAL_NM`) and the proximity check
+   runs *before* the bbox check in `Harbor::contains_pos`. This
+   closes the 6–12 NM "purgatory" annulus where `compute_steering`
+   reported arrived but `contains_pos` said not docked, causing the
+   ship to thrash near the anchor.
+
+3. **Entry-tile LOS filtering.** `pathfind::nearest_visible_entry_tiles`
+   filters candidate start/goal centroids by polygon LOS from the
+   reference position, falling back to unfiltered nearest when no
+   visible centroid exists. Used by `tile_mesh_path`,
+   `tile_mesh_cached_path`, and `find_path_to_harbor`.
+   `PortRouteCache::build` likewise restricts each port's source
+   set to anchor + LOS-clear neighbours.
+
+4. **Cooldown-gated final-replan with mandatory Steer.**
+   `ai.rs` `act_sail`'s "arrived at last waypoint but not in harbor"
+   branch now (a) gates the implicit replan on
+   `replan_cooldown_ticks`, and (b) ALWAYS emits a `Steer` command —
+   either a fresh deflection-aware steer after a successful replan,
+   or `Steer { ship.heading, 0.0 }` as a halt. Without (b),
+   `ship.heading` stayed stale for up to 30 cooldown ticks while the
+   motion sweep kept sailing into the coast.
+
+5. **Full-360° deflection scoring.** `nav::deflect_for_land` rewritten
+   to score all 36 candidate headings by clear-distance via a new
+   `heading_clear_distance` helper, breaking ties on smallest
+   absolute deflection. Guarantees the emitted heading has *some*
+   forward clearance in the chosen direction.
+
+6. **Combat steering honours the no-aground invariant.** Found that
+   `act_pursue`, `act_flee`, and `act_board` each emitted `Steer`
+   commands built directly from target/threat geometry, bypassing
+   `compute_steering` and therefore `deflect_for_land`. This was the
+   dominant remaining source of "stuck-at-coast" ships: any
+   engagement near a coastline produced a heading aimed straight at
+   land. New `nav::tactical_steering(...)` helper deflects the
+   desired heading the same way `compute_steering` does and recomputes
+   wind-adjusted speed at the resulting heading. All three combat
+   actions now route through `ShipBtContext::tactical_steer`.
+
+**Outstanding issue: numerical robustness in `coastline_geom`.**
+`first_land_hit` and `line_is_clear` exhibit non-monotonic behaviour:
+probing the same ray from the same origin at different lengths can
+report `clear` for some lengths and `hit at <0.02 NM` for others — the
+hit point is the same when reported. Root cause is almost certainly
+catastrophic cancellation in the f32 `orient` cross-product when one
+of the two segments is very short relative to the polygon edge being
+tested. Practically this means: even with the deflection now
+correctly selecting a clear heading, the motion sweep's short-segment
+probe sometimes mis-reports it as blocked, pinning the ship.
+Untouched in this pass; the right cure is either promoting the
+geometry kernel to f64 or moving entirely onto the portal-aware
+tile-mesh substrate per the planned next phase. Symptom now observed:
+a small handful of ships oscillate 180° in tight straits (e.g.
+Basse-Terre channels) where the deflection picks one valid escape
+heading, the motion fails the short-probe, deflection on the next
+tick picks the opposite escape, motion fails again — repeat.
+
+**Validation.** 237 tests pass; clippy clean; `bench_pathfind` 1332/1332.
+
+---
+
+## 2025 — Route preference: stay >= 1 NM from land
+
+**Symptom.** SSSP-cached harbor routes hug the coast — Dijkstra over
+the tile-centroid graph with raw `dist_nm` edge cost picks the
+straightest path, which often means tiles whose centroids sit a
+fraction of a nautical mile from the polygon coastline. Combined
+with the unresolved f32 robustness bug in `coastline_geom`, ships
+along those routes frequently end up grazing land and oscillating.
+
+**Fix.** Soft "stay offshore" preference baked into both the cached
+SSSP and the live A*, sharing a single per-tile clearance vector.
+
+- `CoastlineGeom::clearance_nm(pos, max_radius_nm)` — bucket scan
+  returning the minimum point-to-segment distance to any indexed
+  coastline edge, capped at `max_radius_nm` (with new
+  `point_segment_dist_sq` helper).
+- `TileMesh::clearance_nm: Vec<f32>` — one entry per tile, populated
+  once at `World::load` by sampling `CoastlineGeom::clearance_nm` at
+  each centroid (cap `CLEARANCE_MAX_NM = 2.0`).
+- `TileMesh::edge_cost(from, e) = e.dist_nm * clearance_penalty(min(c_a, c_b))`
+  with `clearance_penalty(c) = 1 + 9 * max(0, (1 - c/1.0))^2`.
+  Quadratic ramp from 1× at c >= 1 NM up to 10× at c = 0. A path
+  forced against the coast still wins over a >10× detour, but a
+  straight near-coast cut loses to an open-water sweep when the two
+  are similar in length. A* heuristic stays admissible (penalty >= 1).
+- `dijkstra_from_sources` (in `portroutes.rs`) and `TileMesh::route`
+  both go through `mesh.edge_cost`, so the cached SSSP and the live
+  fallback agree on what "good route" means.
+
+**Smoothing.** A runtime LOS string-pull post-pass was prototyped in
+`stitch_tile_route` but immediately reverted: visually the funnel
+output is still jagged because the centroid+portal corridor itself
+zigzags through small open-water tiles, and the per-query relax did
+not solve it. The agreed direction is to do route simplification at
+build time (either in `PortRouteCache::build` or in the navmesh
+preprocessor) rather than per-query — deferred to a later pass.
+
+**Validation.** `cargo test --workspace` green; `clippy -D warnings`
+clean; `bench_pathfind` 1332/1332 (0.02 ms avg, 0.34 ms max — small
+overhead vs prior). `bench_trade` 60-day run completes; no new
+calibration regressions.
+
+
+---
+
+## 2025-05-26 — Navmesh substrate: hex lattice + coastal CDT (preprocessor v2)
+
+**Problem.** Open-ocean routes through the old square-Steiner-grid
+navmesh (50 NM spacing, all-CDT tiling) produced visibly jagged
+heading commands. Ship paths from e.g. Cartagena to the English
+Channel zigzagged even far offshore because adjacent centroids did
+not line up on a regular lattice — every 1-2 minutes of sail the
+funnel handed steering a slightly different bearing. Two earlier
+attempts (route-build deep-water collapse, runtime 3-waypoint
+heading averaging) were rejected by the user on the grounds that the
+problem is the *substrate*, not the smoothing layer on top of it.
+
+**Decision.** Regenerate the navmesh with two distinct zones:
+1. **Deep water:** a flat-top **hex lattice at 12 NM pitch** (centre-
+   to-centre). Each hex is kept iff it is fully contained in the sea
+   polygon eroded by **1 NM**, guaranteeing a uniform offshore safety
+   margin. Centroids are exactly on the hex lattice, so a straight
+   open-ocean route hits a sequence of nearly-collinear centroids and
+   the funnel output stays straight.
+2. **Coastal annulus:** the existing CDT + Hertel–Mehlhorn pipeline,
+   run on `sea − ∪ hexes` with hex boundaries injected as constraint
+   segments and hex interiors as PSLG holes. Vertex indices are
+   shared with the hex set so adjacency stitches across the boundary
+   with no extra work.
+
+**Binary format bumped to v2.** Header is now `u32 NAVMESH_MAGIC`
+("NMV2", `0x32564D4E`) + `u32 num_tiles`, and every tile carries an
+`f32 clearance_nm` (distance from centroid to nearest land, capped at
+**30 NM**) directly in the file. The Rust loader rejects any file
+without the magic. `World::load` no longer recomputes clearance when
+the mesh already has it baked in.
+
+**Constants reshuffled.** `tile_mesh.rs`:
+- `NAVMESH_MAGIC = 0x32564D4E`
+- `DEEP_WATER_NM = 12.0` (one tile of clearance ≈ open water)
+- `CLEARANCE_MAX_NM` bumped 2.0 → 30.0 to match the preprocessor cap.
+  The clearance-penalty ramp only uses the 0-1 NM range, so the cap
+  is purely an upper bound on what the file is allowed to ship.
+
+**Pipeline outputs (current Caribbean+Atlantic dataset).**
+- Hex lattice candidates: 199,447; kept: 124,866.
+- Coastal CDT: 95,539 merged convex tiles.
+- Largest connected component: **200,826 tiles** total.
+- `navmesh.bin`: 22.9 MB (was ~7 MB; ~3× larger due to denser deep-
+  water tiling, but well inside acceptable for an offline preprocess
+  output, especially since `clearance_nm` is in-file now).
+
+**Validation.** `cargo fmt`, `clippy -D warnings`, `cargo test
+--workspace` (237 tests) all green. `bench_pathfind` 1332/1332 ok,
+26.5 ms total (avg 0.02 ms, max 0.39 ms). `bench_trade` 60-day run
+completes; no bankruptcies. Visualizer-inspected by user — approved.
+
+**Defaults landed on.**
+- `--hex-pitch-nm = 12.0`
+- `--hex-buffer-nm = 1.0`
+- `--coastal-segment-nm = 8.0` (max densified segment along sea
+  boundary rings in the CDT)
+- `--max-tile-diameter-nm = 24.0` (so coastal H–M merges produce
+  tiles roughly hex-sized)
+
+**Deferred.** The old `cdt_sea` and `--steiner-spacing-nm` path is
+no longer used but is still in the preprocessor source for now;
+delete it in a follow-up. The runtime "deep-water heading averaging"
+(`deep_water_target` in `nav.rs`) was tried and rejected in favour
+of the substrate fix; no surviving runtime smoothing layer.
+
+---
+
+## 2026-?? — Stuck-ship rescue attempts: all failed
+
+**Context.** After landing the portal-aware tile-route refactor
+(`PlannedPath { waypoints, tile_route }` plumbed through NavTrack;
+`compute_steering` falls back to `mesh.portal_between` when LOS to the
+next waypoint is blocked; `deflect_for_land` removed from the normal
+steering path), ships in the Delaware River and around New York Harbor
+still get **wedged at `speed = 0`** indefinitely. Hull is pinned
+against a polygon edge inside a narrow channel; the motion sweep keeps
+zeroing speed every tick. The portal-aware steering helps in open
+water and most coastal approaches but does not rescue ships already
+pressed against a coastline.
+
+**Failed approaches (all uncommitted, reverted).**
+
+1. **Stuck-tick replan.** Added `stuck_ticks: u16` on `ShipAI`,
+   `STUCK_SPEED_KT = 0.01`, `STUCK_REPLAN_TICKS = 2`. When stuck for
+   2 ticks with a destination set, force `replan_to_port` from truth
+   (snap `estimated_position` to `ship.position` first). Bypasses the
+   30-tick cooldown but only runs once per cooldown cycle so it can't
+   thrash. *Result:* ships still stuck; the new plan from the same
+   pinned position immediately re-encounters the same condition.
+
+2. **Hop to next waypoint (LOS-gated).** Before replanning, if
+   `waypoints[0]` is within 0.25 → 0.5 → 1.0 NM and polygon LOS-clear,
+   teleport hull to it, pop, reorient. *Result:* still stuck. Tried
+   each threshold; visualizer showed no improvement.
+
+3. **Hop to nearest waypoint with successor preference.** Find
+   `argmin_i dist(pos, waypoints[i])`, prefer `waypoints[i+1]` (in
+   case nearest is one we've drifted past), require LOS-clear. Discard
+   everything up to and including the hopped-to waypoint. *Result:*
+   still stuck.
+
+4. **Hop to nearest waypoint, no LOS check, within 1 NM.** User's
+   suggestion: just teleport unconditionally to the nearest queued
+   waypoint within 1 NM, drop the LOS gate entirely. *Result:* still
+   stuck.
+
+**Reverted.** All four attempts (`stuck_ticks` field, constants,
+rescue blocks, ai.rs threading) discarded via `git checkout`. Branch
+`ai-expansion` left at the portal-aware steering refactor with no
+stuck-rescue layered on top.
+
+**Hypothesis on why nothing worked.** Either (a) the failing ships
+have no waypoint within 1 NM of their pinned position (the planner's
+SSFA pulls waypoints tight against pivot corners; a hull drifted
+laterally into a different shoreline may be > 1 NM from any of
+them), or (b) something *upstream* of the AI tick is keeping the
+ships pinned — the motion sweep's `coastline_geom::farthest_clear_point`
+may be returning the current position when the desired heading has
+*any* lateral component into the polygon, and the AI never gets to
+revise the heading because it sees `speed == 0` and replans → same
+plan → same heading → stuck. The teleport even moved the hull
+to a known-good waypoint and the *next* tick still showed `speed = 0`,
+which strongly suggests the motion sweep itself is the culprit, not
+the AI plan.
+
+**Next.** Background research agent to design an elegant
+get-unstuck-and-navigate-narrow-channels algorithm with a hard
+guarantee that no ship can remain `speed = 0` against the coast
+indefinitely. See agent task launched concurrently.
+
+---
+
+## 2026-?? — Sliding motion sweep + remove `deflect_for_land`: also failed
+
+**Context.** Following the failed teleport-rescue attempts (previous
+entry), a research agent produced `planning/research/narrow-channel-navigation.md`
+which recommended a layered fix. The top recommendation (Priority 1)
+was to replace the motion sweep's hard-stop on land contact with a
+Quake-style *sliding response*: project the remaining velocity onto
+the contact edge's tangent so a hull grazing the bank keeps tangential
+motion instead of going to `speed = 0`.
+
+**What was tried.**
+
+1. **`CoastlineGeom::slide_move`** — Quake/Source-style sliding move
+   for 2-D. Up to 4 bumps per tick; on each land hit, find the
+   contact edge, compute its outward normal, zero the into-surface
+   component of remaining velocity, multiply by `FRICTION = 0.85`,
+   continue. Required a new query `first_land_hit_with_edge` that
+   returns both the hit point and the polyline edge that produced it.
+   Wired into `world.rs` motion sweep, replacing
+   `farthest_clear_point`.
+
+2. **Removed `deflect_for_land` from `compute_steering`.** With the
+   sliding sweep handling marginal grazes at the physics layer, the
+   36-ray reactive deflection in steering was redundant and was the
+   suspected source of tick-to-tick oscillation (different "best"
+   heading each tick as ship position shifts → wobble). Combat
+   steering (`tactical_steering`) still uses `deflect_for_land`.
+
+**Results.**
+
+- *First viz check* (sliding sweep only, `deflect_for_land` still in):
+  "Delaware still doesn't work, oscillating in the water. **Nothing
+  gets stuck though, it's only oscillation.**" — User. This was a
+  partial win: hulls no longer pinned at zero speed.
+
+- *Second viz check* (sliding sweep + `deflect_for_land` removed from
+  normal steering): "Ships still get stuck in the delaware." — User.
+  Regression: removing `deflect_for_land` reintroduced the stuck
+  condition. The sliding sweep alone does not provide enough
+  emergent wall-following to keep ships moving through the Delaware's
+  geometry.
+
+**Reverted.** The `coastline_geom.rs` slide_move, the `world.rs`
+wire-up, the `nav.rs` deflect-removal, the `tile_mesh.rs` scaffolding
+(`tile_contains`, `find_tile_containing`, `walk_to_tile`), and the
+incidental `harbor.rs` whitespace drift all discarded via
+`git checkout`. Branch `ai-expansion` left at the post-hex-lattice
+state with no nav modifications.
+
+**What this tells us.** Sliding response is necessary but not
+sufficient. The Delaware failure mode is more subtle than "hull
+pinned at speed = 0":
+
+- With `deflect_for_land` present and `farthest_clear_point` physics:
+  ship oscillates because the deflector picks a different heading
+  each tick.
+- With sliding physics and `deflect_for_land` present: ship still
+  oscillates (sliding lets it move, deflector still flip-flops).
+- With sliding physics and `deflect_for_land` removed: ship gets
+  stuck again — the bearing-to-waypoint heading has too much
+  into-coast component for sliding alone to extract useful tangential
+  motion, OR the waypoint itself sits in a position where any direct
+  approach grazes land.
+
+**Likely root cause.** The SSFA waypoints are *pulled tight* against
+the convex pivots of the funnel, which in a narrow twisty channel
+means waypoints sit right at the inside corners. A direct heading
+toward such a waypoint from upstream often grazes the *opposite*
+bank before reaching the pivot. The corridor is fine; the discrete
+target points within it are not.
+
+**Suggested next direction.** Priority 2 (`current_tile` tracking)
++ Priority 3 (portal-gate steering) from the research doc, treating
+the planner output as a chain of *gates* (portals) rather than
+discrete waypoints. The steering target each tick is the next gate's
+midpoint (provably safe by tile convexity), not a corner-pulled
+waypoint. This is the substrate the previous "portal-aware steering
+on tile-route" refactor was building toward; it needs the `current_tile`
+piece to robustly identify which gate is "next" even after off-route
+drift.
+
+Research document committed alongside this entry:
+`planning/research/narrow-channel-navigation.md`.
+
+---
+
+## 2026-05-?? — Narrow-channel navigation: **solved**
+
+After many failed iterations (logged above), the Delaware River /
+NY Harbor / Philadelphia-undock failure modes all clear with a
+three-part fix layered on the polygon-truth substrate. The
+**critical** change — the one that flipped working-ish into
+working — was the last one: changing the deflection objective
+from "max clear distance" to "max forward-projected clear distance".
+
+### The combination that works
+1. **Sliding motion sweep** (`coastline_geom::slide_move`,
+   Quake-style: up to 4 bumps, 0.85 friction). Replaces the binary
+   `farthest_clear_point` that left ships motionless against
+   any oblique coast.
+
+2. **Per-ship `current_tile` tracking.** `NavTrack.current_tile`
+   is updated each tick by `TileMesh::walk_to_tile` (portal-crossing
+   walk; O(neighbors), lazy reinit via `find_tile_containing`).
+   This gives steering an O(1) handle on the medial-axis
+   neighborhood without re-running point-in-polygon every tick.
+
+3. **Centroid-hop channel-center fallback in `compute_steering`.**
+   When the direct bearing to the current waypoint is blocked
+   within lookahead, replace the steering target with the
+   LOS-visible centroid (from `current_tile` ∪ its neighbors)
+   that minimizes distance to the waypoint. This steps the ship
+   along the channel one tile at a time without overshooting,
+   which would cause a 180° flip.
+
+4. **(The key fix.) Forward-projected deflection objective.**
+   `deflect_for_land` previously maximized raw clearance distance.
+   In a tight channel that meant a heading 170° off desired with
+   20 NM of open water beat the 8 NM clearance pointing the right
+   way — so ships happily U-turned out of channels they were
+   trying to traverse. New objective: `score = clear_distance *
+   cos(angle_off_desired)`. The candidate sweep is capped at
+   ±90°; anything more than 90° off desired has non-positive
+   score and is rejected by construction. Ties on score still
+   break by proximity to `current_heading` (the existing
+   hysteresis).
+
+### Why this combination works
+The three structural changes (sliding + current_tile + centroid hop)
+were necessary but not sufficient: with the old "max clearance"
+deflection objective, even with a clean centroid target available,
+the deflector could still pick a backwards heading whenever a
+forward heading wasn't *fully* clear. The forward-projection score
+forces the deflector to honor the steering layer's chosen direction
+of travel, falling back to "slower but forward" rather than "faster
+but reversed".
+
+### Empirical
+- bench_trade: 24 ships in red (was 31 baseline, 35 in last failed
+  attempt). Combat / fleet survival unchanged.
+- All 237 workspace tests pass.
+- Viz: ships in Delaware, NY, and Philadelphia harbors no longer
+  oscillate, U-turn, or wedge against coastlines.
+
+### Files touched
+- `crates/sim-core/src/coastline_geom.rs` — `slide_move`,
+  `first_land_hit_with_edge`.
+- `crates/sim-core/src/tile_mesh.rs` — `tile_contains`,
+  `find_tile_containing`, `walk_to_tile`, helper `segments_cross`.
+- `crates/sim-core/src/nav.rs` — `NavTerrain.mesh`,
+  `NavTrack.current_tile`, centroid-hop fallback in
+  `compute_steering`, forward-projection objective in
+  `deflect_for_land`, `current_heading` parameter threaded through
+  `compute_steering` / `tactical_steering` / `deflect_for_land`.
+- `crates/sim-core/src/world.rs` — motion sweep calls
+  `slide_move` and updates `ship.nav.current_tile`.
+- `crates/sim-core/src/ai.rs` — both `NavTerrain` construction
+  sites pass `c.tile_mesh`; both `compute_steering` and
+  `tactical_steering` callers pass `self.ship.heading`.
+
+### Reference
+`planning/research/narrow-channel-navigation.md` — §2 (sliding
+response), §5 (current_tile tracking), §6 (medial axis). The
+forward-projection objective is **not** explicitly in the research
+doc; it emerged from observing the deflector's failure mode after
+the three recommended pieces were in place.
+
+---
+
+## 2025 — Equator-hugging routes: deep-water shortcut edges
+
+### Symptom
+Long open-ocean routes (Caribbean ↔ West Africa) followed a
+visibly absurd path: from Port Royal a ship would dive SE down to
+`y = -1348` (the southern map bound at `LAT_MIN = -5°`), skirt
+along that latitude for ~80 hops, then climb back NE to Elmina —
+adding ~12 % over the great-circle distance and producing the
+"hugging the equator" complaint.
+
+### Root cause
+The hex lattice produced by `preprocess_navmesh.py` is flat-top,
+so neighbour bearings are `±30°, ±90°, ±150°` — there is **no
+due-east neighbour**. Any A* path between two centroids whose
+true bearing falls between those axes can only approximate it by
+mixing axis-aligned hops, and every monotone mixture has the same
+cost. The min-heap's tie-break picks the lowest-`f` entry seen
+first, which (with our heuristic) is "all-SE first, then all-E" —
+the visibly bad shape. There is no actual cost difference for the
+solver to exploit; the problem is graph topology, not weighting.
+
+### Fix
+Add **deep-water shortcut edges** to the routing graph at world
+load. For every tile whose `clearance_nm ≥ DEEP_WATER_NM` (12 NM,
+the existing "open ocean" threshold), bin all other deep-water
+tiles within 300 NM into 8 bearing octants and, for each
+non-empty octant, install one shortcut edge to the **farthest**
+candidate whose centroid-to-centroid segment passes the polygon
+LOS test. Each deep-water tile thus gets up to 8 long edges
+spanning open ocean, on top of its 6 hex neighbours.
+
+The mesh geometry, portals, and adjacency for `walk_to_tile` /
+`current_tile` tracking are untouched. Shortcuts live in a
+parallel `TileMesh::shortcut_neighbors: Vec<Vec<TileEdge>>` and
+are walked alongside `neighbors` in both `TileMesh::route` (A*)
+and `portroutes::dijkstra_from_sources` (port-pair SSSP). The
+funnel/stitching pass (`pathfind::stitch_tile_route`) recognises
+shortcut hops via `shortcut_neighbors` lookup and emits the
+stored midpoint as a degenerate funnel portal — LOS-clearance was
+verified at build time, so pinning through the midpoint is safe.
+
+The build runs in parallel via Rayon (`par_iter` over tiles),
+costs ~2 s of world-load time for the bundled mesh, and produces
+~930 k edges across ~117 k deep-water tiles.
+
+### Validation
+- **diag_atlantic** (now deleted): Port Royal → Elmina dropped
+  from **456 tiles, +11.9 % over direct, southmost y = -1348**
+  to **173 tiles, +5.1 %, southmost y = -798** (Elmina's own
+  latitude is y = -745, so the route now stays within ~50 NM of
+  the great circle for the whole crossing).
+- `bench_pathfind`: all 1332 port pairs solve in 17.55 ms total
+  (avg 0.01 ms, max 0.36 ms). Within +2 ms of the previous
+  no-shortcuts baseline (15.07 ms).
+- `bench_trade`: fleet P/L **+785 k pesos** (was +760 k without
+  shortcuts), debt down 56 k, bankrupt ships 0 (was 2). The
+  "38 in red" verdict is a different metric bucket that only
+  prints when bankrupt count is 0; net economic outcome is
+  strictly better.
+- `World::load`: 3.71 s vs 0.61 s without shortcuts. The +3.1 s
+  is one-time and runs parallel via Rayon.
+- `cargo test --workspace`: 10 passed, 0 failed.
+
+### Whole-overhaul comparison
+Worth recording since this commit closes out the navigation
+overhaul that started with the raster→tile-mesh substrate swap:
+
+| metric              | pre-overhaul (raster) | this commit            |
+| ------------------- | --------------------- | ---------------------- |
+| `bench_pathfind`    | 2023 ms total         | **17.55 ms** (~115×)   |
+| avg route plan      | 1.44 ms               | **0.01 ms** (~140×)    |
+| route success       | 1406/1406             | 1332/1332 (defn'l)     |
+| route quality       | hugs land / overshoots| stays in lane, ~+5%    |
+| `bench_trade` bankrupt | 2–14 (run-noisy)   | **0**                  |
+| narrow-channel bug  | persistent oscillation| **solved**             |
+| equator-hugging bug | persistent overshoot  | **solved** (this PR)   |
+
+The route-count drop (1406 → 1332) is definitional: ports that
+no longer self-pair (Bermuda etc.) were filtered when the harbor
+substrate moved off the raster grid.
+
+### Files
+- `crates/sim-core/src/tile_mesh.rs` — new `shortcut_neighbors`
+  field; `build_deep_water_shortcuts()` builder; `route()` walks
+  both neighbour lists.
+- `crates/sim-core/src/portroutes.rs` — `dijkstra_from_sources`
+  walks both neighbour lists.
+- `crates/sim-core/src/pathfind.rs::stitch_tile_route` —
+  shortcut-aware funnel portal lookup.
+- `crates/sim-core/src/world.rs` — `World::load` calls
+  `build_deep_water_shortcuts(geom, land, 300.0, 8)` after
+  clearance is installed.
+
+### Note
+Earlier research entries listed shortcuts under "deferred /
+explicitly out of scope"; that judgement is revised. The fix is
+small (one new field, one builder, three call-site walks), pays
+for itself in route quality, and cleanly addresses a topology
+limitation the hex lattice can't solve on its own. The deferred
+items (per-tile tunable radius, A* tie-break weighting, ports as
+tile-ids) remain deferred.
+
+---
+
+## 2025 — Long-run economic regression: triaged as not-nav
+
+### Trigger
+After committing deep-water shortcuts, the 730-day bench showed
+Fleet P/L **−269 k pesos** (with shortcuts) vs the historical
+**+4.55 M** baseline from pre-nav-overhaul runs (see entry
+~"Phase 5: morale + sailor pool"). User asked whether the nav
+overhaul might have made routes longer in practice and caused
+the regression.
+
+### Result of triage
+Apples-to-apples at 730 d:
+
+| metric        | no shortcuts | with shortcuts | Δ        |
+|---------------|--------------|----------------|----------|
+| Fleet P/L     | −428 k       | **−269 k**     | +159 k   |
+| Bankrupt      | 22           | 23             | ≈ same   |
+
+Shortcuts are strictly **better** at 730 d (and at 365 d:
++15 k vs −188 k). The decline from the historical +4.55 M is
+not caused by the navigation work — both with and without
+shortcuts the fleet is deep in the red at 730 d.
+
+### Where the loss actually is
+Per-faction-type breakdown (730 d, with shortcuts):
+- Profitable: Spain fluyt +155 k (32 ships), England ship +91 k,
+  Free sloop +49 k (12 pirate ships), Havana / London / Cadiz
+  short-haul fluyts and ships.
+- Losing: France ship −105 k, Netherlands fluyt −94 k, Spain
+  brigantine −89 k, France fluyt −79 k.
+- Bottom 5 individual earners all hit a −12,500 peso floor
+  (chandler debt cap) and were all home-ported at Ouidah,
+  Cartagena, Willemstad — i.e., the long Atlantic-crossing
+  legs.
+
+System-wide **provisions** balance drops monotonically from
+10 107 to 3 916 units over 24 months. Early-run Δtotals of
+−500 to −800 per month, stabilising around −100/month once the
+balance is depleted. Ships eat ~400–1 000 provisions/month
+beyond port consumption — the food economy can't sustain the
+fleet's time-at-sea on long-haul routes.
+
+### Conclusion
+This is **economic calibration**, not nav. Long Atlantic legs
+(Africa ↔ Caribbean ↔ Europe) don't break even at current cargo
+prices, wage rates, and provisions burn. The nav overhaul made
+the legs shorter and faster — they just still aren't profitable
+enough to support the fleet that's currently configured to sail
+them. Deferred to a future calibration pass; likely candidates:
+
+1. Wage / provisions consumption rate too high relative to
+   long-haul cargo margins.
+2. Long-haul cargo prices (slaves, sugar, manufactures) too low
+   at the distant ports that source them.
+3. Long-haul ship type / capacity mismatch.
+
+No code change in this entry — bookkeeping only, so that future
+work doesn't waste time re-discovering this is not a nav bug.

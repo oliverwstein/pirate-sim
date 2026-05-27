@@ -725,7 +725,7 @@ impl Ship {
     }
 
     /// Resupply provisions for one hour at a port market: buy provisions
-    /// from the port's stockpile, paying out of `self.silver` at the
+    /// from the port's balance, paying out of `self.silver` at the
     /// market's buy price. Returns `true` when no further resupply is
     /// possible — either the hold is full, the ship is broke, or the
     /// market is dry.
@@ -743,12 +743,12 @@ impl Ship {
             return true;
         }
 
-        let stockpile = market.stockpile.get(provisions_id);
-        if stockpile <= 0.0 {
+        let available = market.available_to_buy(provisions_id);
+        if available <= 0.0 {
             return true;
         }
 
-        let unit_price = market.buy_price(provisions_id, goods).max(0.0001);
+        let unit_price = market.price_at(provisions_id, goods).max(0.0001);
 
         // Chandler credit: if we can't pay cash but have debt
         // headroom (and the port chandler has any silver to lend),
@@ -764,7 +764,7 @@ impl Ship {
 
         let desired = RESUPPLY_RATE_PER_HOUR
             .min(space)
-            .min(stockpile)
+            .min(available)
             .min(affordable);
         if desired <= 0.0 {
             return true;
@@ -773,14 +773,18 @@ impl Ship {
         let cost = Pesos::from_pesos_f32(desired * unit_price);
         self.silver -= cost;
         market.silver += cost;
-        market.stockpile.remove(provisions_id, desired);
+        let bound = market.effective_bound(provisions_id);
+        market.balance.set(
+            provisions_id,
+            (market.balance.get(provisions_id) - desired.ceil() as i32).clamp(-bound, bound),
+        );
         self.provisions += desired;
 
         // Done when full, broke, or market dry. The "broke" case only
         // returns true when we couldn't afford even the next slice —
         // we keep going as long as there's *some* progress this tick.
         let full = self.provisions >= stats.provision_capacity - 1e-4;
-        let market_dry = market.stockpile.get(provisions_id) <= 0.0;
+        let market_dry = market.available_to_buy(provisions_id) <= 0.0;
         let broke = self.silver.as_pesos_f32() < unit_price * 0.05; // less than 5% of an hour's rate
         full || market_dry || broke
     }
@@ -1380,7 +1384,7 @@ mod tests {
     }
 
     #[test]
-    fn test_market_resupply_consumes_silver_and_stockpile() {
+    fn test_market_resupply_consumes_silver_and_balance() {
         use crate::goods::{ids, GoodsRegistry};
         use crate::market::{PortArchetype, PortMarket};
 
@@ -1393,7 +1397,7 @@ mod tests {
 
         let ship_silver_before = ship.silver;
         let port_silver_before = market.silver;
-        let stockpile_before = market.stockpile.get(ids::PROVISIONS);
+        let balance_before = market.balance.get(ids::PROVISIONS);
 
         // Tick to completion (or 200 hours, whichever first).
         let mut iters = 0;
@@ -1421,7 +1425,7 @@ mod tests {
         let earned = market.silver - port_silver_before;
         assert_eq!(spent, earned, "spent {} vs earned {}", spent, earned);
         // Stockpile dropped by ≈ amount loaded.
-        assert!(market.stockpile.get(ids::PROVISIONS) < stockpile_before);
+        assert!(market.balance.get(ids::PROVISIONS) < balance_before);
     }
 
     #[test]
@@ -1433,8 +1437,8 @@ mod tests {
         let mut market =
             PortMarket::with_recipe(&goods, PortArchetype::NorthAmericanFarming.recipe());
         // Drain the market.
-        let stockpile = market.stockpile.get(ids::PROVISIONS);
-        market.stockpile.remove(ids::PROVISIONS, stockpile);
+        let bound = market.effective_bound(ids::PROVISIONS);
+        market.balance.set(ids::PROVISIONS, -bound);
 
         let stats = ShipStats::sloop();
         let mut ship = Ship::new(Position::ZERO, ShipState::Docked);

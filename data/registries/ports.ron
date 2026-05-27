@@ -1,15 +1,21 @@
 // Port registry. Each entry is one settlement on the map.
 //
-// Coordinates are in nautical miles from origin (17.5°N, 72.5°W).
-// X = East (positive), Y = North (positive).
+// Coordinates are real-world WGS84 decimal degrees: `coord: (lat, lon)`,
+// north and east positive (so Western Hemisphere longitudes are
+// negative). At load they are projected to the simulator's NM grid
+// via equirectangular projection anchored at 17.5°N, 72.5°W:
 //
-// Equirectangular projection: x = (lon + 72.5) × 60, y = (lat - 17.5) × 60.
-// Map extends to x ≈ 5250, y ≈ 2550, so European/African ports fit.
+//     x_nm = (lon + 72.5) * 60
+//     y_nm = (lat - 17.5) * 60
+//
+// Pick `coord` from the anchorage actually used by 17th-century deep-
+// draft shipping (outer roadstead, bar, or transhipment point), not
+// the city centre — see planning/research/port-coordinates.md.
 //
 // Fields:
 //   name              — display name (used for archetype lookup; see
 //                       market::archetype_for in code)
-//   position          — (x_nm, y_nm)
+//   coord             — (lat_deg, lon_deg) WGS84 decimal degrees
 //   faction           — Spain | England | France | Netherlands | Free
 //                       (the 5-faction Phase 3 model; `Free` covers
 //                       independents/pirate havens — actual piracy is a
@@ -24,73 +30,82 @@
 
 [
     // === SPANISH ===
-    (name: "Havana",          position: (-592.8, 337.8),  faction: Spain,   harbor_radius_nm: 8.0,  shipyard: None, category: CaribbeanEntrepot),
-    (name: "Portobelo",       position: (-429.0, -477.0), faction: Spain,   harbor_radius_nm: 8.0,  shipyard: None, category: SmallColonial),
-    (name: "Cartagena",       position: (-181.8, -426.0), faction: Spain,   harbor_radius_nm: 8.0,  shipyard: None, category: CaribbeanEntrepot),
-    (name: "Santo Domingo",   position: (157.2, 58.2),    faction: Spain,   harbor_radius_nm: 8.0,  shipyard: None, category: SmallColonial),
-    (name: "Santiago de Cuba",position: (-199.2, 151.2),  faction: Spain,   harbor_radius_nm: 8.0,  shipyard: None, category: SmallColonial),
-    (name: "San Juan",        position: (382.8, 58.2),    faction: Spain,   harbor_radius_nm: 8.0,  shipyard: None, category: SmallColonial),
-    // Maracaibo: up Lake Maracaibo — wider radius to reach open water.
-    (name: "Maracaibo",       position: (52.2, -412.2),   faction: Spain,   harbor_radius_nm: 30.0, shipyard: None, category: SmallColonial),
-    (name: "La Guaira",       position: (334.2, -414.0),  faction: Spain,   harbor_radius_nm: 8.0,  shipyard: None, category: SmallColonial),
-    (name: "Trinidad",        position: (658.8, -411.0),  faction: Spain,   harbor_radius_nm: 8.0,  shipyard: None, category: SmallColonial),
-    (name: "Margarita",       position: (517.8, -390.0),  faction: Spain,   harbor_radius_nm: 8.0,  shipyard: None, category: SmallColonial),
+    (name: "Havana",          coord: (23.1450, -82.3600),  faction: Spain,   harbor_radius_nm: 8.0,  shipyard: None, category: CaribbeanEntrepot),
+    (name: "Portobelo",       coord: (9.5550, -79.6550), faction: Spain,   harbor_radius_nm: 8.0,  shipyard: None, category: SmallColonial),
+    (name: "Cartagena",       coord: (10.2500, -75.5667), faction: Spain,   harbor_radius_nm: 8.0,  shipyard: None, category: CaribbeanEntrepot),
+    (name: "Santo Domingo",   coord: (18.4667, -69.9000),    faction: Spain,   harbor_radius_nm: 8.0,  shipyard: None, category: SmallColonial),
+    (name: "Santiago de Cuba",coord: (19.9833, -75.8833),  faction: Spain,   harbor_radius_nm: 8.0,  shipyard: None, category: SmallColonial),
+    (name: "San Juan",        coord: (18.4667, -66.1167),    faction: Spain,   harbor_radius_nm: 8.0,  shipyard: None, category: SmallColonial),
+    // Maracaibo: anchorage at San Carlos bar/narrows (the lake entrance);
+    // wider radius for transit up the strait. Moved ~21 NM N from inside
+    // the lake — see planning/research/port-coordinates.md.
+    (name: "Maracaibo",       coord: (10.9833, -71.6000),   faction: Spain,   harbor_radius_nm: 30.0, shipyard: None, category: SmallColonial),
+    (name: "La Guaira",       coord: (10.6000, -66.9333),  faction: Spain,   harbor_radius_nm: 8.0,  shipyard: None, category: SmallColonial),
+    (name: "Trinidad",        coord: (10.6500, -61.5167),  faction: Spain,   harbor_radius_nm: 8.0,  shipyard: None, category: SmallColonial),
+    // Margarita: Pampatar anchorage (NE coast).
+    (name: "Margarita",       coord: (11.0000, -63.7950),  faction: Spain,   harbor_radius_nm: 8.0,  shipyard: None, category: SmallColonial),
 
     // === ENGLISH ===
-    (name: "Port Royal",      position: (-260.4, 26.4),   faction: England, harbor_radius_nm: 8.0,  shipyard: None, category: CaribbeanEntrepot),
-    (name: "Kingston",        position: (-257.4, 28.2),   faction: England, harbor_radius_nm: 8.0,  shipyard: None, category: CaribbeanEntrepot),
-    (name: "Bridgetown",      position: (772.8, -264.0),  faction: England, harbor_radius_nm: 8.0,  shipyard: None, category: SmallColonial),
-    (name: "Basseterre",      position: (586.8, -12.0),   faction: England, harbor_radius_nm: 8.0,  shipyard: None, category: SmallColonial),
-    (name: "English Harbour", position: (644.4, -30.0),   faction: England, harbor_radius_nm: 8.0,  shipyard: None, category: SmallColonial),
-    (name: "Charleston",      position: (-445.8, 916.8),  faction: England, harbor_radius_nm: 25.0, shipyard: None, category: SmallColonial),
-    // Boston: shipyard for sloops, brigantines, barks.
-    (name: "Boston",          position: (86.4, 1491.6),   faction: England, harbor_radius_nm: 20.0, shipyard: Some(["sloop", "brigantine", "bark"]), category: SmallColonial),
+    (name: "Port Royal",      coord: (17.9383, -76.8417),   faction: England, harbor_radius_nm: 8.0,  shipyard: None, category: CaribbeanEntrepot),
+    (name: "Bridgetown",      coord: (13.1000, -59.6333),  faction: England, harbor_radius_nm: 8.0,  shipyard: None, category: SmallColonial),
+    (name: "Basseterre",      coord: (17.3000, -62.7167),   faction: England, harbor_radius_nm: 8.0,  shipyard: None, category: SmallColonial),
+    (name: "English Harbour", coord: (17.0000, -61.7667),   faction: England, harbor_radius_nm: 8.0,  shipyard: None, category: SmallColonial),
+    // Charleston: outer bar anchorage (~4 NM SE of city).
+    (name: "Charleston",      coord: (32.7333, -79.8833),  faction: England, harbor_radius_nm: 25.0, shipyard: None, category: SmallColonial),
+    // Boston: Nantasket/King's Roads outer roadstead.
+    (name: "Boston",          coord: (42.3167, -70.9500),   faction: England, harbor_radius_nm: 20.0, shipyard: Some(["sloop", "brigantine", "bark"]), category: SmallColonial),
     // New York: NY harbor + lower Hudson + reach to Atlantic.
-    (name: "New York",        position: (-90.6, 1392.6),  faction: England, harbor_radius_nm: 60.0, shipyard: None, category: SmallColonial),
-    // Philadelphia: city is up the Delaware River; anchor at bay mouth.
-    (name: "Philadelphia",    position: (-177.8, 1312.6), faction: England, harbor_radius_nm: 30.0, shipyard: Some(["sloop", "brigantine"]), category: SmallColonial),
+    (name: "New York",        coord: (40.6833, -74.0167),  faction: England, harbor_radius_nm: 60.0, shipyard: None, category: SmallColonial),
+    // Philadelphia:
+    // Founded 1682 — historically borderline for 1680; see §4.3.
+    (name: "Philadelphia",    coord: (39.857055, -75.236817), faction: England, harbor_radius_nm: 10.0, shipyard: Some(["sloop", "brigantine"]), category: SmallColonial),
     // Bermuda: cedar-built sloops were the quintessential Caribbean trader.
-    (name: "Bermuda",         position: (469.2, 892.8),   faction: England, harbor_radius_nm: 8.0,  shipyard: Some(["sloop"]), category: SmallColonial),
-    (name: "Belize",          position: (-942.0, 0.0),    faction: England, harbor_radius_nm: 30.0, shipyard: None, category: SmallColonial),
+    (name: "Bermuda",         coord: (32.3817, -64.6767),   faction: England, harbor_radius_nm: 8.0,  shipyard: Some(["sloop"]), category: SmallColonial),
+    (name: "Belize",          coord: (17.4983, -88.1883),   faction: England, harbor_radius_nm: 30.0, shipyard: None, category: SmallColonial),
 
     // === FRENCH ===
-    (name: "Fort-Royal",      position: (685.8, -174.0),  faction: France,  harbor_radius_nm: 8.0,  shipyard: None, category: SmallColonial),
-    (name: "Basse-Terre",     position: (646.2, -90.0),   faction: France,  harbor_radius_nm: 8.0,  shipyard: None, category: SmallColonial),
-    (name: "Cap-Français",    position: (18.0, 135.6),    faction: France,  harbor_radius_nm: 8.0,  shipyard: None, category: SmallColonial),
+    (name: "Fort-Royal",      coord: (14.6000, -61.0667),  faction: France,  harbor_radius_nm: 8.0,  shipyard: None, category: SmallColonial),
+    (name: "Basse-Terre",     coord: (15.9833, -61.7333),   faction: France,  harbor_radius_nm: 8.0,  shipyard: None, category: SmallColonial),
+    (name: "Cap-Français",    coord: (19.7600, -72.2000),    faction: France,  harbor_radius_nm: 8.0,  shipyard: None, category: SmallColonial),
     // Petit-Goâve: French buccaneer base — small but pirate-haven dynamics.
-    (name: "Petit-Goâve",     position: (-22.2, 55.8),    faction: France,  harbor_radius_nm: 8.0,  shipyard: None, category: PirateHaven),
-    (name: "Cayenne",         position: (1210.2, -753.6), faction: France,  harbor_radius_nm: 15.0, shipyard: None, category: SmallColonial),
+    (name: "Petit-Goâve",     coord: (18.4317, -72.8667),    faction: France,  harbor_radius_nm: 8.0,  shipyard: None, category: PirateHaven),
+    (name: "Cayenne",         coord: (4.9333, -52.3167), faction: France,  harbor_radius_nm: 15.0, shipyard: None, category: SmallColonial),
 
     // === DUTCH ===
     // Curaçao (Willemstad): the great Dutch entrepôt of the Spanish Main.
-    (name: "Willemstad",      position: (214.2, -323.4),  faction: Netherlands, harbor_radius_nm: 8.0,  shipyard: None, category: CaribbeanEntrepot),
-    (name: "St. Eustatius",   position: (571.8, -1.2),    faction: Netherlands, harbor_radius_nm: 8.0,  shipyard: None, category: SmallColonial),
-    // Paramaribo: moved to mouth of Suriname river.
-    (name: "Paramaribo",      position: (1039.8, -685.0), faction: Netherlands, harbor_radius_nm: 15.0, shipyard: None, category: SmallColonial),
+    (name: "Willemstad",      coord: (12.1167, -68.9333),  faction: Netherlands, harbor_radius_nm: 8.0,  shipyard: None, category: CaribbeanEntrepot),
+    (name: "St. Eustatius",   coord: (17.4833, -62.9833),    faction: Netherlands, harbor_radius_nm: 8.0,  shipyard: None, category: SmallColonial),
+    // Paramaribo: river-mouth outer anchorage (~6 NM S of city).
+    (name: "Paramaribo",      coord: (5.9833, -55.1333), faction: Netherlands, harbor_radius_nm: 15.0, shipyard: None, category: SmallColonial),
 
     // === PIRATE HAVENS ===
-    (name: "Tortuga",         position: (-16.8, 152.4),   faction: Free,     harbor_radius_nm: 8.0,  shipyard: None, category: PirateHaven),
-    (name: "Nassau",          position: (-291.0, 453.0),  faction: Free,     harbor_radius_nm: 8.0,  shipyard: None, category: PirateHaven),
-    (name: "Tobago",          position: (709.8, -375.0),  faction: Free,     harbor_radius_nm: 8.0,  shipyard: None, category: PirateHaven),
+    (name: "Tortuga",         coord: (20.0400, -72.7900),   faction: Free,     harbor_radius_nm: 8.0,  shipyard: None, category: PirateHaven),
+    (name: "Nassau",          coord: (25.0783, -77.3383),  faction: Free,     harbor_radius_nm: 8.0,  shipyard: None, category: PirateHaven),
+    // Tobago: Scarborough Roads anchorage. Contested in 1680; see §4.4.
+    (name: "Tobago",          coord: (11.1833, -60.7367),  faction: Free,     harbor_radius_nm: 8.0,  shipyard: None, category: PirateHaven),
 
     // === EUROPE ===
-    // London at the Nore anchorage (Thames Estuary mouth, 51.5°N 1°E);
-    // 1-NM grid resolution can't open the Thames itself, and 1680s
-    // ocean-going ships anchored at the Nore for lighter transfer anyway.
-    (name: "London",          position: (4410.0, 2040.0), faction: England, harbor_radius_nm: 30.0, shipyard: Some(["brigantine", "bark", "ship"]), category: EuropeanHub),
-    // Amsterdam at Ijmuiden / North Sea (52.4°N 4.9°E). Dutch yards
-    // pioneered the fluyt.
-    (name: "Amsterdam",       position: (4644.0, 2092.0), faction: Netherlands, harbor_radius_nm: 25.0, shipyard: Some(["fluyt", "ship"]), category: EuropeanHub),
+    // London at the Nore anchorage (51.48°N 0.88°E), Thames Estuary outer;
+    // 1680s ocean-going ships anchored at the Nore for lighter transfer.
+    (name: "London",          coord: (51.4833, 0.8833), faction: England, harbor_radius_nm: 30.0, shipyard: Some(["brigantine", "bark", "ship"]), category: EuropeanHub),
+    // Amsterdam at Texel Roads (52.98°N 4.78°E) — historically correct
+    // outer anchorage. ⚠️ verify navmesh connectivity; the prior IJmuiden
+    // position (4625.0, 2105.0) was a workaround for the old raster-
+    // harbor coastline overlap. Phase B tile-anchored harbors should
+    // handle Texel Roads cleanly — see research/port-coordinates.md §4.2.
+    (name: "Amsterdam",       coord: (52.9833, 4.7833), faction: Netherlands, harbor_radius_nm: 25.0, shipyard: Some(["fluyt", "ship"]), category: EuropeanHub),
     // Cadiz: Bay of Cadiz (36.5°N 6.3°W). Royal yards built large ships.
-    (name: "Cadiz",           position: (3972.0, 1142.0), faction: Spain,   harbor_radius_nm: 20.0, shipyard: Some(["ship"]), category: EuropeanHub),
+    (name: "Cadiz",           coord: (36.5167, -6.2833), faction: Spain,   harbor_radius_nm: 20.0, shipyard: Some(["ship"]), category: EuropeanHub),
     // Nantes: anchorage at Paimboeuf / Loire estuary mouth near St-Nazaire
     // (47.3°N 2.2°W) — Nantes proper is 30 NM up the Loire.
-    (name: "Nantes",          position: (4218.0, 1788.0), faction: France,  harbor_radius_nm: 25.0, shipyard: Some(["bark", "ship"]), category: EuropeanHub),
+    (name: "Nantes",          coord: (47.3000, -2.2000), faction: France,  harbor_radius_nm: 25.0, shipyard: Some(["bark", "ship"]), category: EuropeanHub),
 
     // === WEST AFRICA ===
     // Slave-trade ports — stand-ins for the wider Gold Coast and Bight
     // of Benin networks. Modeled as transient entrepôts (the European
     // factors had small permanent staff but high ship turnover).
-    (name: "Elmina",          position: (4269.0, -745.0), faction: Netherlands, harbor_radius_nm: 15.0, shipyard: None, category: CaribbeanEntrepot), // Dutch since 1637
-    (name: "Ouidah",          position: (4470.0, -666.0), faction: France,  harbor_radius_nm: 15.0, shipyard: None, category: CaribbeanEntrepot),
+    (name: "Elmina",          coord: (5.0833, -1.3500), faction: Netherlands, harbor_radius_nm: 15.0, shipyard: None, category: CaribbeanEntrepot), // Dutch since 1637
+    // Ouidah: 2 NM offshore roadstead (surf-beaten coast precluded shore moorings).
+    (name: "Ouidah",          coord: (6.3000, 2.0833), faction: France,  harbor_radius_nm: 15.0, shipyard: None, category: CaribbeanEntrepot),
 ]
+

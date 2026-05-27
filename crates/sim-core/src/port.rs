@@ -56,12 +56,22 @@ pub struct Port {
 /// Default harbor radius (NM) used when a port doesn't specify one.
 pub const DEFAULT_HARBOR_RADIUS_NM: f32 = 8.0;
 
-/// On-disk shape of one port. Shipyard lists are stored as ship-type
-/// names and resolved to `ShipTypeId` at load against the live registry.
+/// Map-projection origin shared with the preprocessor pipeline
+/// (`tools/preprocess/*`). Real-world `(lat_deg, lon_deg)` get
+/// projected to the simulator's NM grid via
+/// `x = (lon - ORIGIN_LON) * 60`, `y = (lat - ORIGIN_LAT) * 60`.
+const ORIGIN_LAT_DEG: f32 = 17.5;
+const ORIGIN_LON_DEG: f32 = -72.5;
+const NM_PER_DEG: f32 = 60.0;
+
+/// On-disk shape of one port. Coordinates are real-world decimal
+/// degrees `(lat, lon)`; they are projected to the NM grid at load.
+/// Shipyard ship-type names are resolved to `ShipTypeId` against the
+/// live registry.
 #[derive(Clone, Debug, Deserialize)]
 struct PortRecord {
     name: String,
-    position: (f32, f32),
+    coord: (f32, f32),
     faction: Faction,
     harbor_radius_nm: f32,
     shipyard: Option<Vec<String>>,
@@ -102,9 +112,12 @@ pub fn from_ron_str(s: &str, ship_types: &ShipTypeRegistry) -> Result<Vec<Port>,
                 Some(ids)
             }
         };
+        let (lat_deg, lon_deg) = r.coord;
+        let x_nm = (lon_deg - ORIGIN_LON_DEG) * NM_PER_DEG;
+        let y_nm = (lat_deg - ORIGIN_LAT_DEG) * NM_PER_DEG;
         ports.push(Port {
             name: r.name,
-            position: Position::new(r.position.0, r.position.1),
+            position: Position::new(x_nm, y_nm),
             faction: r.faction,
             harbor_radius_nm: r.harbor_radius_nm,
             shipyard,
