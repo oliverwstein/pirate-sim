@@ -505,6 +505,99 @@ impl TileMesh {
             Some((p1, p0))
         }
     }
+
+    /// Test whether `pos` lies inside the convex polygon of tile `id`.
+    /// Uses the half-plane sign test for each ordered edge; returns
+    /// true if `pos` is on the same side of every edge (CCW polygon).
+    /// Tolerates degenerate edges by ignoring them.
+    pub fn tile_contains(&self, id: u32, pos: Position) -> bool {
+        let Some(tile) = self.tiles.get(id as usize) else {
+            return false;
+        };
+        if pos.x < tile.bbox_min.x
+            || pos.x > tile.bbox_max.x
+            || pos.y < tile.bbox_min.y
+            || pos.y > tile.bbox_max.y
+        {
+            return false;
+        }
+        let v = &tile.vertices;
+        if v.len() < 3 {
+            return false;
+        }
+        let mut sign: f32 = 0.0;
+        for i in 0..v.len() {
+            let a = v[i];
+            let b = v[(i + 1) % v.len()];
+            let cross = (b.x - a.x) * (pos.y - a.y) - (b.y - a.y) * (pos.x - a.x);
+            if cross.abs() < 1e-6 {
+                continue;
+            }
+            if sign == 0.0 {
+                sign = cross;
+            } else if sign.signum() != cross.signum() {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Locate the tile containing `pos` by searching the nearest
+    /// centroids (cheap broad-phase) and applying the half-plane test.
+    /// Returns `None` if `pos` is not inside any tile within `radius_nm`.
+    pub fn find_tile_containing(&self, pos: Position, radius_nm: f32) -> Option<u32> {
+        self.nearest_centroids(pos, radius_nm)
+            .into_iter()
+            .map(|(id, _)| id)
+            .find(|&id| self.tile_contains(id, pos))
+    }
+
+    /// Update the ship's current tile after a move `old_pos → new_pos`,
+    /// starting from `current`. Walks portal-by-portal up to `MAX_HOPS`
+    /// times: if the move crossed any shared edge with a neighbor, the
+    /// neighbor becomes the new current and we test from there. Falls
+    /// back to a fresh [`find_tile_containing`] when the walk leaves
+    /// the known neighborhood (rare — typically a teleport or replan).
+    pub fn walk_to_tile(&self, current: u32, old_pos: Position, new_pos: Position) -> Option<u32> {
+        const MAX_HOPS: u32 = 4;
+        let mut tile = current;
+        for _ in 0..MAX_HOPS {
+            let mut crossed: Option<u32> = None;
+            if let Some(edges) = self.neighbors.get(tile as usize) {
+                for e in edges {
+                    if let Some((l, r)) = self.shared_edge(tile, e.to) {
+                        if segments_cross(old_pos, new_pos, l, r) {
+                            crossed = Some(e.to);
+                            break;
+                        }
+                    }
+                }
+            }
+            match crossed {
+                Some(next) => tile = next,
+                None => {
+                    return if self.tile_contains(tile, new_pos) {
+                        Some(tile)
+                    } else {
+                        self.find_tile_containing(new_pos, 50.0)
+                    };
+                }
+            }
+        }
+        Some(tile)
+    }
+}
+
+/// Standard 2-D segment-segment crossing test (open intervals).
+fn segments_cross(p1: Position, p2: Position, p3: Position, p4: Position) -> bool {
+    let o = |a: Position, b: Position, c: Position| -> f32 {
+        (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x)
+    };
+    let d1 = o(p3, p4, p1);
+    let d2 = o(p3, p4, p2);
+    let d3 = o(p1, p2, p3);
+    let d4 = o(p1, p2, p4);
+    (d1 > 0.0 && d2 < 0.0 || d1 < 0.0 && d2 > 0.0) && (d3 > 0.0 && d4 < 0.0 || d3 < 0.0 && d4 > 0.0)
 }
 
 /// Simple Stupid Funnel Algorithm.

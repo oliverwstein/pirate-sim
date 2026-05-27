@@ -734,10 +734,12 @@ impl<'a> ShipBtContext<'a> {
         let terrain = self.pathfind.map(|c| crate::nav::NavTerrain {
             geom: c.coastline_geom,
             land: c.land,
+            mesh: c.tile_mesh,
         });
         let s = crate::nav::tactical_steering(
             self.ship.position,
             desired_heading,
+            self.ship.heading,
             self.stats,
             self.wind,
             terrain,
@@ -872,6 +874,7 @@ impl<'a> ShipBtContext<'a> {
         let terrain = self.pathfind.map(|c| crate::nav::NavTerrain {
             geom: c.coastline_geom,
             land: c.land,
+            mesh: c.tile_mesh,
         });
         let pos_estimate = self.estimated_position();
         let pos_truth = self.ship.position;
@@ -945,6 +948,7 @@ impl<'a> ShipBtContext<'a> {
             self.goal,
             pos_estimate,
             pos_truth,
+            self.ship.heading,
             self.stats,
             self.wind,
             terrain,
@@ -1005,6 +1009,7 @@ impl<'a> ShipBtContext<'a> {
                         self.goal,
                         pos_estimate2,
                         pos_truth2,
+                        self.ship.heading,
                         self.stats,
                         self.wind,
                         terrain,

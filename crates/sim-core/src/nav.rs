@@ -15,16 +15,21 @@ use crate::coastline_geom::CoastlineGeom;
 use crate::map::land::LandMap;
 use crate::ship::{angle_diff, normalize_angle, speed_at_heading, ShipStats};
 use crate::sim_rng::SimRng;
+use crate::tile_mesh::TileMesh;
 use crate::types::{Position, ShipId, WindVector};
 
 /// Bundle of land-truth queries the steering layer uses for reactive
 /// deflection. The polygon-truth [`CoastlineGeom`] is the oracle;
 /// [`LandMap`] is its raster pre-filter (`CoastlineGeom` queries take
 /// it as a parameter — see `coastline_geom.rs` for the bilevel design).
+/// The [`TileMesh`] supplies channel-center fallbacks (tile centroid /
+/// portal midpoints) when the direct bearing to a planner waypoint
+/// would graze land.
 #[derive(Clone, Copy)]
 pub struct NavTerrain<'a> {
     pub geom: &'a CoastlineGeom,
     pub land: &'a LandMap,
+    pub mesh: &'a TileMesh,
 }
 
 /// Maximum number of intermediate waypoints a planned path may hold.
@@ -225,6 +230,14 @@ pub struct NavTrack {
     /// in the `Ship` struct (no per-ship heap allocation, no pointer chase
     /// when combat/weather iterate over fleets).
     pub waypoints: ArrayVec<Position, MAX_WAYPOINTS>,
+    /// Tile id the ship is currently inside (or last known to be in).
+    /// Maintained every tick by the motion sweep via
+    /// [`TileMesh::walk_to_tile`]. `None` after a teleport, on first
+    /// spawn, or when the walk loses track; reinitialized lazily on
+    /// the next motion update. The steering layer uses it to pick a
+    /// channel-center target (tile centroid) when the direct bearing
+    /// to the next waypoint is blocked.
+    pub current_tile: Option<u32>,
 }
 
 impl NavTrack {
@@ -289,6 +302,7 @@ impl NavTrack {
         goal: &mut NavGoal,
         pos_estimate: Position,
         pos_truth: Position,
+        current_heading: f32,
         stats: &ShipStats,
         wind: &WindVector,
         terrain: Option<NavTerrain<'_>>,
@@ -347,6 +361,64 @@ impl NavTrack {
             port_vmg.max(stbd_vmg).max(MIN_UPWIND_VMG)
         };
 
+        // Channel-center steering: when the direct bearing to the
+        // current waypoint is blocked by land within lookahead, the
+        // SSFA waypoint is geometrically wrong from our position (it
+        // sits at an inside corner of the planner's funnel). Replace
+        // the steering target with the LOS-visible tile centroid
+        // (current tile or one of its neighbors) that makes the
+        // greatest forward progress toward the blocked waypoint —
+        // i.e., step through the channel one centroid at a time
+        // along the medial axis. Aiming purely at the *current*
+        // tile's centroid causes a 180° U-turn once the ship
+        // overshoots it; hopping to the next neighbor centroid
+        // forward maintains forward momentum.
+        //
+        // This is the medial-axis-approximation recommended by the
+        // research doc (`narrow-channel-navigation.md` §1431, citing
+        // Jacobs 2006 which observed 14% → 0% stuck rates with
+        // medial-axis steering in narrow corridors).
+        //
+        // Falls back to the original bearing-to-waypoint when:
+        //   - no terrain provided (e.g. tests),
+        //   - no current_tile cached (just spawned / between updates),
+        //   - the direct bearing is already clear at full lookahead,
+        //   - or no neighbor centroid is both LOS-clear and closer to
+        //     the waypoint than we are (already at the channel head).
+        let mut effective_bearing = bearing_to_target;
+        if let Some(t) = terrain {
+            if !heading_clear(pos_truth, bearing_to_target, t, DEFLECT_LOOKAHEAD_NM) {
+                if let Some(tile_id) = self.current_tile {
+                    let cur_dist = pos_truth.distance(target);
+                    let mut best_centroid: Option<Position> = None;
+                    let mut best_dist = cur_dist - 0.25;
+                    let mut consider = |id: u32| {
+                        if let Some(tile) = t.mesh.tiles.get(id as usize) {
+                            let c = tile.centroid;
+                            let d = c.distance(target);
+                            if d < best_dist
+                                && (c - pos_truth).length() > 0.5
+                                && t.geom.line_is_clear(t.land, pos_truth, c)
+                            {
+                                best_dist = d;
+                                best_centroid = Some(c);
+                            }
+                        }
+                    };
+                    consider(tile_id);
+                    if let Some(neigh) = t.mesh.neighbors.get(tile_id as usize) {
+                        for e in neigh {
+                            consider(e.to);
+                        }
+                    }
+                    if let Some(c) = best_centroid {
+                        let to_c = c - pos_truth;
+                        effective_bearing = normalize_angle(to_c.x.atan2(to_c.y).to_degrees());
+                    }
+                }
+            }
+        }
+
         // Reactive land deflection (optional). Keeps the ship from sailing
         // into a coast between planner waypoints (e.g., when blown sideways).
         // Uses TRUTH, not estimate: this represents the lookout/crew seeing
@@ -354,8 +426,14 @@ impl NavTrack {
         // put the captain's mental ship safely offshore while the real hull
         // grounds on a reef the lookouts could plainly see.
         let heading = match terrain {
-            Some(t) => deflect_for_land(pos_truth, bearing_to_target, t, DEFLECT_LOOKAHEAD_NM),
-            None => bearing_to_target,
+            Some(t) => deflect_for_land(
+                pos_truth,
+                effective_bearing,
+                current_heading,
+                t,
+                DEFLECT_LOOKAHEAD_NM,
+            ),
+            None => effective_bearing,
         };
 
         Some(Steering { heading, speed })
@@ -384,57 +462,85 @@ impl NavTrack {
 pub fn tactical_steering(
     pos: Position,
     desired_heading: f32,
+    current_heading: f32,
     stats: &ShipStats,
     wind: &WindVector,
     terrain: Option<NavTerrain<'_>>,
 ) -> Steering {
     let heading = match terrain {
-        Some(t) => deflect_for_land(pos, desired_heading, t, DEFLECT_LOOKAHEAD_NM),
+        Some(t) => deflect_for_land(
+            pos,
+            desired_heading,
+            current_heading,
+            t,
+            DEFLECT_LOOKAHEAD_NM,
+        ),
         None => desired_heading,
     };
     let speed = speed_at_heading(heading, stats, wind);
     Steering { heading, speed }
 }
 
+/// Reactive land deflection. Fast path: returns `desired` if it is
+/// clear at full lookahead. Otherwise sweeps 36 candidate headings
+/// (every 10° around `desired`) and returns the one with the greatest
+/// **forward-projected clearance** — `clear_distance * cos(angle_off_desired)`.
+/// This rewards forward progress over absolute clearance, so a ship
+/// in a narrow channel prefers a shorter clear leg in the intended
+/// direction over a longer clear leg that points backwards. Ties on
+/// score are broken by **proximity to `current_heading`** (hysteresis)
+/// to prevent flicking between two equally-good headings tick to tick.
+///
+/// Candidates with negative projection (i.e. more than 90° off the
+/// desired direction) are never chosen unless every forward heading
+/// has zero clearance — in which case the ship is wedged and
+/// `desired` is returned (the motion sweep will then keep it
+/// stationary rather than U-turning out of its current channel).
 pub fn deflect_for_land(
     pos: Position,
     desired: f32,
+    current_heading: f32,
     terrain: NavTerrain<'_>,
     lookahead_nm: f32,
 ) -> f32 {
-    // Fast path: the desired heading is clear at full lookahead.
     if heading_clear_distance(pos, desired, terrain, lookahead_nm) >= lookahead_nm {
         return desired;
     }
-    // Sweep 36 candidates (every 10°). Score each by clear distance,
-    // breaking ties in favour of the smaller absolute deflection from
-    // `desired`. Headings clear at full lookahead all tie at the top
-    // of the distance ranking, so the deflection tiebreaker selects
-    // the most-natural escape exactly when one exists.
+    let score = |candidate: f32, dist: f32| -> f32 {
+        let cos = angle_diff(candidate, desired).to_radians().cos();
+        dist * cos
+    };
     let mut best_heading = desired;
-    let mut best_dist = heading_clear_distance(pos, desired, terrain, lookahead_nm);
-    let mut best_deflect = 0.0_f32;
-    for i in 1..18 {
+    let mut best_score = score(
+        desired,
+        heading_clear_distance(pos, desired, terrain, lookahead_nm),
+    );
+    let mut best_inertia = angle_diff(desired, current_heading).abs();
+    // Sweep up to ±90° (i=1..9, every 10°). Beyond that the cos()
+    // weight goes non-positive — a heading more than 90° off desired
+    // never makes forward progress and is rejected by construction.
+    for i in 1..9 {
         let offset = i as f32 * 10.0;
         for &sign in &[1.0_f32, -1.0] {
             let candidate = normalize_angle(desired + offset * sign);
             let d = heading_clear_distance(pos, candidate, terrain, lookahead_nm);
-            let deflect = offset; // absolute angular distance
-            let better = d > best_dist + 0.01 || (d >= best_dist - 0.01 && deflect < best_deflect);
+            let s = score(candidate, d);
+            let inertia = angle_diff(candidate, current_heading).abs();
+            let better =
+                s > best_score + 0.01 || (s >= best_score - 0.01 && inertia < best_inertia);
             if better {
-                best_dist = d;
+                best_score = s;
                 best_heading = candidate;
-                best_deflect = deflect;
+                best_inertia = inertia;
             }
         }
     }
-    // 180° opposite (port and starboard sides converge here).
-    let opposite = normalize_angle(desired + 180.0);
-    let d = heading_clear_distance(pos, opposite, terrain, lookahead_nm);
-    if d > best_dist + 0.01 {
-        best_heading = opposite;
-    }
     best_heading
+}
+
+/// Convenience: is `heading` clear at full lookahead from `pos`?
+fn heading_clear(pos: Position, heading: f32, terrain: NavTerrain<'_>, lookahead_nm: f32) -> bool {
+    heading_clear_distance(pos, heading, terrain, lookahead_nm) >= lookahead_nm
 }
 
 /// Probe along `heading` from `pos` and return the distance to first
@@ -480,6 +586,7 @@ mod tests {
                 &mut goal,
                 Position::ZERO,
                 Position::ZERO,
+                0.0,
                 &stats,
                 &wind,
                 None,
@@ -502,6 +609,7 @@ mod tests {
                 &mut goal,
                 Position::ZERO,
                 Position::ZERO,
+                0.0,
                 &stats,
                 &wind,
                 None,
@@ -527,6 +635,7 @@ mod tests {
             &mut goal,
             Position::ZERO,
             Position::ZERO,
+            0.0,
             &stats,
             &wind,
             None,

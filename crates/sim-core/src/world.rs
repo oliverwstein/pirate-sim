@@ -1166,18 +1166,31 @@ impl World {
 
             let new_pos = ship.compute_next_position(&ship_stats, &wind, 1.0);
             let old_pos = ship.position;
-            let safe_pos =
-                self.coastline_geom
-                    .farthest_clear_point(&self.map.land, old_pos, new_pos);
+            let safe_pos = self
+                .coastline_geom
+                .slide_move(&self.map.land, old_pos, new_pos);
 
-            if safe_pos.distance(old_pos) > 0.05 {
+            let traveled = safe_pos.distance(old_pos);
+            if traveled > 0.05 {
                 ship.position = safe_pos;
-                // Speed reflects how far we actually traveled.
-                let traveled = safe_pos.distance(old_pos);
                 ship.speed = traveled; // 1 hour tick → NM == kt
             } else {
                 ship.speed = 0.0;
             }
+
+            // Update current_tile via portal-crossing walk (O(neighbors)
+            // per tick — usually a no-op when the ship stays in the same
+            // tile). Falls back to a centroid-search initializer on the
+            // first move or after a teleport. Used by the steering layer
+            // to pick a channel-center fallback target when the direct
+            // bearing to a waypoint would graze land.
+            ship.nav.current_tile = match ship.nav.current_tile {
+                Some(c) => self
+                    .tile_mesh
+                    .walk_to_tile(c, old_pos, ship.position)
+                    .or_else(|| self.tile_mesh.find_tile_containing(ship.position, 50.0)),
+                None => self.tile_mesh.find_tile_containing(ship.position, 50.0),
+            };
         }
 
         // ─── §3c-2b: Pay-at-port pass ────────────────────────────────

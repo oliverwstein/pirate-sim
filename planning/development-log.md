@@ -3323,3 +3323,86 @@ drift.
 
 Research document committed alongside this entry:
 `planning/research/narrow-channel-navigation.md`.
+
+---
+
+## 2026-05-?? — Narrow-channel navigation: **solved**
+
+After many failed iterations (logged above), the Delaware River /
+NY Harbor / Philadelphia-undock failure modes all clear with a
+three-part fix layered on the polygon-truth substrate. The
+**critical** change — the one that flipped working-ish into
+working — was the last one: changing the deflection objective
+from "max clear distance" to "max forward-projected clear distance".
+
+### The combination that works
+1. **Sliding motion sweep** (`coastline_geom::slide_move`,
+   Quake-style: up to 4 bumps, 0.85 friction). Replaces the binary
+   `farthest_clear_point` that left ships motionless against
+   any oblique coast.
+
+2. **Per-ship `current_tile` tracking.** `NavTrack.current_tile`
+   is updated each tick by `TileMesh::walk_to_tile` (portal-crossing
+   walk; O(neighbors), lazy reinit via `find_tile_containing`).
+   This gives steering an O(1) handle on the medial-axis
+   neighborhood without re-running point-in-polygon every tick.
+
+3. **Centroid-hop channel-center fallback in `compute_steering`.**
+   When the direct bearing to the current waypoint is blocked
+   within lookahead, replace the steering target with the
+   LOS-visible centroid (from `current_tile` ∪ its neighbors)
+   that minimizes distance to the waypoint. This steps the ship
+   along the channel one tile at a time without overshooting,
+   which would cause a 180° flip.
+
+4. **(The key fix.) Forward-projected deflection objective.**
+   `deflect_for_land` previously maximized raw clearance distance.
+   In a tight channel that meant a heading 170° off desired with
+   20 NM of open water beat the 8 NM clearance pointing the right
+   way — so ships happily U-turned out of channels they were
+   trying to traverse. New objective: `score = clear_distance *
+   cos(angle_off_desired)`. The candidate sweep is capped at
+   ±90°; anything more than 90° off desired has non-positive
+   score and is rejected by construction. Ties on score still
+   break by proximity to `current_heading` (the existing
+   hysteresis).
+
+### Why this combination works
+The three structural changes (sliding + current_tile + centroid hop)
+were necessary but not sufficient: with the old "max clearance"
+deflection objective, even with a clean centroid target available,
+the deflector could still pick a backwards heading whenever a
+forward heading wasn't *fully* clear. The forward-projection score
+forces the deflector to honor the steering layer's chosen direction
+of travel, falling back to "slower but forward" rather than "faster
+but reversed".
+
+### Empirical
+- bench_trade: 24 ships in red (was 31 baseline, 35 in last failed
+  attempt). Combat / fleet survival unchanged.
+- All 237 workspace tests pass.
+- Viz: ships in Delaware, NY, and Philadelphia harbors no longer
+  oscillate, U-turn, or wedge against coastlines.
+
+### Files touched
+- `crates/sim-core/src/coastline_geom.rs` — `slide_move`,
+  `first_land_hit_with_edge`.
+- `crates/sim-core/src/tile_mesh.rs` — `tile_contains`,
+  `find_tile_containing`, `walk_to_tile`, helper `segments_cross`.
+- `crates/sim-core/src/nav.rs` — `NavTerrain.mesh`,
+  `NavTrack.current_tile`, centroid-hop fallback in
+  `compute_steering`, forward-projection objective in
+  `deflect_for_land`, `current_heading` parameter threaded through
+  `compute_steering` / `tactical_steering` / `deflect_for_land`.
+- `crates/sim-core/src/world.rs` — motion sweep calls
+  `slide_move` and updates `ship.nav.current_tile`.
+- `crates/sim-core/src/ai.rs` — both `NavTerrain` construction
+  sites pass `c.tile_mesh`; both `compute_steering` and
+  `tactical_steering` callers pass `self.ship.heading`.
+
+### Reference
+`planning/research/narrow-channel-navigation.md` — §2 (sliding
+response), §5 (current_tile tracking), §6 (medial axis). The
+forward-projection objective is **not** explicitly in the research
+doc; it emerged from observing the deflector's failure mode after
+the three recommended pieces were in place.

@@ -255,6 +255,100 @@ impl CoastlineGeom {
         best.map(|(_, p)| p)
     }
 
+    /// Variant of [`first_land_hit`] that also returns the polyline edge
+    /// that produced the hit. Used by [`slide_move`] to compute the
+    /// contact normal for sliding response. Returns `None` if the
+    /// segment is clear or if only the raster pre-filter has a verdict
+    /// (no edge data available — caller should fall back to a hard
+    /// stop in that case).
+    pub fn first_land_hit_with_edge(
+        &self,
+        land: &LandMap,
+        a: Position,
+        b: Position,
+    ) -> Option<(Position, CoastEdge)> {
+        if !raster_corridor_touches_land(land, a, b) {
+            return None;
+        }
+        if !self.has_polylines {
+            return None;
+        }
+        let mut best: Option<(f32, Position, CoastEdge)> = None;
+        self.coast.for_each_bucket_along(a, b, |edges| {
+            for e in edges {
+                if let Some((t, p)) = segment_intersection_point(a, b, e.a, e.b) {
+                    if best.is_none_or(|(bt, _, _)| t < bt) {
+                        best = Some((t, p, *e));
+                    }
+                }
+            }
+            true
+        });
+        best.map(|(_, p, e)| (p, e))
+    }
+
+    /// Sweep a point ship from `from` toward `to`, sliding along
+    /// coastline edges on contact instead of stopping. Returns the
+    /// final position after at most `MAX_BUMPS` slide iterations.
+    ///
+    /// This is the Quake/Source-style "SlideMove" adapted for 2-D
+    /// coastline polygons: on each land hit we project the remaining
+    /// velocity onto the contact edge (zero the into-surface
+    /// component, keep the tangential one) and continue. A small
+    /// friction factor reduces tangential velocity each bump so a
+    /// ship grazing the bank loses energy realistically.
+    ///
+    /// Falls back to a single-shot pullback (i.e. behaves like
+    /// [`farthest_clear_point`]) when polyline edge data is
+    /// unavailable.
+    pub fn slide_move(&self, land: &LandMap, from: Position, to: Position) -> Position {
+        const MAX_BUMPS: u32 = 4;
+        const PULLBACK_NM: f32 = 0.02;
+        const FRICTION: f32 = 0.85;
+
+        let mut pos = from;
+        let mut remaining = to - from;
+
+        for _ in 0..MAX_BUMPS {
+            let step_len = remaining.length();
+            if step_len < 1e-4 {
+                break;
+            }
+            let target = pos + remaining;
+
+            let Some((hit, edge)) = self.first_land_hit_with_edge(land, pos, target) else {
+                pos = target;
+                break;
+            };
+
+            let along = remaining * (1.0 / step_len);
+            let hit_t = (hit - pos).length();
+            let safe_t = (hit_t - PULLBACK_NM).max(0.0);
+            pos += along * safe_t;
+
+            let edge_dir = edge.b - edge.a;
+            let edge_len = edge_dir.length();
+            if edge_len < 1e-6 {
+                break;
+            }
+            let tangent = edge_dir * (1.0 / edge_len);
+            let mut normal = Position::new(-tangent.y, tangent.x);
+            if normal.dot(pos - hit) < 0.0 {
+                normal = -normal;
+            }
+
+            let leftover_len = (step_len - safe_t - PULLBACK_NM).max(0.0);
+            if leftover_len < 1e-4 {
+                break;
+            }
+            let leftover = along * leftover_len;
+            let into_surface = leftover.dot(normal);
+            remaining = (leftover - normal * into_surface) * FRICTION;
+        }
+
+        pos
+    }
+
     /// Polygon-truth replacement for `LandMap::farthest_clear_point`:
     /// the farthest point along `a → b` that stays in water. If the
     /// segment is fully clear, returns `b`. Otherwise returns the
