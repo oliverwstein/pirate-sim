@@ -3510,3 +3510,64 @@ for itself in route quality, and cleanly addresses a topology
 limitation the hex lattice can't solve on its own. The deferred
 items (per-tile tunable radius, A* tie-break weighting, ports as
 tile-ids) remain deferred.
+
+---
+
+## 2025 — Long-run economic regression: triaged as not-nav
+
+### Trigger
+After committing deep-water shortcuts, the 730-day bench showed
+Fleet P/L **−269 k pesos** (with shortcuts) vs the historical
+**+4.55 M** baseline from pre-nav-overhaul runs (see entry
+~"Phase 5: morale + sailor pool"). User asked whether the nav
+overhaul might have made routes longer in practice and caused
+the regression.
+
+### Result of triage
+Apples-to-apples at 730 d:
+
+| metric        | no shortcuts | with shortcuts | Δ        |
+|---------------|--------------|----------------|----------|
+| Fleet P/L     | −428 k       | **−269 k**     | +159 k   |
+| Bankrupt      | 22           | 23             | ≈ same   |
+
+Shortcuts are strictly **better** at 730 d (and at 365 d:
++15 k vs −188 k). The decline from the historical +4.55 M is
+not caused by the navigation work — both with and without
+shortcuts the fleet is deep in the red at 730 d.
+
+### Where the loss actually is
+Per-faction-type breakdown (730 d, with shortcuts):
+- Profitable: Spain fluyt +155 k (32 ships), England ship +91 k,
+  Free sloop +49 k (12 pirate ships), Havana / London / Cadiz
+  short-haul fluyts and ships.
+- Losing: France ship −105 k, Netherlands fluyt −94 k, Spain
+  brigantine −89 k, France fluyt −79 k.
+- Bottom 5 individual earners all hit a −12,500 peso floor
+  (chandler debt cap) and were all home-ported at Ouidah,
+  Cartagena, Willemstad — i.e., the long Atlantic-crossing
+  legs.
+
+System-wide **provisions** balance drops monotonically from
+10 107 to 3 916 units over 24 months. Early-run Δtotals of
+−500 to −800 per month, stabilising around −100/month once the
+balance is depleted. Ships eat ~400–1 000 provisions/month
+beyond port consumption — the food economy can't sustain the
+fleet's time-at-sea on long-haul routes.
+
+### Conclusion
+This is **economic calibration**, not nav. Long Atlantic legs
+(Africa ↔ Caribbean ↔ Europe) don't break even at current cargo
+prices, wage rates, and provisions burn. The nav overhaul made
+the legs shorter and faster — they just still aren't profitable
+enough to support the fleet that's currently configured to sail
+them. Deferred to a future calibration pass; likely candidates:
+
+1. Wage / provisions consumption rate too high relative to
+   long-haul cargo margins.
+2. Long-haul cargo prices (slaves, sugar, manufactures) too low
+   at the distant ports that source them.
+3. Long-haul ship type / capacity mismatch.
+
+No code change in this entry — bookkeeping only, so that future
+work doesn't waste time re-discovering this is not a nav bug.
