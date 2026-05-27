@@ -202,6 +202,7 @@ impl World {
                 .collect();
             tile_mesh.set_clearance(clearance);
         }
+        tile_mesh.build_deep_water_shortcuts(&coastline_geom, &map.land, 300.0, 8);
         let goods = GoodsRegistry::starter();
         let port_specs: Vec<PortSpec<'_>> = ports
             .iter()

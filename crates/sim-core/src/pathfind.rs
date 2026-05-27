@@ -298,11 +298,24 @@ fn stitch_tile_route(
 ) -> Vec<Position> {
     let mut portals: Vec<(Position, Position)> = Vec::with_capacity(route.len().saturating_sub(1));
     for w in route.windows(2) {
-        let Some((l, r)) = mesh.shared_edge(w[0], w[1]) else {
-            // Should not happen on the bundled mesh, but guard anyway.
-            return centroid_chain_with_terminal(mesh, route, terminal);
-        };
-        portals.push((l, r));
+        if let Some((l, r)) = mesh.shared_edge(w[0], w[1]) {
+            portals.push((l, r));
+            continue;
+        }
+        // Shortcut edge (non-adjacent deep-water tiles): use the
+        // stored midpoint as a degenerate portal. LOS-clearance
+        // was verified at build time, so the funnel can safely
+        // pin through it.
+        if let Some(portal) = mesh
+            .shortcut_neighbors
+            .get(w[0] as usize)
+            .and_then(|edges| edges.iter().find(|e| e.to == w[1]).map(|e| e.portal))
+        {
+            portals.push((portal, portal));
+            continue;
+        }
+        // Should not happen on the bundled mesh, but guard anyway.
+        return centroid_chain_with_terminal(mesh, route, terminal);
     }
 
     let smoothed = tile_mesh::funnel(start, terminal, &portals);

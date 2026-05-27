@@ -155,13 +155,24 @@ fn dijkstra_from_sources(mesh: &TileMesh, n_tiles: usize, sources: &[u32]) -> Po
         if d > dist[cur_us] {
             continue;
         }
-        for e in &mesh.neighbors[cur_us] {
+        let relax = |e: &crate::tile_mesh::TileEdge,
+                     dist: &mut Vec<f32>,
+                     pred: &mut Vec<u32>,
+                     heap: &mut BinaryHeap<HeapEntry>| {
             let nd = d + mesh.edge_cost(cur, e);
             let to_us = e.to as usize;
             if nd < dist[to_us] {
                 dist[to_us] = nd;
                 pred[to_us] = cur;
                 heap.push(HeapEntry { d: nd, idx: e.to });
+            }
+        };
+        for e in &mesh.neighbors[cur_us] {
+            relax(e, &mut dist, &mut pred, &mut heap);
+        }
+        if let Some(shortcuts) = mesh.shortcut_neighbors.get(cur_us) {
+            for e in shortcuts {
+                relax(e, &mut dist, &mut pred, &mut heap);
             }
         }
     }

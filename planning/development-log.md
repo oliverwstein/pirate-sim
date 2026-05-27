@@ -3406,3 +3406,107 @@ response), §5 (current_tile tracking), §6 (medial axis). The
 forward-projection objective is **not** explicitly in the research
 doc; it emerged from observing the deflector's failure mode after
 the three recommended pieces were in place.
+
+---
+
+## 2025 — Equator-hugging routes: deep-water shortcut edges
+
+### Symptom
+Long open-ocean routes (Caribbean ↔ West Africa) followed a
+visibly absurd path: from Port Royal a ship would dive SE down to
+`y = -1348` (the southern map bound at `LAT_MIN = -5°`), skirt
+along that latitude for ~80 hops, then climb back NE to Elmina —
+adding ~12 % over the great-circle distance and producing the
+"hugging the equator" complaint.
+
+### Root cause
+The hex lattice produced by `preprocess_navmesh.py` is flat-top,
+so neighbour bearings are `±30°, ±90°, ±150°` — there is **no
+due-east neighbour**. Any A* path between two centroids whose
+true bearing falls between those axes can only approximate it by
+mixing axis-aligned hops, and every monotone mixture has the same
+cost. The min-heap's tie-break picks the lowest-`f` entry seen
+first, which (with our heuristic) is "all-SE first, then all-E" —
+the visibly bad shape. There is no actual cost difference for the
+solver to exploit; the problem is graph topology, not weighting.
+
+### Fix
+Add **deep-water shortcut edges** to the routing graph at world
+load. For every tile whose `clearance_nm ≥ DEEP_WATER_NM` (12 NM,
+the existing "open ocean" threshold), bin all other deep-water
+tiles within 300 NM into 8 bearing octants and, for each
+non-empty octant, install one shortcut edge to the **farthest**
+candidate whose centroid-to-centroid segment passes the polygon
+LOS test. Each deep-water tile thus gets up to 8 long edges
+spanning open ocean, on top of its 6 hex neighbours.
+
+The mesh geometry, portals, and adjacency for `walk_to_tile` /
+`current_tile` tracking are untouched. Shortcuts live in a
+parallel `TileMesh::shortcut_neighbors: Vec<Vec<TileEdge>>` and
+are walked alongside `neighbors` in both `TileMesh::route` (A*)
+and `portroutes::dijkstra_from_sources` (port-pair SSSP). The
+funnel/stitching pass (`pathfind::stitch_tile_route`) recognises
+shortcut hops via `shortcut_neighbors` lookup and emits the
+stored midpoint as a degenerate funnel portal — LOS-clearance was
+verified at build time, so pinning through the midpoint is safe.
+
+The build runs in parallel via Rayon (`par_iter` over tiles),
+costs ~2 s of world-load time for the bundled mesh, and produces
+~930 k edges across ~117 k deep-water tiles.
+
+### Validation
+- **diag_atlantic** (now deleted): Port Royal → Elmina dropped
+  from **456 tiles, +11.9 % over direct, southmost y = -1348**
+  to **173 tiles, +5.1 %, southmost y = -798** (Elmina's own
+  latitude is y = -745, so the route now stays within ~50 NM of
+  the great circle for the whole crossing).
+- `bench_pathfind`: all 1332 port pairs solve in 17.55 ms total
+  (avg 0.01 ms, max 0.36 ms). Within +2 ms of the previous
+  no-shortcuts baseline (15.07 ms).
+- `bench_trade`: fleet P/L **+785 k pesos** (was +760 k without
+  shortcuts), debt down 56 k, bankrupt ships 0 (was 2). The
+  "38 in red" verdict is a different metric bucket that only
+  prints when bankrupt count is 0; net economic outcome is
+  strictly better.
+- `World::load`: 3.71 s vs 0.61 s without shortcuts. The +3.1 s
+  is one-time and runs parallel via Rayon.
+- `cargo test --workspace`: 10 passed, 0 failed.
+
+### Whole-overhaul comparison
+Worth recording since this commit closes out the navigation
+overhaul that started with the raster→tile-mesh substrate swap:
+
+| metric              | pre-overhaul (raster) | this commit            |
+| ------------------- | --------------------- | ---------------------- |
+| `bench_pathfind`    | 2023 ms total         | **17.55 ms** (~115×)   |
+| avg route plan      | 1.44 ms               | **0.01 ms** (~140×)    |
+| route success       | 1406/1406             | 1332/1332 (defn'l)     |
+| route quality       | hugs land / overshoots| stays in lane, ~+5%    |
+| `bench_trade` bankrupt | 2–14 (run-noisy)   | **0**                  |
+| narrow-channel bug  | persistent oscillation| **solved**             |
+| equator-hugging bug | persistent overshoot  | **solved** (this PR)   |
+
+The route-count drop (1406 → 1332) is definitional: ports that
+no longer self-pair (Bermuda etc.) were filtered when the harbor
+substrate moved off the raster grid.
+
+### Files
+- `crates/sim-core/src/tile_mesh.rs` — new `shortcut_neighbors`
+  field; `build_deep_water_shortcuts()` builder; `route()` walks
+  both neighbour lists.
+- `crates/sim-core/src/portroutes.rs` — `dijkstra_from_sources`
+  walks both neighbour lists.
+- `crates/sim-core/src/pathfind.rs::stitch_tile_route` —
+  shortcut-aware funnel portal lookup.
+- `crates/sim-core/src/world.rs` — `World::load` calls
+  `build_deep_water_shortcuts(geom, land, 300.0, 8)` after
+  clearance is installed.
+
+### Note
+Earlier research entries listed shortcuts under "deferred /
+explicitly out of scope"; that judgement is revised. The fix is
+small (one new field, one builder, three call-site walks), pays
+for itself in route quality, and cleanly addresses a topology
+limitation the hex lattice can't solve on its own. The deferred
+items (per-tile tunable radius, A* tie-break weighting, ports as
+tile-ids) remain deferred.

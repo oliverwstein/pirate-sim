@@ -87,6 +87,18 @@ pub struct TileEdge {
 pub struct TileMesh {
     pub tiles: Vec<Tile>,
     pub neighbors: Vec<Vec<TileEdge>>,
+    /// Optional long-range A* edges for deep-water tiles. Empty until
+    /// [`TileMesh::build_deep_water_shortcuts`] is called. Each entry
+    /// `i` lists up-to-8 octant-binned shortcuts from tile `i` to
+    /// distant deep-water tiles whose centroid is LOS-clear from
+    /// `tiles[i].centroid`. Routing layers (`route`,
+    /// `dijkstra_from_sources`) walk both `neighbors` and these
+    /// shortcuts during relaxation. The mesh geometry, portals, and
+    /// per-ship `current_tile` tracking are untouched: shortcuts only
+    /// densify the A* graph in open ocean, so deep-water paths
+    /// approach the rhumb line instead of zig-zagging through the
+    /// hex lattice's discrete bearing axes.
+    pub shortcut_neighbors: Vec<Vec<TileEdge>>,
     /// Spatial hash of centroids in `BUCKET_NM`-sized cells. The key
     /// is `(floor(x / BUCKET_NM), floor(y / BUCKET_NM))`.
     centroid_buckets: HashMap<(i32, i32), Vec<u32>>,
@@ -155,6 +167,7 @@ impl TileMesh {
         Self {
             tiles: Vec::new(),
             neighbors: Vec::new(),
+            shortcut_neighbors: Vec::new(),
             centroid_buckets: HashMap::new(),
             clearance_nm: Vec::new(),
         }
@@ -269,6 +282,7 @@ impl TileMesh {
         Ok(Self {
             tiles,
             neighbors,
+            shortcut_neighbors: Vec::new(),
             centroid_buckets,
             clearance_nm,
         })
@@ -293,6 +307,105 @@ impl TileMesh {
     pub fn set_clearance(&mut self, clearance: Vec<f32>) {
         debug_assert_eq!(clearance.len(), self.tiles.len());
         self.clearance_nm = clearance;
+    }
+
+    /// Build long-range A* shortcut edges for deep-water tiles.
+    ///
+    /// On a flat-top hex lattice the only neighbour directions are
+    /// `30°, 90°, 150°, …`; an A* path between two points whose true
+    /// bearing falls between those axes can only approximate it by
+    /// zig-zagging or by following one axis fully then turning. Both
+    /// shapes have the same total length, so the heap's tie-break
+    /// picks whichever expansion order it sees first — typically a
+    /// long monotone leg along a single axis that overshoots toward
+    /// a map edge before turning back (the "Africa → Caribbean
+    /// route hugs the equator" symptom).
+    ///
+    /// This method densifies the A* graph in open ocean so the
+    /// planner can take a single straight edge between distant
+    /// deep-water tiles instead of stepping hex-by-hex along an
+    /// axis. The mesh geometry, portals, neighbour adjacency for
+    /// `walk_to_tile`, and `current_tile` tracking are all
+    /// untouched — only the routing graph gets extra edges.
+    ///
+    /// Algorithm: for every tile whose `clearance_nm ≥ DEEP_WATER_NM`,
+    /// gather all other deep-water tiles within `radius_nm`, bin
+    /// them into `n_octants` angular sectors around the centroid,
+    /// and for each sector keep the **farthest** candidate whose
+    /// centroid-to-centroid segment passes the polygon-LOS test.
+    /// Result: ≤ `n_octants` shortcut edges per deep-water tile,
+    /// each spanning up to `radius_nm` of open ocean.
+    ///
+    /// LOS checks use `geom.line_is_clear(land, …)`; the raster
+    /// fast-path inside `CoastlineGeom` keeps them cheap (a few µs
+    /// each), and the farthest-first ordering per sector means we
+    /// usually need only 1 LOS check per sector. The whole build
+    /// runs in parallel over tiles via Rayon.
+    ///
+    /// Requires clearance data — calls `has_clearance()` first and
+    /// becomes a no-op if none is installed (test fixtures).
+    pub fn build_deep_water_shortcuts(
+        &mut self,
+        geom: &crate::coastline_geom::CoastlineGeom,
+        land: &crate::map::land::LandMap,
+        radius_nm: f32,
+        n_octants: usize,
+    ) {
+        use rayon::prelude::*;
+
+        if !self.has_clearance() || self.tiles.is_empty() {
+            self.shortcut_neighbors = vec![Vec::new(); self.tiles.len()];
+            return;
+        }
+        let n_octants = n_octants.max(1);
+        let sector_rad = std::f32::consts::TAU / n_octants as f32;
+
+        let n = self.tiles.len();
+        let centroids: Vec<Position> = self.tiles.iter().map(|t| t.centroid).collect();
+        let clearance = &self.clearance_nm;
+
+        self.shortcut_neighbors = (0..n)
+            .into_par_iter()
+            .map(|i| {
+                if clearance[i] < DEEP_WATER_NM {
+                    return Vec::new();
+                }
+                let pi = centroids[i];
+                // Gather deep-water candidates within radius, with
+                // distance. `nearest_centroids` already sorts ascending;
+                // we'll bucket then sort per-octant descending.
+                let mut by_sector: Vec<Vec<(f32, u32)>> = vec![Vec::new(); n_octants];
+                for (j, dist) in self.nearest_centroids(pi, radius_nm) {
+                    if j as usize == i {
+                        continue;
+                    }
+                    if clearance[j as usize] < DEEP_WATER_NM {
+                        continue;
+                    }
+                    let pj = centroids[j as usize];
+                    let bearing = (pj.x - pi.x).atan2(pj.y - pi.y);
+                    let normalized = (bearing + std::f32::consts::TAU) % std::f32::consts::TAU;
+                    let sector = ((normalized / sector_rad) as usize) % n_octants;
+                    by_sector[sector].push((dist, j));
+                }
+                let mut edges: Vec<TileEdge> = Vec::with_capacity(n_octants);
+                for bucket in &mut by_sector {
+                    bucket.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+                    for &(d, j) in bucket.iter() {
+                        let pj = centroids[j as usize];
+                        if geom.line_is_clear(land, pi, pj) {
+                            edges.push(TileEdge {
+                                to: j,
+                                portal: (pi + pj) * 0.5,
+                                dist_nm: d,
+                            });
+                            break;
+                        }
+                    }
+                }
+                edges
+            })
+            .collect();
     }
 
     /// True iff clearance data has been installed. When false, the
@@ -414,7 +527,7 @@ impl TileMesh {
                     return Some(path);
                 }
                 let cur_g = scratch.g_score[cur_us];
-                for e in &self.neighbors[cur_us] {
+                let relax = |e: &TileEdge, scratch: &mut RouteScratch| {
                     let tentative = cur_g + self.edge_cost(cur, e);
                     let to_us = e.to as usize;
                     let prev = scratch.g_score[to_us];
@@ -428,6 +541,14 @@ impl TileMesh {
                             f: tentative + h(e.to),
                             idx: e.to,
                         });
+                    }
+                };
+                for e in &self.neighbors[cur_us] {
+                    relax(e, &mut scratch);
+                }
+                if let Some(shortcuts) = self.shortcut_neighbors.get(cur_us) {
+                    for e in shortcuts {
+                        relax(e, &mut scratch);
                     }
                 }
             }
@@ -872,6 +993,7 @@ mod tests {
         TileMesh {
             tiles,
             neighbors,
+            shortcut_neighbors: Vec::new(),
             centroid_buckets,
             clearance_nm: Vec::new(),
         }
