@@ -3571,3 +3571,70 @@ them. Deferred to a future calibration pass; likely candidates:
 
 No code change in this entry — bookkeeping only, so that future
 work doesn't waste time re-discovering this is not a nav bug.
+
+## Global map expansion: two-tier hybrid (geodesic + regional charts)
+
+**Context:** New `game` branch targets a full "sim-game" spanning
+1661–1691, covering the entire world's oceans, ports, and navigable
+rivers — a step up from the Caribbean-only scope to date. A friend's
+separate project (`garret-pirates/`, JS) models its whole world as a
+subdivided icosahedron ("geodesic sphere"); the user asked us to
+compare the two projects and then adopt that global + geodesic idea
+for this expansion.
+
+**Problem:** `Position` is a flat NM plane (`glam::Vec2`, origin
+17.5°N/72.5°W) with equirectangular projection that has never applied
+`cos(lat)` correction, despite `tools/preprocess/README.md` claiming
+it does. This is already measurably wrong at the box's current edges
+(e.g. ~62% E–W distance overstatement at Amsterdam's latitude) and
+cannot represent a whole globe (wraparound, poles) at all.
+
+**Alternatives considered:**
+1. Extend the single flat plane globally with a proper cos(lat) fix —
+   simplest change, but still can't wrap the globe and re-breaks at
+   high latitude/poles; rejected for a "whole world" target.
+2. Rewrite `Position` to true spherical lat/lon everywhere — geodesically
+   correct everywhere, but the research pass showed almost every
+   high-value, well-tested piece of the crate (`tile_mesh.rs`'s portal
+   navmesh + funnel algorithm, `coastline_geom.rs`'s polygon LOS/collision
+   oracle, `nav.rs`'s DR/noon-sight model, `ship.rs`'s physics integrator,
+   `spatial.rs`) is built on flat Euclidean math with no seam to intercept.
+   A full rewrite would touch nearly the whole crate for capability we
+   only need at the scale of "which ocean basin," not "is this hull
+   scraping that reef."
+3. **Two-tier hybrid (chosen).** A new Tier-1 global geodesic mesh
+   (icosahedral subdivision, ported from `garret-pirates/src/geodesic.js`)
+   handles only global land/sea topology, reachability flood-fill, river
+   bookkeeping, and coarse shipping-lane routing between regions. The
+   existing flat-plane machinery is kept essentially untouched but
+   generalized into per-region `Chart`s (each with its own local origin
+   and a corrected cos(lat) projection), so precision coastal/harbor/
+   river navigation still runs on the same proven algorithms. Long
+   open-ocean legs between charts plan on the coarse Tier-1 graph and
+   simulate as simplified great-circle transit.
+
+**Rationale:** Garrett's own project independently converged on the same
+split — his long-haul NPC routing runs over a small hand-authored
+lane graph in lat/lon space, *not* over his 163k-tile geodesic mesh;
+the fine tile graph is used only for land/sea classification and
+reachability, with a wholly separate local vector-steering layer for
+close-in movement. This confirmed the hybrid isn't a compromise, it's
+the standard shape of this problem. It also means we don't have to
+re-earn the correctness of `tile_mesh.rs`'s portal/funnel routing or
+`nav.rs`'s dead-reckoning model, which are among the most road-tested
+parts of the codebase (see `bench_pathfind`, the 730 d economic-
+regression entry above, and `planning/navigation-plan.md`).
+
+**Status / what shipped:** M1 landed on `game`: `crates/sim-core/src/geo/`
+(`mesh.rs` — icosahedron + 4T subdivision + ordered dual adjacency;
+`index.rs` — lon/lat bucket spatial index for nearest-tile lookups),
+with unit tests for tile-count formula, adjacency symmetry, pentagon/
+hexagon degree counts, and lat/lon round-tripping. This is purely
+additive — nothing in `map`, `nav`, `tile_mesh`, or `coastline_geom`
+depends on it yet. Full milestone breakdown (M2 chart generalization +
+cos(lat) fix, M3 lane graph, M4 open-ocean transit state, M5 rivers,
+M6 sim-viz world view) is in the `game`-branch plan; M2 data scope
+starts with curated basins (Atlantic both sides, Caribbean, Indian
+Ocean rim, Manila-galleon route, Pacific crossing corridor) rather
+than whole-globe GEBCO, added incrementally since Tier-1 classification
+is per-tile and additive.

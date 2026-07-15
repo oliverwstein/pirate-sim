@@ -6,6 +6,7 @@ pub mod coastline_geom;
 pub mod combat;
 pub mod command;
 pub mod equilibrium;
+pub mod geo;
 pub mod goods;
 pub mod harbor;
 pub mod map;

@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/sim-core", "crates/sim-viz"]
+members = ["crates/sim-core", "crates/sim-viz", "crates/sim-globe-view"]
 resolver = "2"
 
 # Perf Phase 1: link-time optimization across the whole workspace and a

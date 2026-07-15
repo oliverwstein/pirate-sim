@@ -1,0 +1,15 @@
+[package]
+name = "sim-globe-view"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+sim-core = { path = "../sim-core" }
+macroquad = "0.4"
+# Matches sim-core's glam version, so its Vec3 is the same concrete type
+# `sim_core::geo` uses. Named `core_glam` (not `glam`) because
+# `macroquad::prelude` does `pub use glam;` re-exporting macroquad's own
+# older glam (0.27) under that name — glob-importing the prelude would
+# otherwise shadow a plain `glam` dependency name and silently resolve
+# `glam::Vec3` to the wrong (0.27) type.
+core_glam = { package = "glam", version = "0.29" }

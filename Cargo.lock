@@ -759,6 +759,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "sim-globe-view"
+version = "0.1.0"
+dependencies = [
+ "glam 0.29.3",
+ "macroquad",
+ "sim-core",
+]
+
+[[package]]
 name = "sim-viz"
 version = "0.1.0"
 dependencies = [
