@@ -1,8 +1,3 @@
-# Copilot Cloud Agent Instructions: Pirate Sim
-Never end the conversation without being told, through the ask-user-question tool, that the user is done. After each action, use the ask user question tool to prompt the user for the next step. Always wait for the user's response before taking another action. Before committing code, always ask the user to review the changes and confirm that you should proceed. If the user says no, ask them what changes they would like to see and make those changes before asking them to review again. After committing, ask what is next. 
-
-*Remember, always use the ask user question tool when you finish working.*
-
 ## Development Logging (`development-log.md`)
 Maintain a running log of decisions in `planning/development-log.md`. Whenever you and the user finalize a significant design choice, solve a complex architectural problem, or pivot from an older plan, you must append an entry to this file. If something needs to be changed, or turns out not to work, a note on that should also be added. 
 *   **Format:** Append to the bottom of the file. Use a brief, clear markdown format.
